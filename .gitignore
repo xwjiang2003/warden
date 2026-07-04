@@ -1,0 +1,52 @@
+# === Binary / Build ===
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+build/
+dist/
+
+# === Test binary ===
+*.test
+
+# === Go ===
+*.out
+vendor/
+
+# === Logs ===
+logs/
+*.log
+
+# === IDE / Editor ===
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# === OS ===
+$RECYCLE.BIN/
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+
+# === Config (sensitive) ===
+# Uncomment if config.json contains secrets:
+# config.json
+
+# === Temp / Misc ===
+*.tmp
+*.temp
+tmp/
+temp/
+_pkg*

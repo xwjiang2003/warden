@@ -1,0 +1,97 @@
+{
+  "listen": ":81",
+  "backend": "http://127.0.0.1:8001",
+  "rules_file": "rules/coraza.conf",
+  "read_timeout_sec": 60,
+  "write_timeout_sec": 60,
+  "idle_timeout_sec": 120,
+  "access_log": "logs/access.log",
+  "access_log_rotate": {
+    "mode": "daily",
+    "max_size_mb": 100
+  },
+  "block_requests": true,
+  "rate_limit": {
+    "enabled": true,
+    "hot_path_max": 10,
+    "hot_path_window_sec": 30,
+    "site_max_per_min": 60,
+    "hot_path_patterns": [
+      "^/pub/news/4($|;|\\?)",
+      "^/pub/newsList/(70|81|84|100)($|;|\\?)",
+      "^/pub/newsListData($|\\?)"
+    ]
+  },
+  "cc_defense": {
+    "enabled": true,
+    "global_qps_max": 800,
+    "global_qps_burst": 200,
+    "trust_ip_min_visits": 5,
+    "trust_ip_window_sec": 600,
+    "new_ip_qps_max": 50,
+    "new_ip_qps_burst": 20,
+    "new_ip_ratio_block": 80,
+    "new_ip_check_sec": 30,
+    "new_ip_check_min_reqs": 60,
+    "challenge_cookie_key": ""
+  },
+  "waf_rules": {
+    "cc_paths": [
+      "^/pub/news/4($|;|\\?)",
+      "^/pub/newsList/(70|81|84|100)($|;|\\?)"
+    ],
+    "cc_no_referer_block": true,
+    "block_script_ua": true,
+    "custom_script_uas": [
+      "ShapBot",
+      "SERankingBacklinksBot",
+      "AhrefsBot",
+      "DotBot"
+    ],
+    "scanner_paths": [
+      "/developmentserver",
+      "/phpmyadmin",
+      "/wp-admin",
+      "/wp/",
+      "/wordpress/",
+      "/backup/",
+      "/blog/",
+      "/new/",
+      "/old/",
+      "/xmlrpc",
+      "/.env",
+      "/.git",
+      "/manager",
+      "/actuator",
+      "/photos",
+      "/admin",
+      "/login",
+      "/config",
+      "/api/",
+      "/swagger",
+      "/api-docs"
+    ],
+    "scanner_uas": [
+      "zgrab",
+      "masscan",
+      "sqlmap",
+      "nikto",
+      "acunetix",
+      "dirbuster",
+      "nmap",
+      "nessus",
+      "burp"
+    ],
+    "custom_block_paths": [],
+    "custom_block_status": 403
+  },
+  "conn_limit": {
+    "max_conns_per_sec": 500,
+    "burst": 100
+  },
+  "firewall_block": {
+    "enabled": true,
+    "expire_min": 30,
+    "auto_block": true
+  }
+}

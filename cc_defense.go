@@ -2,18 +2,40 @@ package main
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-const ccCookieName = "__cc_v"
-const ccCookieTTL = 300
+const ccJSCookieName = "__cc_js"
+const ccJSCookieTTL = 600
+const jsChallengeDifficulty = 4 // SHA256 前导零个数（4个 → ~100-500ms）
+const jsChallengeSeedTTL = 300  // seed 有效期 5 分钟
+
+// 搜索引擎爬虫 UA 白名单——不挑战，直接放行
+var searchBotUAs = []string{
+	"googlebot", "baiduspider", "bingbot", "bytespider",
+	"applebot", "yisouspider", "sogou", "petalbot",
+	"semrushbot", "ahrefsbot", "dotbot", "duckduckbot",
+	"facebookexternalhit", "twitterbot", "slurp",
+}
+
+func isSearchBot(ua string) bool {
+	ua = strings.ToLower(ua)
+	for _, bot := range searchBotUAs {
+		if strings.Contains(ua, bot) {
+			return true
+		}
+	}
+	return false
+}
 
 type CCDefenseConfig struct {
 	Enabled              bool   `json:"enabled"`
@@ -115,6 +137,13 @@ func (t *ipTrustTracker) isTrusted(ip string) bool {
 	}
 	t.mu.Unlock()
 	return false
+}
+
+func (t *ipTrustTracker) setTrusted(ip string) {
+	t.trustedMap.Store(ip, true)
+	t.mu.Lock()
+	delete(t.counters, ip)
+	t.mu.Unlock()
 }
 
 func (t *ipTrustTracker) gc() {
@@ -241,42 +270,117 @@ func (d *newIPFloodDetector) isFlooding(ip string) bool {
 	return false
 }
 
-// ---- Cookie 挑战 (缓存签名减少 HMAC) ----
+// ---- JS 计算挑战 (SHA256 Proof-of-Work) ----
+// 替代原来的 Cookie + meta-refresh（无法阻拦 headless Chrome）
+// 客户端需执行 JS 计算 SHA256(seed:nonce) 使其前 N 位为零
+// 纯 JS SHA256 实现，不依赖 SubtleCrypto API（HTTP 下也可用）
 
-func signCookie(ip string, secret string) string {
+// generateChallengeSeed 生成带签名的随机种子
+// 格式: hexTimestamp:hexRandom:hmacSig (防篡改 + 时效性)
+func generateChallengeSeed(ip, secret string) string {
+	ts := strconv.FormatInt(time.Now().Unix(), 16)
+	b := make([]byte, 8)
+	rand.Read(b)
+	rnd := hex.EncodeToString(b)
+	// 将 IP 绑定到签名中，防止跨 IP 复用挑战结果
+	payload := ts + ":" + rnd + ":" + ip
 	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte(ip))
-	mac.Write([]byte(strconv.FormatInt(time.Now().Unix()/int64(ccCookieTTL), 10)))
-	return hex.EncodeToString(mac.Sum(nil))[:16]
+	mac.Write([]byte(payload))
+	sig := hex.EncodeToString(mac.Sum(nil))[:16]
+	return ts + ":" + rnd + ":" + sig
 }
 
-func verifyCookie(ip, val, secret string) bool {
-	return val == signCookie(ip, secret)
+// verifyChallengeSeed 验证种子签名和有效期
+func verifyChallengeSeed(seed, ip, secret string) bool {
+	parts := strings.SplitN(seed, ":", 3)
+	if len(parts) != 3 {
+		return false
+	}
+	tsHex, rnd, sig := parts[0], parts[1], parts[2]
+	ts, err := strconv.ParseInt(tsHex, 16, 64)
+	if err != nil || time.Now().Unix()-ts > int64(jsChallengeSeedTTL) {
+		return false
+	}
+	// 验证时使用当前请求 IP 重建签名，IP 不匹配则验证失败
+	payload := tsHex + ":" + rnd + ":" + ip
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(payload))
+	expected := hex.EncodeToString(mac.Sum(nil))[:16]
+	return sig == expected
 }
 
-func serveChallenge(w http.ResponseWriter, r *http.Request, ip string, secret string) {
-	if ck, _ := r.Cookie(ccCookieName); ck != nil {
-		if verifyCookie(ip, ck.Value, secret) {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Write(htmlReload)
-			return
+// verifyJSProof 验证客户端的工作量证明
+func verifyJSProof(seed, nonce string) bool {
+	// seed 可能很大（~40 hex chars），限制长度防 DoS
+	if len(seed) > 128 || len(nonce) > 20 {
+		return false
+	}
+	nonceInt, err := strconv.ParseInt(nonce, 10, 64)
+	if err != nil || nonceInt < 0 {
+		return false
+	}
+	data := seed + ":" + nonce
+	hash := sha256.Sum256([]byte(data))
+	hexHash := hex.EncodeToString(hash[:])
+	prefix := strings.Repeat("0", jsChallengeDifficulty)
+	return strings.HasPrefix(hexHash, prefix)
+}
+
+// serveJSChallenge 返回 JS 工作量证明挑战页
+func serveJSChallenge(w http.ResponseWriter, r *http.Request, ip, secret string) {
+	// 已有有效 JS Challenge cookie → 直接放行（用于刷新后的请求）
+	if ck, _ := r.Cookie(ccJSCookieName); ck != nil {
+		val := ck.Value
+		// cookie 格式: seed:nonce
+		idx := strings.LastIndex(val, ":")
+		if idx > 0 {
+			seed := val[:idx]
+			nonce := val[idx+1:]
+			if verifyChallengeSeed(seed, ip, secret) && verifyJSProof(seed, nonce) {
+				// 有效 proof — 刷新页面让浏览器重试原请求
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.Write(jsReloadHTML)
+				return
+			}
 		}
 	}
-	token := signCookie(ip, secret)
+
+	seed := generateChallengeSeed(ip, secret)
+	// 先设置临时 cookie（种子），JS 完成后会覆盖
 	http.SetCookie(w, &http.Cookie{
-		Name:     ccCookieName,
-		Value:    token,
+		Name:     ccJSCookieName,
+		Value:    seed,
 		Path:     "/",
-		MaxAge:   ccCookieTTL,
+		MaxAge:   ccJSCookieTTL,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(`<html><head><meta http-equiv="refresh" content="0;url=` + r.URL.String() + `"></head></html>`))
+	w.Write([]byte(jsChallengeHTML(seed, r.URL.String())))
 }
 
-var htmlReload = []byte(`<html><body><script>location.reload()</script></body></html>`)
+var jsReloadHTML = []byte(`<html><body><script>location.reload()</script></body></html>`)
+
+// jsChallengeHTML 生成 JS 计算挑战页面
+// 内嵌纯 JS SHA256（约 1.2KB），不依赖 SubtleCrypto，HTTP 连接也可用
+func jsChallengeHTML(seed, targetURL string) string {
+	return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>安全检查</title><style>body{font-family:-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#f5f5f5}.box{text-align:center;padding:2rem}.s{width:36px;height:36px;border:4px solid #ddd;border-top-color:#1a73e8;border-radius:50%;animation:spin .8s linear infinite;margin:20px auto}@keyframes spin{to{transform:rotate(360deg)}}#m{color:#666;font-size:14px}</style></head><body><div class="box"><div class="s"></div><p id="m">正在验证浏览器安全性...</p></div><script>
+(function(){var S='` + seed + `',U='` + targetURL + `',D='` + strings.Repeat("0", jsChallengeDifficulty) + `',N=0,M=document.getElementById('m');
+function sha256(m){function R(x,n){return(x>>>n)|(x<<(32-n))}function r(x,n){return x>>>n}function C(x,y){return x&y}function X(x,y){return x^y}
+var K=[1116352408,1899447441,3049323471,3921009573,961987163,1508970993,2453635748,2870763221,3624381080,310598401,607225278,1426881987,1925078388,2162078206,2614888103,3248222580,3835390401,4022224774,264347078,604807628,770255983,1249150122,1555081692,1996064986,2554220882,2821834349,2952996808,3210313671,3336571891,3584528711,113926993,338241895,666307205,773529912,1294757372,1396182291,1695183700,1986661051,2177026350,2456956037,2730485921,2820302411,3259730800,3345764771,3516065817,3600352804,4094571909,275423344,430227734,506948616,659060556,883997877,958139571,1322822218,1537002063,1747873779,1955562222,2024104815,2227730452,2361852424,2428436474,2756734187,3204031479,3329325298];
+var H=[1779033703,3144134277,1013904242,2773480762,1359893119,2600822924,528734635,1541459225];
+var b=[],i,j,t,l,ch,maj,s0,s1,t1,t2,W=new Array(64);m=unescape(encodeURIComponent(m));
+for(i=0;i<m.length;i++)b[i>>2]|=m.charCodeAt(i)<<(24-(i%4)*8);b[i>>2]|=0x80<<(24-(i%4)*8);
+var bl=((m.length+8)>>6)+1;b.length=bl*16;for(i=bl*16-2;i>=0;i--)b[i]=b[i]||0;
+var hi=(m.length*8)>>32,lo=(m.length*8)&0xffffffff;b[bl*16-2]=hi;b[bl*16-1]=lo;
+for(var bi=0;bi<bl;bi++){for(i=0;i<16;i++)W[i]=b[bi*16+i];for(i=16;i<64;i++){s0=X(X(R(W[i-15],7),R(W[i-15],18)),r(W[i-15],3));s1=X(X(R(W[i-2],17),R(W[i-2],19)),r(W[i-2],10));W[i]=W[i-16]+s0+W[i-7]+s1|0}
+var a=H[0],b2=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];for(i=0;i<64;i++){t1=h+X(X(R(e,6),R(e,11)),R(e,25))+((e&f)^(~e&g))+K[i]+W[i]|0;t2=X(X(R(a,2),R(a,13)),R(a,22))+((a&b2)^(a&c)^(b2&c))|0;h=g;g=f;f=e;e=d+t1|0;d=c;c=b2;b2=a;a=t1+t2|0}
+H[0]=H[0]+a|0;H[1]=H[1]+b2|0;H[2]=H[2]+c|0;H[3]=H[3]+d|0;H[4]=H[4]+e|0;H[5]=H[5]+f|0;H[6]=H[6]+g|0;H[7]=H[7]+h|0}
+var hex='';for(i=0;i<8;i++){t=H[i];for(j=7;j>=0;j--){hex+=((t>>(j*4))&0xf).toString(16)}}return hex}
+function solve(){var h;while(true){h=sha256(S+':'+N);if(h.substring(0,D.length)===D){document.cookie='` + ccJSCookieName + `='+encodeURIComponent(S+':'+N)+';path=/;max-age=` + strconv.Itoa(ccJSCookieTTL) + `;SameSite=Lax';location.replace(U);return}N++;if(N%5000===0){M.textContent='验证中... ('+N+'次)'}if(N%150===0){setTimeout(solve,0);return}}}
+setTimeout(solve,10)})();
+</script><noscript><p>请启用浏览器的JavaScript功能后刷新页面，或联系网站管理员。</p></noscript></body></html>`
+}
 
 // ---- 主处理器 ----
 
@@ -338,7 +442,8 @@ func (h *ccDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 快速路径：可信 IP → 无需 flooding 检测，几乎无锁
 	if h.trust.isTrusted(ip) {
 		if !h.dlimiter.trusted.allow() {
-			http.Error(w, "Server busy, please retry", http.StatusServiceUnavailable)
+			log.Printf("[cc_defense] trusted ip=%s rate limited, closing connection", ip)
+			closeConnectionSilently(w)
 			return
 		}
 		h.next.ServeHTTP(w, r)
@@ -350,22 +455,47 @@ func (h *ccDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	flooding := h.flood.isFlooding(ip)
 
 	if flooding {
-		ck, _ := r.Cookie(ccCookieName)
-		if ck != nil && verifyCookie(ip, ck.Value, h.secret) {
+		// 搜索引擎爬虫白名单 — 不挑战，限速后放行
+		if isSearchBot(r.Header.Get("User-Agent")) {
 			if !h.dlimiter.untrusted.allow() {
-				http.Error(w, "Server busy, please retry", http.StatusServiceUnavailable)
+				log.Printf("[cc_defense] search bot ip=%s rate limited, closing connection", ip)
+				closeConnectionSilently(w)
 				return
 			}
 			h.next.ServeHTTP(w, r)
 			return
 		}
+
+		ck, _ := r.Cookie(ccJSCookieName)
+		if ck != nil {
+			// cookie 格式: seed:nonce
+			val := ck.Value
+			idx := strings.LastIndex(val, ":")
+			if idx > 0 {
+				seed := val[:idx]
+				nonce := val[idx+1:]
+				if verifyChallengeSeed(seed, ip, h.secret) && verifyJSProof(seed, nonce) {
+					// JS 工作量证明通过 → 升级为可信 IP
+					// 后续请求走快速通道，不再被挑战或严格限流
+					h.trust.setTrusted(ip)
+					if !h.dlimiter.untrusted.allow() {
+						log.Printf("[cc_defense] untrusted ip=%s rate limited (valid js proof), closing connection", ip)
+						closeConnectionSilently(w)
+						return
+					}
+					h.next.ServeHTTP(w, r)
+					return
+				}
+			}
+		}
 		h.reportOffender(ip)
-		serveChallenge(w, r, ip, h.secret)
+		serveJSChallenge(w, r, ip, h.secret)
 		return
 	}
 
 	if !h.dlimiter.untrusted.allow() {
-		http.Error(w, "Server busy, please retry later", http.StatusServiceUnavailable)
+		log.Printf("[cc_defense] untrusted ip=%s rate limited, closing connection", ip)
+		closeConnectionSilently(w)
 		return
 	}
 

@@ -83,8 +83,7 @@ func (rl *ipRateLimiter) middleware(next http.Handler) http.Handler {
 		if over {
 			log.Printf("[ratelimit] ip=%s uri=%s reason=%s block=%v", ip, r.URL.Path, reason, rl.block)
 			if rl.block {
-				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-				http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+				closeConnectionSilently(w)
 				if rl.onBlock != nil {
 					rl.onBlock(ip)
 				}

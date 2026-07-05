@@ -315,6 +315,23 @@ func realIPMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// closeConnectionSilently 直接关闭底层 TCP 连接，不发送 HTTP 响应。
+// 效果类似 nginx 的 444 (Connection Closed Without Response)。
+// 用于 CC/DDoS 拦截场景：节省出站带宽、不暴露服务器信息、减少攻击者探测机会。
+// 仅 HTTP/1.1 支持 hijack；HTTP/2 或 hijack 不可用时 fallback 为最小 503 响应。
+func closeConnectionSilently(w http.ResponseWriter) {
+	if hj, ok := w.(http.Hijacker); ok {
+		conn, _, err := hj.Hijack()
+		if err == nil {
+			conn.Close()
+			return
+		}
+	}
+	// fallback: HTTP/2 或 hijack 不可用
+	w.Header().Set("Connection", "close")
+	w.WriteHeader(http.StatusServiceUnavailable)
+}
+
 func trimHost(listen string) string {
 	if strings.HasPrefix(listen, ":") {
 		return listen

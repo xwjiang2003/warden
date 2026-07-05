@@ -38,7 +38,7 @@ func (c *WAFRulesConfig) build() string {
 	var b strings.Builder
 
 	if len(c.ScannerUAs) > 0 {
-		b.WriteString(fmt.Sprintf("SecRule REQUEST_HEADERS:User-Agent \"@rx (?i)(%s)\" \\\n    \"id:910001,phase:1,deny,status:403,log,auditlog,msg:'Scanner UA'\"\n\n",
+		b.WriteString(fmt.Sprintf("SecRule REQUEST_HEADERS:User-Agent \"@rx (?i)(%s)\" \\\n    \"id:910001,phase:1,drop,log,auditlog,msg:'Scanner UA'\"\n\n",
 			strings.Join(c.ScannerUAs, "|")))
 	}
 
@@ -47,14 +47,14 @@ func (c *WAFRulesConfig) build() string {
 		for i, p := range c.ScannerPaths {
 			escaped[i] = escapeRx(p)
 		}
-		b.WriteString(fmt.Sprintf("SecRule REQUEST_URI \"@rx (?i)^/(%s)\" \\\n    \"id:910002,phase:1,deny,status:403,log,auditlog,msg:'Scanner path'\"\n\n",
+		b.WriteString(fmt.Sprintf("SecRule REQUEST_URI \"@rx (?i)^/(%s)\" \\\n    \"id:910002,phase:1,drop,log,auditlog,msg:'Scanner path'\"\n\n",
 			strings.Join(escaped, "|")))
 	}
 
 	if c.BlockScriptUA {
 		uas := []string{"Go-http-client", "python-requests", "curl", "wget", "axios", "okhttp", "Java"}
 		uas = append(uas, c.CustomScriptUAs...)
-		b.WriteString(fmt.Sprintf("SecRule REQUEST_HEADERS:User-Agent \"@rx (?i)(%s)\" \\\n    \"id:910004,phase:1,deny,status:403,log,auditlog,msg:'Script/bot UA'\"\n\n",
+		b.WriteString(fmt.Sprintf("SecRule REQUEST_HEADERS:User-Agent \"@rx (?i)(%s)\" \\\n    \"id:910004,phase:1,drop,log,auditlog,msg:'Script/bot UA'\"\n\n",
 			strings.Join(uas, "|")))
 	}
 
@@ -63,14 +63,14 @@ func (c *WAFRulesConfig) build() string {
 		for i, p := range c.CCPaths {
 			escaped[i] = escapeRx(p)
 		}
-		b.WriteString(fmt.Sprintf("SecRule REQUEST_URI \"@rx (?i)(%s)\" \\\n    \"id:910003,phase:1,chain,deny,status:429,log,auditlog,msg:'CC hot path no referer'\"\n    SecRule &REQUEST_HEADERS:Referer \"@eq 0\"\n\n",
+		b.WriteString(fmt.Sprintf("SecRule REQUEST_URI \"@rx (?i)(%s)\" \\\n    \"id:910003,phase:1,chain,drop,log,auditlog,msg:'CC hot path no referer'\"\n    SecRule &REQUEST_HEADERS:Referer \"@eq 0\"\n\n",
 			strings.Join(escaped, "|")))
 	}
 
 	for i, p := range c.CustomBlockPaths {
 		rid := 910100 + i
-		b.WriteString(fmt.Sprintf("SecRule REQUEST_URI \"@rx %s\" \\\n    \"id:%d,phase:1,deny,status:%d,log,auditlog,msg:'Custom block path'\"\n",
-			p, rid, c.CustomBlockStatus))
+		b.WriteString(fmt.Sprintf("SecRule REQUEST_URI \"@rx %s\" \\\n    \"id:%d,phase:1,drop,log,auditlog,msg:'Custom block path'\"\n",
+			p, rid))
 	}
 
 	return b.String()

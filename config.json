@@ -13,9 +13,9 @@
   "block_requests": true,
   "rate_limit": {
     "enabled": true,
-    "hot_path_max": 10,
+    "hot_path_max": 30,
     "hot_path_window_sec": 30,
-    "site_max_per_min": 60,
+    "site_max_per_min": 300,
     "hot_path_patterns": [
       "^/pub/news/4($|;|\\?)",
       "^/pub/newsList/(70|81|84|100)($|;|\\?)",

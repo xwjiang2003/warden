@@ -4,6 +4,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
@@ -13,8 +14,23 @@ type RateLimitConfig struct {
 	HotPathMax       int      `json:"hot_path_max"`
 	HotPathWindowSec int      `json:"hot_path_window_sec"`
 	SiteMaxPerMin    int      `json:"site_max_per_min"`
+	SubnetMaxPerMin  int      `json:"subnet_max_per_min"` // /24 子网限流，防同网段多IP攻击
 	// 仅对日志里确认的 CC 热点 URI 限流；不匹配普通 newsList 列表页
 	HotPathPatterns []string `json:"hot_path_patterns"`
+}
+
+// subnet24 提取 IP 的 /24 子网前缀
+func subnet24(ip string) string {
+	if strings.Contains(ip, ":") {
+		// IPv6: 取 /48
+		return ip[:strings.LastIndex(ip, ":")] + "::/48"
+	}
+	// IPv4: 取 /24
+	idx := strings.LastIndex(ip, ".")
+	if idx < 0 {
+		return ip
+	}
+	return ip[:idx] + ".0/24"
 }
 
 type ipRateLimiter struct {
@@ -24,7 +40,13 @@ type ipRateLimiter struct {
 	onBlock     func(ip string)
 	mu          sync.Mutex
 	counters    map[string]*ipCounters
+	subnetCount map[string]*subnetCounter // /24 子网计数
 	offenderCnt map[string]int
+}
+
+type subnetCounter struct {
+	count int
+	reset time.Time
 }
 
 type ipCounters struct {
@@ -53,12 +75,17 @@ func newIPRateLimiter(cfg RateLimitConfig, blockRequests bool, onBlock func(ip s
 		compiled = append(compiled, regexp.MustCompile(p))
 	}
 
+	if cfg.SubnetMaxPerMin <= 0 {
+		cfg.SubnetMaxPerMin = 500 // 默认每 /24 子网 500次/分钟
+	}
+
 	return &ipRateLimiter{
 		cfg:         cfg,
 		block:       blockRequests,
 		hotPaths:    compiled,
 		onBlock:     onBlock,
 		counters:    make(map[string]*ipCounters),
+		subnetCount: make(map[string]*subnetCounter),
 		offenderCnt: make(map[string]int),
 	}
 }
@@ -94,10 +121,38 @@ func (rl *ipRateLimiter) middleware(next http.Handler) http.Handler {
 	})
 }
 
+// subnetCheckLocked 检查 /24 子网级别限流（需在 mu 锁内调用）
+func (rl *ipRateLimiter) subnetCheckLocked(ip string, now time.Time) (reason string, over bool) {
+	if rl.cfg.SubnetMaxPerMin <= 0 {
+		return "", false
+	}
+	subnet := subnet24(ip)
+	sc, ok := rl.subnetCount[subnet]
+	if !ok {
+		rl.subnetCount[subnet] = &subnetCounter{count: 1, reset: now.Add(time.Minute)}
+		return "", false
+	}
+	if now.After(sc.reset) {
+		sc.count = 1
+		sc.reset = now.Add(time.Minute)
+		return "", false
+	}
+	sc.count++
+	if sc.count > rl.cfg.SubnetMaxPerMin {
+		return "subnet_rpm", true
+	}
+	return "", false
+}
+
 func (rl *ipRateLimiter) check(ip string, hotPath bool) (reason string, over bool) {
 	now := time.Now()
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
+
+	// /24 子网级别限流检查
+	if reason, over := rl.subnetCheckLocked(ip, now); over {
+		return reason, true
+	}
 
 	c, ok := rl.counters[ip]
 	if !ok {
@@ -133,6 +188,14 @@ func (rl *ipRateLimiter) check(ip string, hotPath bool) (reason string, over boo
 		for k, v := range rl.counters {
 			if now.After(v.siteReset) && now.After(v.hotReset) {
 				delete(rl.counters, k)
+			}
+		}
+	}
+	// 清理过期的子网计数器
+	if len(rl.subnetCount) > 50000 {
+		for k, v := range rl.subnetCount {
+			if now.After(v.reset) {
+				delete(rl.subnetCount, k)
 			}
 		}
 	}

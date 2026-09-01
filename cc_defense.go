@@ -608,6 +608,7 @@ type ccDefenseHandler struct {
 	offenders sync.Map
 	behavior  *ipBehaviorTracker
 	sessions  *sessionTracker
+	ipChecker *IPRegionChecker
 	cfg       CCDefenseConfig
 	secret    string
 	next      http.Handler
@@ -626,8 +627,9 @@ func newCCDefense(cfg CCDefenseConfig, fw *firewallBlocker, next http.Handler) h
 		flood:    newNewIPFloodDetector(cfg.NewIPCheckSec, cfg.NewIPRatioBlock, cfg.NewIPCheckMinReqs),
 		fw:       fw,
 		behavior: newIPBehaviorTracker(),
-		sessions: newSessionTracker(),
-		cfg:      cfg,
+		sessions:  newSessionTracker(),
+		ipChecker: newIPRegionChecker(),
+		cfg:       cfg,
 		secret:   cfg.ChallengeCookieKey,
 		next:     next,
 	}
@@ -658,6 +660,15 @@ func (h *ccDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ip := clientIPFromRequest(r)
+
+	// IP 归属检测：云服务商/国外 IP 直接拒绝
+	if h.ipChecker != nil {
+		if blocked, reason := h.ipChecker.isBlocked(ip); blocked {
+			log.Printf("[cc_defense] IP blocked ip=%s reason=%s", ip, reason)
+			closeConnectionSilently(w)
+			return
+		}
+	}
 
 	// 快速路径：可信 IP → 无需 flooding 检测，几乎无锁
 	if h.trust.isTrusted(ip) {

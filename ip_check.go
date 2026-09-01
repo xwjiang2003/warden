@@ -120,45 +120,69 @@ func (c *IPRegionChecker) search(ipStr string) (string, error) {
 	return "", nil
 }
 
-func (c *IPRegionChecker) isBlocked(ip string) (bool, string) {
+// classify 返回 IP 的国家与 ISP 字段；非公网/无法解析返回 ok=false。
+// region 格式：国家|省份|城市|ISP|国家代码，故 ISP 在 parts[3]、国家代码在 parts[4]。
+func (c *IPRegionChecker) classify(ip string) (country, isp string, ok bool) {
 	if c == nil || c.data == nil {
-		return false, ""
+		return "", "", false
 	}
 
 	// 非公网地址（私有/内网/回环/链路本地/组播/未指定）直接放行，不做归属判断
 	// 避免 ip2region 将 10.x / 192.168.x 等保留网段标为 "Reserved" 导致误判为国外
 	if pip := net.ParseIP(ip); pip == nil || isNonPublicIP(pip) {
-		return false, ""
+		return "", "", false
 	}
 
 	region, err := c.search(ip)
 	if err != nil || region == "" {
-		return false, ""
+		return "", "", false
 	}
 
 	parts := strings.Split(region, "|")
 	if len(parts) < 5 {
-		return false, ""
+		return "", "", false
 	}
 
-	country := strings.TrimSpace(parts[0])
-	isp := strings.TrimSpace(parts[4])
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[3]), true
+}
 
-	// 1. 国外 IP 直接拒绝；"Reserved" 表示保留/未分配地址段（含内网），放行
-	if country != "" && country != "0" && country != "中国" && country != "Reserved" &&
-		!strings.Contains(country, "内网") && !strings.Contains(country, "局域网") {
-		return true, "foreign:" + country
+// isForeignCountry 判断国家是否为国外（排除中国/保留/内网/局域网）
+func isForeignCountry(country string) bool {
+	if country == "" || country == "0" || country == "中国" || country == "Reserved" {
+		return false
 	}
+	return !strings.Contains(country, "内网") && !strings.Contains(country, "局域网")
+}
 
-	// 2. 云服务商 / IDC 机房 IP 直接拒绝
+// isCloudISP 判断 ISP 是否为云服务商/IDC 机房
+func isCloudISP(isp string) bool {
 	ispLower := strings.ToLower(isp)
 	for _, kw := range cloudISPKeywords {
 		if strings.Contains(ispLower, strings.ToLower(kw)) {
-			return true, "cloud:" + isp
+			return true
 		}
 	}
+	return false
+}
 
+// isBlockedBy 按开关判断是否拦截（blockForeign / blockCloud 独立控制）
+func (c *IPRegionChecker) isBlockedBy(ip string, blockForeign, blockCloud bool) (bool, string) {
+	country, isp, ok := c.classify(ip)
+	if !ok {
+		return false, ""
+	}
+	if blockForeign && isForeignCountry(country) {
+		return true, "foreign:" + country
+	}
+	if blockCloud && isCloudISP(isp) {
+		return true, "cloud:" + isp
+	}
 	return false, ""
+}
+
+// isBlocked 默认同时启用国外与云厂商拦截（供测试/兼容使用）
+func (c *IPRegionChecker) isBlocked(ip string) (bool, string) {
+	return c.isBlockedBy(ip, true, true)
 }
 
 // isNonPublicIP 判断是否为非公网地址：私有、回环、链路本地、组播、未指定。

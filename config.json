@@ -4,7 +4,7 @@
   "rules_file": "rules/coraza.conf",
   "read_timeout_sec": 60,
   "write_timeout_sec": 60,
-  "idle_timeout_sec": 120,
+  "idle_timeout_sec": 180,
   "access_log": "logs/access.log",
   "access_log_rotate": {
     "mode": "daily",
@@ -13,10 +13,10 @@
   "block_requests": true,
   "rate_limit": {
     "enabled": true,
-    "hot_path_max": 30,
+    "hot_path_max": 300,
     "hot_path_window_sec": 30,
-    "site_max_per_min": 300,
-    "subnet_max_per_min": 500,
+    "site_max_per_min": 1200,
+    "subnet_max_per_min": 2000,
     "hot_path_patterns": [
       "^/pub/news/4($|;|\\?)",
       "^/pub/newsList/(70|81|84|100)($|;|\\?)",
@@ -98,6 +98,10 @@
   "ip_whitelist": {
     "enabled": false,
     "cidrs": []
+  },
+  "ip_check": {
+    "block_foreign": true,
+    "block_cloud": true
   },
   "admin": {
     "enabled": true,

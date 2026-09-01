@@ -10,11 +10,11 @@ import (
 )
 
 type RateLimitConfig struct {
-	Enabled          bool     `json:"enabled"`
-	HotPathMax       int      `json:"hot_path_max"`
-	HotPathWindowSec int      `json:"hot_path_window_sec"`
-	SiteMaxPerMin    int      `json:"site_max_per_min"`
-	SubnetMaxPerMin  int      `json:"subnet_max_per_min"` // /24 子网限流，防同网段多IP攻击
+	Enabled          bool `json:"enabled"`
+	HotPathMax       int  `json:"hot_path_max"`
+	HotPathWindowSec int  `json:"hot_path_window_sec"`
+	SiteMaxPerMin    int  `json:"site_max_per_min"`
+	SubnetMaxPerMin  int  `json:"subnet_max_per_min"` // /24 子网限流，防同网段多IP攻击
 	// 仅对日志里确认的 CC 热点 URI 限流；不匹配普通 newsList 列表页
 	HotPathPatterns []string `json:"hot_path_patterns"`
 }
@@ -110,7 +110,9 @@ func (rl *ipRateLimiter) middleware(next http.Handler) http.Handler {
 		if over {
 			log.Printf("[ratelimit] ip=%s uri=%s reason=%s block=%v", ip, r.URL.Path, reason, rl.block)
 			if rl.block {
-				closeConnectionSilently(w)
+				// 普通限流返回 429（而非静默断连），避免 nginx 端显示 500/空响应、也便于前端排查
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 				if rl.onBlock != nil {
 					rl.onBlock(ip)
 				}

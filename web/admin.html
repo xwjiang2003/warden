@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pyfls WAF - 管理后台</title>
+<link rel="stylesheet" href="https://unpkg.com/element-plus@2.9.7/dist/index.css">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f2f5}
+#app{min-height:100vh}
+.el-aside{background:#1d1e2c;overflow-y:auto}
+.el-aside .logo{height:56px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:17px;font-weight:700;border-bottom:1px solid rgba(255,255,255,0.08);letter-spacing:1px}
+.el-aside .el-menu{border-right:none;background:transparent}
+.el-aside .el-menu-item{color:rgba(255,255,255,0.65)}
+.el-aside .el-menu-item:hover,.el-aside .el-menu-item.is-active{color:#fff;background:rgba(64,158,255,0.15)}
+.el-header{background:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 24px;box-shadow:0 1px 3px rgba(0,0,0,0.06);z-index:1;height:56px}
+.el-header h2{font-size:16px;font-weight:600;color:#303133}
+.el-main{padding:20px 24px}
+.page-card{background:#fff;border-radius:8px;padding:24px;box-shadow:0 1px 2px rgba(0,0,0,0.03);margin-bottom:20px}
+.page-card h3{font-size:15px;font-weight:600;color:#303133;margin-bottom:20px;padding-bottom:12px;border-bottom:1px solid #ebeef5}
+.stats-row{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px}
+.stat-item{flex:1;min-width:170px;background:#fff;border-radius:8px;padding:20px;box-shadow:0 1px 2px rgba(0,0,0,0.03);display:flex;flex-direction:column;gap:8px}
+.stat-item .label{font-size:13px;color:#909399}
+.stat-item .value{font-size:24px;font-weight:700;color:#303133}
+.stat-item .value.green{color:#67c23a}
+.stat-item .value.orange{color:#e6a23c}
+.stat-item .value.blue{color:#409eff}
+.el-form-item__label{font-weight:500}
+.log-viewer{background:#1e1e1e;color:#d4d4d4;border-radius:6px;padding:16px;font-family:"Cascadia Code","Fira Code",monospace;font-size:12px;line-height:1.7;max-height:500px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
+.tag-input-wrap{display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-height:34px;border:1px solid #dcdfe6;border-radius:4px;padding:4px 8px;background:#fff;cursor:text}
+.tag-input-wrap:focus-within{border-color:#409eff}
+.tag-input-wrap .tag-input{flex:1;min-width:120px;border:none;outline:none;height:28px;font-size:13px;background:transparent}
+.restart-notice{background:#fef0f0;border:1px solid #fde2e2;border-radius:6px;padding:12px 16px;margin-top:16px;color:#f56c6c;font-size:13px;display:flex;align-items:center;gap:8px}
+</style>
+</head>
+<body>
+<div id="app">
+<el-container style="min-height:100vh">
+  <el-aside width="220px">
+    <div class="logo">🛡️ Pyfls WAF</div>
+    <el-menu :default-active="currentRoute" @select="navigate" background-color="#1d1e2c" text-color="rgba(255,255,255,0.65)" active-text-color="#fff">
+      <el-menu-item index="dashboard">📊 仪表盘</el-menu-item>
+      <el-menu-item index="basic">⚙️ 基本设置</el-menu-item>
+      <el-menu-item index="ratelimit">⏱️ 频率限制</el-menu-item>
+      <el-menu-item index="ccdefense">🛡️ CC 防御</el-menu-item>
+      <el-menu-item index="wafrules">🔒 WAF 规则</el-menu-item>
+      <el-menu-item index="connlimit">🔗 连接限制</el-menu-item>
+      <el-menu-item index="logs">📋 访问日志</el-menu-item>
+    </el-menu>
+  </el-aside>
+  <el-container>
+    <el-header>
+      <h2>{{ pageTitle }}</h2>
+      <div style="display:flex;align-items:center;gap:16px;font-size:13px;color:#909399">
+        <span v-if="configLoaded">代理: {{ config.listen }} → {{ config.backend }}</span>
+        <el-tag :type="blockType" size="small">{{ config.block_requests ? '拦截模式' : '监控模式' }}</el-tag>
+      </div>
+    </el-header>
+    <el-main>
+      <!-- 仪表盘 -->
+      <template v-if="currentRoute==='dashboard'">
+        <div class="stats-row">
+          <div class="stat-item"><span class="label">运行时间</span><span class="value blue" style="font-size:18px">{{ stats.uptime }}</span></div>
+          <div class="stat-item"><span class="label">CC 防御</span><span class="value" :class="stats.cc_defense_enabled?'green':'orange'">{{ stats.cc_defense_enabled ? '已开启' : '已关闭' }}</span></div>
+          <div class="stat-item"><span class="label">频率限制</span><span class="value" :class="stats.rate_limit_enabled?'green':'orange'">{{ stats.rate_limit_enabled ? '已开启' : '已关闭' }}</span></div>
+          <div class="stat-item"><span class="label">协程数</span><span class="value blue">{{ stats.num_goroutine }}</span></div>
+        </div>
+        <div class="stats-row">
+          <div class="stat-item"><span class="label">内存使用</span><span class="value">{{ stats.memory_mb.toFixed(1) }} MB</span></div>
+          <div class="stat-item"><span class="label">系统内存</span><span class="value">{{ stats.memory_sys_mb.toFixed(1) }} MB</span></div>
+          <div class="stat-item"><span class="label">CPU 核心</span><span class="value">{{ stats.num_cpu }}</span></div>
+          <div class="stat-item"><span class="label">Go 版本</span><span class="value" style="font-size:16px">{{ stats.go_version }}</span></div>
+        </div>
+        <div class="page-card">
+          <h3>代理信息</h3>
+          <el-descriptions :column="2" border size="small">
+            <el-descriptions-item label="监听地址">{{ stats.proxy_listen }}</el-descriptions-item>
+            <el-descriptions-item label="后端地址">{{ stats.proxy_backend }}</el-descriptions-item>
+            <el-descriptions-item label="启动时间">{{ stats.start_time }}</el-descriptions-item>
+            <el-descriptions-item label="运行模式">{{ config.block_requests ? '拦截模式 (Block)' : '监控模式 (Log Only)' }}</el-descriptions-item>
+          </el-descriptions>
+        </div>
+      </template>
+
+      <!-- 基本设置 -->
+      <template v-if="currentRoute==='basic'">
+        <div class="page-card">
+          <h3>代理设置</h3>
+          <el-form :model="config" label-width="130px" label-position="left">
+            <el-row :gutter="20">
+              <el-col :span="12">
+                <el-form-item label="监听地址"><el-input v-model="config.listen" placeholder=":80" /></el-form-item>
+              </el-col>
+              <el-col :span="12">
+                <el-form-item label="后端地址"><el-input v-model="config.backend" placeholder="http://127.0.0.1:81" /></el-form-item>
+              </el-col>
+            </el-row>
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <el-form-item label="读超时(秒)"><el-input-number v-model="config.read_timeout_sec" :min="1" :max="600" /></el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="写超时(秒)"><el-input-number v-model="config.write_timeout_sec" :min="1" :max="600" /></el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="空闲超时(秒)"><el-input-number v-model="config.idle_timeout_sec" :min="1" :max="600" /></el-form-item>
+              </el-col>
+            </el-row>
+            <el-form-item label="规则文件"><el-input v-model="config.rules_file" placeholder="rules/coraza.conf" /></el-form-item>
+          </el-form>
+        </div>
+        <div class="page-card">
+          <h3>访问日志</h3>
+          <el-form :model="config" label-width="130px" label-position="left">
+            <el-form-item label="日志路径"><el-input v-model="config.access_log" placeholder="logs/access.log" /></el-form-item>
+            <el-row :gutter="20">
+              <el-col :span="12">
+                <el-form-item label="轮转模式">
+                  <el-select v-model="config.access_log_rotate.mode" style="width:100%">
+                    <el-option label="按天 (daily)" value="daily" />
+                    <el-option label="按大小 (size)" value="size" />
+                  </el-select>
+                </el-form-item>
+              </el-col>
+              <el-col :span="12">
+                <el-form-item v-if="config.access_log_rotate.mode==='size'" label="最大大小(MB)">
+                  <el-input-number v-model="config.access_log_rotate.max_size_mb" :min="1" :max="10000" />
+                </el-form-item>
+              </el-col>
+            </el-row>
+          </el-form>
+        </div>
+        <div class="page-card">
+          <h3>全局开关</h3>
+          <el-form :model="config" label-width="130px" label-position="left">
+            <el-form-item label="拦截请求">
+              <el-switch v-model="config.block_requests" active-text="拦截" inactive-text="仅记录" />
+              <span style="margin-left:8px;color:#909399;font-size:12px">关闭后 WAF 只记录不拦截，用于调试</span>
+            </el-form-item>
+          </el-form>
+        </div>
+        <div class="page-card">
+          <h3>管理后台设置</h3>
+          <el-form :model="config.admin" label-width="130px" label-position="left">
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <el-form-item label="启用后台"><el-switch v-model="config.admin.enabled" /></el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="监听地址"><el-input v-model="config.admin.listen" placeholder="127.0.0.1:9090" /></el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="用户名"><el-input v-model="config.admin.username" placeholder="admin" /></el-form-item>
+              </el-col>
+            </el-row>
+            <el-form-item label="管理密码">
+              <el-input v-model="config.admin.password" placeholder="留空则不启用认证" show-password />
+              <span style="color:#909399;font-size:12px">设置密码后，访问管理后台需输入用户名密码（HTTP Basic Auth）</span>
+            </el-form-item>
+          </el-form>
+        </div>
+        <div style="text-align:right;margin-top:8px">
+          <el-button type="primary" @click="saveConfig" :loading="saving">保存配置</el-button>
+        </div>
+        <div v-if="restartNeeded" class="restart-notice">⚠️ 配置已保存，部分更改需重启 WAF 服务才能生效</div>
+      </template>
+
+      <!-- 频率限制 -->
+      <template v-if="currentRoute==='ratelimit'">
+        <div class="page-card">
+          <h3>频率限制设置</h3>
+          <el-form :model="config.rate_limit" label-width="160px" label-position="left">
+            <el-form-item label="启用频率限制"><el-switch v-model="config.rate_limit.enabled" /></el-form-item>
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <el-form-item label="热点路径上限"><el-input-number v-model="config.rate_limit.hot_path_max" :min="1" :max="10000" /></el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="热点窗口(秒)"><el-input-number v-model="config.rate_limit.hot_path_window_sec" :min="1" :max="3600" /></el-form-item>
+              </el-col>
+            </el-row>
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <el-form-item label="站点总限速(/分)"><el-input-number v-model="config.rate_limit.site_max_per_min" :min="1" :max="100000" /></el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="子网限速(/分)"><el-input-number v-model="config.rate_limit.subnet_max_per_min" :min="1" :max="100000" /></el-form-item>
+              </el-col>
+            </el-row>
+          </el-form>
+        </div>
+        <div class="page-card">
+          <h3>热点路径正则 (Hot Path Patterns)</h3>
+          <p style="color:#909399;font-size:13px;margin-bottom:12px">匹配这些正则的 URI 将受到单独的热点路径频率限制。每行一个正则表达式。</p>
+          <el-input v-model="hotPathsText" type="textarea" :rows="6" placeholder="^/pub/news/4($|;|\\?)" />
+        </div>
+        <div style="text-align:right;margin-top:8px">
+          <el-button type="primary" @click="saveRateLimit" :loading="saving">保存配置</el-button>
+        </div>
+        <div v-if="restartNeeded" class="restart-notice">⚠️ 频率限制配置已保存，需重启 WAF 服务生效</div>
+      </template>
+
+      <!-- CC 防御 -->
+      <template v-if="currentRoute==='ccdefense'">
+        <div class="page-card">
+          <h3>CC 攻击防御设置</h3>
+          <el-form :model="config.cc_defense" label-width="180px" label-position="left">
+            <el-form-item label="启用 CC 防御"><el-switch v-model="config.cc_defense.enabled" /></el-form-item>
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <el-form-item label="全局 QPS 上限"><el-input-number v-model="config.cc_defense.global_qps_max" :min="1" :max="100000" /></el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="全局突发容量"><el-input-number v-model="config.cc_defense.global_qps_burst" :min="1" :max="100000" /></el-form-item>
+              </el-col>
+            </el-row>
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <el-form-item label="新 IP QPS 上限"><el-input-number v-model="config.cc_defense.new_ip_qps_max" :min="1" :max="10000" /></el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="新 IP 突发容量"><el-input-number v-model="config.cc_defense.new_ip_qps_burst" :min="1" :max="10000" /></el-form-item>
+              </el-col>
+            </el-row>
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <el-form-item label="信任 IP 最少访问"><el-input-number v-model="config.cc_defense.trust_ip_min_visits" :min="1" :max="10000" /></el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="信任窗口(秒)"><el-input-number v-model="config.cc_defense.trust_ip_window_sec" :min="10" :max="86400" /></el-form-item>
+              </el-col>
+            </el-row>
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <el-form-item label="新 IP 占比阈值(%)"><el-input-number v-model="config.cc_defense.new_ip_ratio_block" :min="1" :max="100" /></el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="检测窗口(秒)"><el-input-number v-model="config.cc_defense.new_ip_check_sec" :min="5" :max="3600" /></el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="最小请求数"><el-input-number v-model="config.cc_defense.new_ip_check_min_reqs" :min="1" :max="100000" /></el-form-item>
+              </el-col>
+            </el-row>
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <el-form-item label="防火墙触发次数"><el-input-number v-model="config.cc_defense.firewall_offender_limit" :min="1" :max="1000" /></el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="挑战 Cookie Key"><el-input v-model="config.cc_defense.challenge_cookie_key" placeholder="留空使用默认值" /></el-form-item>
+              </el-col>
+            </el-row>
+          </el-form>
+        </div>
+        <div style="text-align:right;margin-top:8px">
+          <el-button type="primary" @click="saveConfig" :loading="saving">保存配置</el-button>
+        </div>
+        <div v-if="restartNeeded" class="restart-notice">⚠️ CC 防御配置已保存，需重启 WAF 服务生效</div>
+      </template>
+
+      <!-- WAF 规则 -->
+      <template v-if="currentRoute==='wafrules'">
+        <div class="page-card">
+          <h3>WAF 规则设置</h3>
+          <el-form :model="config.waf_rules" label-width="150px" label-position="left">
+            <el-form-item label="拦截脚本 UA"><el-switch v-model="config.waf_rules.block_script_ua" /></el-form-item>
+            <el-form-item label="CC 无 Referer 拦截"><el-switch v-model="config.waf_rules.cc_no_referer_block" /></el-form-item>
+            <el-form-item label="自定义拦截状态码"><el-input-number v-model="config.waf_rules.custom_block_status" :min="200" :max="599" /></el-form-item>
+          </el-form>
+        </div>
+        <div class="page-card">
+          <h3>CC 热点路径 (URI 正则)</h3>
+          <p style="color:#909399;font-size:13px;margin-bottom:8px">匹配这些路径且无 Referer 的请求将被拦截（需开启上面的 CC 无 Referer 拦截）。每行一个正则。</p>
+          <el-input v-model="ccPathsText" type="textarea" :rows="3" placeholder="^/pub/news/4($|;|\\?)" />
+        </div>
+        <div class="page-card">
+          <h3>扫描器路径</h3>
+          <p style="color:#909399;font-size:13px;margin-bottom:8px">访问这些路径的请求将被拦截。每行一个路径。</p>
+          <el-input v-model="scannerPathsText" type="textarea" :rows="5" placeholder="/phpmyadmin" />
+        </div>
+        <div class="page-card">
+          <h3>扫描器 UA</h3>
+          <p style="color:#909399;font-size:13px;margin-bottom:8px">包含这些关键词的 User-Agent 将被拦截。每行一个关键词。</p>
+          <el-input v-model="scannerUAsText" type="textarea" :rows="4" placeholder="zgrab" />
+        </div>
+        <div class="page-card">
+          <h3>自定义脚本 UA（额外拦截）</h3>
+          <p style="color:#909399;font-size:13px;margin-bottom:8px">在默认脚本 UA 拦截基础上额外添加。每行一个关键词。</p>
+          <el-input v-model="customScriptUAsText" type="textarea" :rows="4" placeholder="ShapBot" />
+        </div>
+        <div class="page-card">
+          <h3>自定义拦截路径</h3>
+          <p style="color:#909399;font-size:13px;margin-bottom:8px">匹配这些正则的 URI 将被直接拦截。每行一个正则表达式。</p>
+          <el-input v-model="customBlockPathsText" type="textarea" :rows="3" placeholder="^/secret(/|$)" />
+        </div>
+        <div style="text-align:right;margin-top:8px">
+          <el-button type="primary" @click="saveWAFRules" :loading="saving">保存配置</el-button>
+        </div>
+        <div v-if="restartNeeded" class="restart-notice">⚠️ WAF 规则已保存，需重启 WAF 服务生效</div>
+      </template>
+
+      <!-- 连接限制 -->
+      <template v-if="currentRoute==='connlimit'">
+        <div class="page-card">
+          <h3>L4 连接限制</h3>
+          <el-form :model="config.conn_limit" label-width="160px" label-position="left">
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <el-form-item label="每秒最大连接数"><el-input-number v-model="config.conn_limit.max_conns_per_sec" :min="1" :max="100000" /></el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="突发容量"><el-input-number v-model="config.conn_limit.burst" :min="1" :max="100000" /></el-form-item>
+              </el-col>
+            </el-row>
+          </el-form>
+        </div>
+        <div class="page-card">
+          <h3>Windows 防火墙拦截</h3>
+          <p style="color:#909399;font-size:13px;margin-bottom:12px">仅 Windows 系统有效，Linux 下此配置无实际效果。</p>
+          <el-form :model="config.firewall_block" label-width="160px" label-position="left">
+            <el-form-item label="启用防火墙拦截"><el-switch v-model="config.firewall_block.enabled" /></el-form-item>
+            <el-form-item label="自动拦截"><el-switch v-model="config.firewall_block.auto_block" /></el-form-item>
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <el-form-item label="拦截过期(分钟)"><el-input-number v-model="config.firewall_block.expire_min" :min="1" :max="10080" /></el-form-item>
+              </el-col>
+            </el-row>
+          </el-form>
+        </div>
+        <div style="text-align:right;margin-top:8px">
+          <el-button type="primary" @click="saveConfig" :loading="saving">保存配置</el-button>
+        </div>
+        <div v-if="restartNeeded" class="restart-notice">⚠️ 连接限制配置已保存，需重启 WAF 服务生效</div>
+      </template>
+
+      <!-- 访问日志 -->
+      <template v-if="currentRoute==='logs'">
+        <div class="page-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+            <h3 style="margin:0;padding:0;border:none">访问日志 (最近 100 行)</h3>
+            <el-button @click="loadLogs" :loading="logsLoading" size="small">🔄 刷新</el-button>
+          </div>
+          <p v-if="logFile" style="color:#909399;font-size:12px;margin-bottom:8px">文件: {{ logFile }}</p>
+          <div class="log-viewer" v-if="logLines.length > 0">{{ logLines.join('\n') }}</div>
+          <el-empty v-else description="暂无日志" />
+        </div>
+      </template>
+    </el-main>
+  </el-container>
+</el-container>
+</div>
+
+<script src="https://unpkg.com/vue@3.5.13/dist/vue.global.prod.js"></script>
+<script src="https://unpkg.com/vue-router@4.5.1/dist/vue-router.global.prod.js"></script>
+<script src="https://unpkg.com/element-plus@2.9.7/dist/index.full.min.js"></script>
+<script src="https://unpkg.com/axios@1.7.9/dist/axios.min.js"></script>
+<script>
+const { createApp, ref, reactive, computed, onMounted } = Vue
+const { createRouter, createWebHashHistory } = VueRouter
+
+// API 基础路径
+const api = axios.create({ baseURL: '/api', timeout: 10000 })
+
+// 默认配置模板
+function defaultConfig() {
+  return {
+    listen: ':80', backend: 'http://127.0.0.1:81', rules_file: 'rules/coraza.conf',
+    read_timeout_sec: 60, write_timeout_sec: 60, idle_timeout_sec: 120,
+    access_log: 'logs/access.log',
+    access_log_rotate: { mode: 'daily', max_size_mb: 100 },
+    block_requests: true,
+    rate_limit: { enabled: true, hot_path_max: 30, hot_path_window_sec: 30, site_max_per_min: 300, subnet_max_per_min: 500, hot_path_patterns: [] },
+    cc_defense: { enabled: true, global_qps_max: 800, global_qps_burst: 200, trust_ip_min_visits: 5, trust_ip_window_sec: 600, new_ip_qps_max: 50, new_ip_qps_burst: 20, new_ip_ratio_block: 80, new_ip_check_sec: 30, new_ip_check_min_reqs: 60, challenge_cookie_key: '', firewall_offender_limit: 10 },
+    waf_rules: { cc_paths: [], cc_no_referer_block: true, scanner_paths: [], scanner_uas: [], block_script_ua: true, custom_script_uas: [], custom_block_paths: [], custom_block_status: 403 },
+    conn_limit: { max_conns_per_sec: 500, burst: 100 },
+    firewall_block: { enabled: true, expire_min: 30, auto_block: true, whitelist_cidrs: [] },
+    admin: { enabled: true, listen: '127.0.0.1:9090', username: 'admin', password: '' }
+  }
+}
+
+const app = createApp({
+  setup() {
+    const config = reactive(defaultConfig())
+    const stats = reactive({ uptime: '-', start_time: '-', go_version: '-', num_goroutine: 0, num_cpu: 0, memory_mb: 0, memory_sys_mb: 0, proxy_listen: '-', proxy_backend: '-', cc_defense_enabled: false, rate_limit_enabled: false, block_requests: false })
+    const currentRoute = ref('dashboard')
+    const saving = ref(false)
+    const restartNeeded = ref(false)
+    const configLoaded = ref(false)
+    const logsLoading = ref(false)
+    const logLines = ref([])
+    const logFile = ref('')
+
+    // 数组字段文本
+    const hotPathsText = ref('')
+    const ccPathsText = ref('')
+    const scannerPathsText = ref('')
+    const scannerUAsText = ref('')
+    const customScriptUAsText = ref('')
+    const customBlockPathsText = ref('')
+
+    const pageTitle = computed(() => {
+      const m = { dashboard:'仪表盘', basic:'基本设置', ratelimit:'频率限制', ccdefense:'CC 防御', wafrules:'WAF 规则', connlimit:'连接限制', logs:'访问日志' }
+      return m[currentRoute.value] || '管理后台'
+    })
+    const blockType = computed(() => config.block_requests ? 'danger' : 'success')
+
+    // 数组文本 ↔ config 同步
+    function arrToText(arr) { return (arr || []).join('\n') }
+    function textToArr(text) { return text.split('\n').map(s => s.trim()).filter(s => s !== '') }
+
+    function syncFromConfig() {
+      hotPathsText.value = arrToText(config.rate_limit.hot_path_patterns)
+      ccPathsText.value = arrToText(config.waf_rules.cc_paths)
+      scannerPathsText.value = arrToText(config.waf_rules.scanner_paths)
+      scannerUAsText.value = arrToText(config.waf_rules.scanner_uas)
+      customScriptUAsText.value = arrToText(config.waf_rules.custom_script_uas)
+      customBlockPathsText.value = arrToText(config.waf_rules.custom_block_paths)
+    }
+
+    function syncToConfig() {
+      config.rate_limit.hot_path_patterns = textToArr(hotPathsText.value)
+      config.waf_rules.cc_paths = textToArr(ccPathsText.value)
+      config.waf_rules.scanner_paths = textToArr(scannerPathsText.value)
+      config.waf_rules.scanner_uas = textToArr(scannerUAsText.value)
+      config.waf_rules.custom_script_uas = textToArr(customScriptUAsText.value)
+      config.waf_rules.custom_block_paths = textToArr(customBlockPathsText.value)
+    }
+
+    async function loadConfig() {
+      try {
+        const { data } = await api.get('/config')
+        Object.assign(config, data)
+        syncFromConfig()
+        configLoaded.value = true
+      } catch (e) {
+        ElementPlus.ElMessage.error('加载配置失败: ' + (e.response?.data?.error || e.message))
+      }
+    }
+
+    async function loadStats() {
+      try {
+        const { data } = await api.get('/stats')
+        Object.assign(stats, data)
+      } catch (e) { /* 静默失败 */ }
+    }
+
+    async function saveConfig() {
+      saving.value = true
+      restartNeeded.value = false
+      syncToConfig()
+      try {
+        const { data } = await api.put('/config', JSON.parse(JSON.stringify(config)))
+        ElementPlus.ElMessage.success(data.message || '配置已保存')
+        if (data.restart_required) restartNeeded.value = true
+      } catch (e) {
+        ElementPlus.ElMessage.error('保存失败: ' + (e.response?.data?.error || e.message))
+      } finally { saving.value = false }
+    }
+
+    async function saveRateLimit() {
+      syncToConfig()
+      await saveConfig()
+    }
+
+    async function saveWAFRules() {
+      syncToConfig()
+      await saveConfig()
+    }
+
+    async function loadLogs() {
+      logsLoading.value = true
+      try {
+        const { data } = await api.get('/logs?lines=100')
+        logLines.value = data.logs || []
+        logFile.value = data.file || ''
+      } catch (e) {
+        ElementPlus.ElMessage.error('加载日志失败')
+      } finally { logsLoading.value = false }
+    }
+
+    function navigate(index) {
+      currentRoute.value = index
+      restartNeeded.value = false
+      if (index === 'logs') loadLogs()
+    }
+
+    onMounted(() => {
+      loadConfig()
+      loadStats()
+      setInterval(loadStats, 30000) // 每 30s 刷新统计
+    })
+
+    return {
+      config, stats, currentRoute, saving, restartNeeded, configLoaded, logsLoading, logLines, logFile,
+      hotPathsText, ccPathsText, scannerPathsText, scannerUAsText, customScriptUAsText, customBlockPathsText,
+      pageTitle, blockType,
+      navigate, saveConfig, saveRateLimit, saveWAFRules, loadLogs
+    }
+  }
+})
+
+app.use(ElementPlus, { locale: {} })
+app.mount('#app')
+</script>
+</body>
+</html>

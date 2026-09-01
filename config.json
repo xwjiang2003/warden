@@ -94,5 +94,15 @@
     "enabled": true,
     "expire_min": 30,
     "auto_block": true
+  },
+  "ip_whitelist": {
+    "enabled": false,
+    "cidrs": []
+  },
+  "admin": {
+    "enabled": true,
+    "listen": "127.0.0.1:9090",
+    "username": "admin",
+    "password": ""
   }
 }

@@ -37,6 +37,8 @@ type Config struct {
 	WAFRules        WAFRulesConfig        `json:"waf_rules"`
 	ConnLimit       ConnLimitConfig       `json:"conn_limit"`
 	FirewallBlock   FirewallBlockConfig   `json:"firewall_block"`
+	IPWhitelist     IPWhitelistConfig     `json:"ip_whitelist"`
+	Admin           AdminConfig           `json:"admin"`
 }
 
 type ConnLimitConfig struct {
@@ -70,6 +72,12 @@ func (c *FirewallBlockConfig) normalize() {
 	}
 }
 
+// IPWhitelistConfig 全局 IP 白名单配置
+type IPWhitelistConfig struct {
+	Enabled bool     `json:"enabled"`
+	CIDRs   []string `json:"cidrs"`
+}
+
 func main() {
 	exeDir, err := executableDir()
 	if err != nil {
@@ -93,6 +101,12 @@ func main() {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		fatalStartup(exeDir, "config: %v", err)
+	}
+
+	// 启动管理后台 (先于 WAF 启动，以便及早排查配置问题)
+	adminSrv := newAdminServer(cfg, cfgPath, cfg.Admin)
+	if err := adminSrv.start(); err != nil {
+		fatalStartup(exeDir, "admin server: %v", err)
 	}
 
 	for _, d := range []string{"logs", "rules"} {
@@ -129,16 +143,17 @@ func main() {
 	cfg.FirewallBlock.normalize()
 	fwBlocker := newFirewallBlocker(cfg.FirewallBlock.Enabled && cfg.FirewallBlock.AutoBlock, cfg.FirewallBlock.ExpireMin, cfg.FirewallBlock.WhitelistCIDRs)
 
-	handler := realIPMiddleware(txhttp.WrapHandler(waf, proxy))
+	inner := realIPMiddleware(txhttp.WrapHandler(waf, proxy))
 	var ccDef *ccDefenseHandler
 	rl := newIPRateLimiter(cfg.RateLimit, cfg.BlockRequests, func(ip string) {
 		if ccDef != nil {
 			ccDef.reportOffender(ip)
 		}
 	})
-	handler = rl.middleware(handler)
+	handler := rl.middleware(inner)
 	ccDef = newCCDefense(cfg.CCDefense, fwBlocker, handler).(*ccDefenseHandler)
-	mux.Handle("/", ccDef)
+	whitelist := newIPWhitelist(cfg.IPWhitelist.CIDRs)
+	mux.Handle("/", whitelistMiddleware(whitelist, cfg.IPWhitelist.Enabled, inner, ccDef))
 
 	readTO := durationSec(cfg.ReadTimeoutSec, 60)
 	writeTO := durationSec(cfg.WriteTimeoutSec, 60)
@@ -168,6 +183,7 @@ func main() {
 	log.Printf("conn_limit: max=%d/s burst=%d", cfg.ConnLimit.MaxConnsPerSec, cfg.ConnLimit.Burst)
 	log.Printf("firewall: enabled=%v auto_block=%v expire=%dmin",
 		cfg.FirewallBlock.Enabled, cfg.FirewallBlock.AutoBlock, cfg.FirewallBlock.ExpireMin)
+	log.Printf("ip_whitelist: enabled=%v cidrs=%d", cfg.IPWhitelist.Enabled, len(cfg.IPWhitelist.CIDRs))
 	log.Printf("access_log: %s rotate=%s max_size_mb=%d",
 		cfg.AccessLog, cfg.AccessLogRotate.Mode, cfg.AccessLogRotate.MaxSizeMB)
 	log.Printf("health: http://127.0.0.1%s/healthz", trimHost(cfg.Listen))

@@ -38,6 +38,7 @@ type Config struct {
 	ConnLimit       ConnLimitConfig       `json:"conn_limit"`
 	FirewallBlock   FirewallBlockConfig   `json:"firewall_block"`
 	IPWhitelist     IPWhitelistConfig     `json:"ip_whitelist"`
+	IPCheck         IPCheckConfig         `json:"ip_check"`
 	Admin           AdminConfig           `json:"admin"`
 }
 
@@ -77,6 +78,15 @@ type IPWhitelistConfig struct {
 	Enabled bool     `json:"enabled"`
 	CIDRs   []string `json:"cidrs"`
 }
+
+// IPCheckConfig IP 归属检测开关（国外 / 云厂商拦截可独立关闭）
+type IPCheckConfig struct {
+	BlockForeign *bool `json:"block_foreign"` // 缺省 true：拦截国外 IP
+	BlockCloud   *bool `json:"block_cloud"`   // 缺省 true：拦截云厂商/IDC
+}
+
+func (c *IPCheckConfig) blockForeign() bool { return c.BlockForeign == nil || *c.BlockForeign }
+func (c *IPCheckConfig) blockCloud() bool   { return c.BlockCloud == nil || *c.BlockCloud }
 
 func main() {
 	exeDir, err := executableDir()
@@ -151,7 +161,7 @@ func main() {
 		}
 	})
 	handler := rl.middleware(inner)
-	ccDef = newCCDefense(cfg.CCDefense, fwBlocker, handler).(*ccDefenseHandler)
+	ccDef = newCCDefense(cfg.CCDefense, cfg.IPCheck, fwBlocker, handler).(*ccDefenseHandler)
 	whitelist := newIPWhitelist(cfg.IPWhitelist.CIDRs)
 	mux.Handle("/", whitelistMiddleware(whitelist, cfg.IPWhitelist.Enabled, inner, ccDef))
 
@@ -184,6 +194,7 @@ func main() {
 	log.Printf("firewall: enabled=%v auto_block=%v expire=%dmin",
 		cfg.FirewallBlock.Enabled, cfg.FirewallBlock.AutoBlock, cfg.FirewallBlock.ExpireMin)
 	log.Printf("ip_whitelist: enabled=%v cidrs=%d", cfg.IPWhitelist.Enabled, len(cfg.IPWhitelist.CIDRs))
+	log.Printf("ip_check: block_foreign=%v block_cloud=%v", cfg.IPCheck.blockForeign(), cfg.IPCheck.blockCloud())
 	log.Printf("access_log: %s rotate=%s max_size_mb=%d",
 		cfg.AccessLog, cfg.AccessLogRotate.Mode, cfg.AccessLogRotate.MaxSizeMB)
 	log.Printf("health: http://127.0.0.1%s/healthz", trimHost(cfg.Listen))

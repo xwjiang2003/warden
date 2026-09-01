@@ -218,13 +218,12 @@ func (fb *firewallBlocker) reaper() {
 	}
 }
 
-// ---- TCP 连接超时优化 ----
-// 缩短空闲连接和半开连接的超时，更快释放资源
+// ---- TCP 连接优化 ----
+// 仅开启 NoDelay；去掉激进的 30s TCP keepalive（Windows 上会提前重置 nginx 的长连接，
+// 导致间歇性 500 / 空响应）。空闲连接由 http.Server 的 IdleTimeout 统一管理。
 
 func connTimeoutTuning(conn net.Conn) {
 	if tcp, ok := conn.(*net.TCPConn); ok {
-		tcp.SetKeepAlive(true)
-		tcp.SetKeepAlivePeriod(30 * time.Second)
 		tcp.SetNoDelay(true)
 	}
 }

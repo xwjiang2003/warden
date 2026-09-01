@@ -3,6 +3,7 @@ package main
 import (
 	"net"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -89,5 +90,30 @@ func TestIPCheckAsymmetricByteOrder(t *testing.T) {
 		if !tc.wantCN && !blocked {
 			t.Errorf("国外 IP %s 未被拦截", tc.ip)
 		}
+	}
+}
+
+// TestIPCheckSplitFlags 验证国外/云厂商拦截开关独立生效
+func TestIPCheckSplitFlags(t *testing.T) {
+	data, err := os.ReadFile("data/ip2region.xdb")
+	if err != nil {
+		t.Skipf("data/ip2region.xdb 不存在，跳过: %v", err)
+	}
+	c := &IPRegionChecker{data: data}
+
+	// 223.5.5.5：中国 阿里（云厂商）。关云厂商开关应放行，开启应拦为 cloud。
+	if blocked, reason := c.isBlockedBy("223.5.5.5", true, false); blocked {
+		t.Errorf("关掉云厂商拦截后 223.5.5.5 不应被拦（reason=%s）", reason)
+	}
+	if blocked, reason := c.isBlockedBy("223.5.5.5", true, true); !blocked || !strings.HasPrefix(reason, "cloud:") {
+		t.Errorf("开启云厂商拦截后 223.5.5.5 应拦为 cloud（reason=%s）", reason)
+	}
+
+	// 1.2.3.4：澳大利亚（国外，非云）。关国外开关应放行，开启应拦为 foreign。
+	if blocked, reason := c.isBlockedBy("1.2.3.4", false, true); blocked {
+		t.Errorf("关掉国外拦截后 1.2.3.4 不应被拦（reason=%s）", reason)
+	}
+	if blocked, reason := c.isBlockedBy("1.2.3.4", true, true); !blocked || !strings.HasPrefix(reason, "foreign:") {
+		t.Errorf("开启国外拦截后 1.2.3.4 应拦为 foreign（reason=%s）", reason)
 	}
 }

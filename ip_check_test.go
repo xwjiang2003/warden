@@ -17,7 +17,7 @@ func TestIsNonPublicIP(t *testing.T) {
 		{"172.31.255.255", true},
 		{"192.168.1.1", true},
 		{"127.0.0.1", true},
-		{"169.254.1.1", true},  // 链路本地
+		{"169.254.1.1", true}, // 链路本地
 		{"224.0.0.1", true},   // 组播
 		{"0.0.0.0", true},     // 未指定
 		{"::1", true},         // IPv6 回环
@@ -59,5 +59,35 @@ func TestIPCheckPrivateNotBlocked(t *testing.T) {
 	// 国内公网 IP 放行
 	if blocked, _ := c.isBlocked("114.114.114.114"); blocked {
 		t.Errorf("国内公网 IP 114.114.114.114 不应被拦截")
+	}
+}
+
+// TestIPCheckAsymmetricByteOrder 验证段索引字节序修复：
+// 字节非对称的 IP 不再被查错（之前 119.2.159.22 被误判为印度尼西亚）
+func TestIPCheckAsymmetricByteOrder(t *testing.T) {
+	data, err := os.ReadFile("data/ip2region.xdb")
+	if err != nil {
+		t.Skipf("data/ip2region.xdb 不存在，跳过: %v", err)
+	}
+	c := &IPRegionChecker{data: data}
+
+	cases := []struct {
+		ip     string
+		wantCN bool // 是否应为国内（不被 foreign 拦截）
+	}{
+		{"119.2.159.22", true},  // 广东广电，之前误判为 Indonesia
+		{"119.2.0.1", true},     // 北京电信
+		{"110.242.68.66", true}, // 河北联通
+		{"1.2.3.4", false},      // 澳大利亚
+		{"8.8.8.8", false},      // 美国
+	}
+	for _, tc := range cases {
+		blocked, reason := c.isBlocked(tc.ip)
+		if tc.wantCN && blocked {
+			t.Errorf("国内 IP %s 被误拦: %s", tc.ip, reason)
+		}
+		if !tc.wantCN && !blocked {
+			t.Errorf("国外 IP %s 未被拦截", tc.ip)
+		}
 	}
 }

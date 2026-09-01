@@ -98,8 +98,10 @@ func (c *IPRegionChecker) search(ipStr string) (string, error) {
 			return "", nil
 		}
 
-		segStart := binary.BigEndian.Uint32(c.data[segOff : segOff+4])
-		segEnd := binary.BigEndian.Uint32(c.data[segOff+4 : segOff+8])
+		// xdb 段索引里的起止 IP 是小端序存储，需按小端读取；
+		// 之前误按大端读，导致字节非对称的 IP（如 119.2.159.22）被查错
+		segStart := binary.LittleEndian.Uint32(c.data[segOff : segOff+4])
+		segEnd := binary.LittleEndian.Uint32(c.data[segOff+4 : segOff+8])
 
 		if ipU32 < segStart {
 			high = mid - 1

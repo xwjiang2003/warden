@@ -123,6 +123,12 @@ func (c *IPRegionChecker) isBlocked(ip string) (bool, string) {
 		return false, ""
 	}
 
+	// 非公网地址（私有/内网/回环/链路本地/组播/未指定）直接放行，不做归属判断
+	// 避免 ip2region 将 10.x / 192.168.x 等保留网段标为 "Reserved" 导致误判为国外
+	if pip := net.ParseIP(ip); pip == nil || isNonPublicIP(pip) {
+		return false, ""
+	}
+
 	region, err := c.search(ip)
 	if err != nil || region == "" {
 		return false, ""
@@ -136,8 +142,8 @@ func (c *IPRegionChecker) isBlocked(ip string) (bool, string) {
 	country := strings.TrimSpace(parts[0])
 	isp := strings.TrimSpace(parts[4])
 
-	// 1. 国外 IP 直接拒绝
-	if country != "" && country != "0" && country != "中国" &&
+	// 1. 国外 IP 直接拒绝；"Reserved" 表示保留/未分配地址段（含内网），放行
+	if country != "" && country != "0" && country != "中国" && country != "Reserved" &&
 		!strings.Contains(country, "内网") && !strings.Contains(country, "局域网") {
 		return true, "foreign:" + country
 	}
@@ -151,4 +157,15 @@ func (c *IPRegionChecker) isBlocked(ip string) (bool, string) {
 	}
 
 	return false, ""
+}
+
+// isNonPublicIP 判断是否为非公网地址：私有、回环、链路本地、组播、未指定。
+// 这些地址不应参与 IP 归属/地域检测。
+func isNonPublicIP(ip net.IP) bool {
+	return ip.IsPrivate() ||
+		ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() ||
+		ip.IsUnspecified()
 }

@@ -17,6 +17,7 @@ import (
 
 	"warden/internal/accesslog"
 	"warden/internal/admin"
+	"warden/internal/alert"
 	"warden/internal/metrics"
 	"warden/internal/proxy"
 	"warden/internal/router"
@@ -53,6 +54,9 @@ func main() {
 
 	adminSrv := admin.NewServer(cfg, cfgPath, dbPath, cfg.Admin)
 	adminSrv.Start()
+
+	alertChecker := alert.NewChecker(cfg)
+	go alertChecker.Run()
 
 	for _, d := range []string{"logs", "rules"} {
 		if err = os.MkdirAll(d, 0755); err != nil {

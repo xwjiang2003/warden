@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 	"warden/internal/config"
+	"warden/internal/attacklog"
 	"warden/internal/metrics"
 	"warden/internal/util"
 )
@@ -513,6 +514,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.ipChecker != nil && (h.blockForeign || h.blockCloud) {
 		if blocked, reason := h.ipChecker.isBlockedBy(ip, h.blockForeign, h.blockCloud); blocked {
 			log.Printf("[cc_defense] IP blocked ip=%s reason=%s", ip, reason)
+			attacklog.Record(ip, r.Host, r.URL.Path, "IP归属", reason)
 			metrics.IPCheckBlocked.Inc()
 			util.CloseConnectionSilently(w)
 			return
@@ -525,6 +527,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if t, ok := v.(time.Time); ok && time.Since(t) < 24*time.Hour {
 				if !h.dlimiter.trusted.allow() {
 					log.Printf("[cc_defense] trusted session rate limited, closing connection")
+				attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "trusted session")
 				metrics.CCBlocked.Inc()
 					util.CloseConnectionSilently(w)
 					return
@@ -540,6 +543,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.trust.isTrusted(ip) {
 		if !h.dlimiter.trusted.allow() {
 			log.Printf("[cc_defense] trusted ip=%s rate limited, closing connection", ip)
+				attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "trusted ip")
 				metrics.CCBlocked.Inc()
 			util.CloseConnectionSilently(w)
 			return
@@ -556,6 +560,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 请求间隔均匀或路径单一 → 直接拦截
 	if h.behavior.isBotLike(ip, r.URL.Path) {
 		log.Printf("[cc_defense] bot-like behavior ip=%s, closing connection", ip)
+				attacklog.Record(ip, r.Host, r.URL.Path, "CC行为", "bot-like")
 				metrics.CCBlocked.Inc()
 		util.CloseConnectionSilently(w)
 		return
@@ -564,6 +569,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	sid := extractSessionID(r.URL.Path)
 	if anom, reason := h.sessions.record(sid, ip); anom {
 		log.Printf("[cc_defense] session anomaly ip=%s reason=%s, closing connection", ip, reason)
+				attacklog.Record(ip, r.Host, r.URL.Path, "CC会话", reason)
 				metrics.CCBlocked.Inc()
 		util.CloseConnectionSilently(w)
 		return
@@ -574,6 +580,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if isSearchBot(r.Header.Get("User-Agent")) {
 			if !h.dlimiter.untrusted.allow() {
 				log.Printf("[cc_defense] search bot ip=%s rate limited, closing connection", ip)
+				attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "search bot")
 				metrics.CCBlocked.Inc()
 				util.CloseConnectionSilently(w)
 				return
@@ -584,12 +591,14 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		h.ReportOffender(ip)
 		metrics.CCBlocked.Inc()
+		attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "captcha")
 		h.serveCaptcha(w, r, ip)
 		return
 	}
 
 	if !h.dlimiter.untrusted.allow() {
 		log.Printf("[cc_defense] untrusted ip=%s rate limited, closing connection", ip)
+				attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "untrusted")
 				metrics.CCBlocked.Inc()
 		util.CloseConnectionSilently(w)
 		return

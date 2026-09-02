@@ -50,6 +50,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
       <el-menu-item index="sites">🌐 代理站点</el-menu-item>
       <el-menu-item index="ipprotection">🌐 IP 防护</el-menu-item>
       <el-menu-item index="alert">📧 告警通知</el-menu-item>
+      <el-menu-item index="attacklogs">🛡️ 攻击日志</el-menu-item>
       <el-menu-item index="logs">📋 访问日志</el-menu-item>
     </el-menu>
   </el-aside>
@@ -689,6 +690,25 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         <div v-if="restartNeeded" class="restart-notice"><span>⚠️ 告警配置已保存，需重启 WAF 服务生效</span><el-button type="danger" size="small" @click="restartService" :loading="restarting">立即重启</el-button></div>
       </template>
 
+      <!-- 攻击日志 -->
+      <template v-if="currentRoute==='attacklogs'">
+        <div class="page-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+            <h3 style="margin:0;padding:0;border:none">攻击日志（最近 200 条，每 3 秒刷新）</h3>
+            <el-button @click="loadAttackLogs" size="small">🔄 刷新</el-button>
+          </div>
+          <el-table :data="attackLogs" size="small" border style="width:100%">
+            <el-table-column prop="time" label="时间" width="160" />
+            <el-table-column prop="ip" label="IP" width="140" />
+            <el-table-column prop="host" label="Host" width="160" />
+            <el-table-column prop="category" label="分类" width="110" />
+            <el-table-column prop="path" label="路径" min-width="200" show-overflow-tooltip />
+            <el-table-column prop="detail" label="详情" min-width="160" show-overflow-tooltip />
+          </el-table>
+          <el-empty v-if="attackLogs.length === 0" description="暂无攻击日志" />
+        </div>
+      </template>
+
       <!-- 访问日志 -->
       <template v-if="currentRoute==='logs'">
         <div class="page-card">
@@ -772,10 +792,11 @@ const app = createApp({
     const urlAllowlistText = ref('')
     const urlBlocklistText = ref('')
     const alertToText = ref('')
+    const attackLogs = ref([])
     const emailTesting = ref(false)
 
     const pageTitle = computed(() => {
-      const m = { dashboard:'仪表盘', basic:'基本设置', ratelimit:'频率限制', ccdefense:'CC 防御', wafrules:'WAF 规则', connlimit:'连接限制', sites:'代理站点', ipprotection:'IP 防护', alert:'告警通知', logs:'访问日志' }
+      const m = { dashboard:'仪表盘', basic:'基本设置', ratelimit:'频率限制', ccdefense:'CC 防御', wafrules:'WAF 规则', connlimit:'连接限制', sites:'代理站点', ipprotection:'IP 防护', alert:'告警通知', attacklogs:'攻击日志', logs:'访问日志' }
       return m[currentRoute.value] || '管理后台'
     })
     const blockType = computed(() => config.block_requests ? 'danger' : 'success')
@@ -917,6 +938,13 @@ const app = createApp({
       } finally { emailTesting.value = false }
     }
 
+    async function loadAttackLogs() {
+      try {
+        const { data } = await api.get('/attack_logs')
+        attackLogs.value = data.logs || []
+      } catch (e) { /* 静默失败 */ }
+    }
+
     async function loadLogs() {
       logsLoading.value = true
       try {
@@ -932,6 +960,7 @@ const app = createApp({
       currentRoute.value = index
       restartNeeded.value = false
       if (index === 'logs') loadLogs()
+      if (index === 'attacklogs') loadAttackLogs()
     }
 
     onMounted(() => {
@@ -940,6 +969,7 @@ const app = createApp({
       loadMetrics()
       setInterval(loadStats, 30000) // 每 30s 刷新统计
       setInterval(loadMetrics, 2000) // 每 2s 刷新拦截指标
+      setInterval(loadAttackLogs, 3000) // 每 3s 刷新攻击日志
     })
 
     return {
@@ -947,7 +977,7 @@ const app = createApp({
       hotPathsText, ccPathsText, scannerPathsText, scannerUAsText, customScriptUAsText, customBlockPathsText,
       whitelistCIDRsText, firewallWhitelistCIDRsText, blacklistCIDRsText, urlAllowlistText, urlBlocklistText, alertToText, emailTesting,
       pageTitle, blockType,
-      navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, sendTestEmail, loadLogs
+      navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, sendTestEmail, loadLogs, loadAttackLogs, attackLogs
     }
   }
 })

@@ -14,22 +14,25 @@ import (
 
 	"warden"
 	"warden/internal/config"
+	"warden/internal/store"
 )
 
 // Server 管理后台服务
 type Server struct {
 	cfg       *config.Config
 	cfgPath   string
+	dbPath    string
 	adminCfg  config.AdminConfig
 	startTime time.Time
 	mux       *http.ServeMux
 }
 
-func NewServer(cfg *config.Config, cfgPath string, adminCfg config.AdminConfig) *Server {
+func NewServer(cfg *config.Config, cfgPath, dbPath string, adminCfg config.AdminConfig) *Server {
 	adminCfg.Normalize()
 	s := &Server{
 		cfg:       cfg,
 		cfgPath:   cfgPath,
+		dbPath:    dbPath,
 		adminCfg:  adminCfg,
 		startTime: time.Now(),
 		mux:       http.NewServeMux(),
@@ -154,7 +157,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	newCfg.FirewallBlock.Normalize()
 	newCfg.CCDefense.Normalize()
 
-	if err := config.Save(s.cfgPath, &newCfg); err != nil {
+	if err := store.Save(s.cfgPath, s.dbPath, &newCfg); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "写入配置文件失败: " + err.Error(),
 		})
@@ -163,7 +166,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 
 	*s.cfg = newCfg
 
-	log.Printf("[admin] 配置已更新并保存到 %s (部分更改需重启生效)", s.cfgPath)
+	log.Printf("[admin] 配置已更新并保存到 %s / %s (部分更改需重启生效)", s.dbPath, s.cfgPath)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message":          "配置已保存",
 		"restart_required": true,

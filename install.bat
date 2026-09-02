@@ -46,7 +46,7 @@ if errorlevel 1 (
 echo.
 
 echo [3/3] 编译 warden.exe ...
-go build -o warden.exe .
+go build -o warden.exe ./cmd/warden
 if errorlevel 1 (
   echo [错误] 编译失败
   goto :end_pause

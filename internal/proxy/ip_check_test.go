@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"net"
@@ -39,7 +39,7 @@ func TestIsNonPublicIP(t *testing.T) {
 // TestIPCheckPrivateNotBlocked 验证私有/内网地址不会被误判为国外。
 // 需要 data/ip2region.xdb，缺失时跳过。
 func TestIPCheckPrivateNotBlocked(t *testing.T) {
-	data, err := os.ReadFile("data/ip2region.xdb")
+	data, err := os.ReadFile("../../data/ip2region.xdb")
 	if err != nil {
 		t.Skipf("data/ip2region.xdb 不存在，跳过: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestIPCheckPrivateNotBlocked(t *testing.T) {
 // TestIPCheckAsymmetricByteOrder 验证段索引字节序修复：
 // 字节非对称的 IP 不再被查错（之前 119.2.159.22 被误判为印度尼西亚）
 func TestIPCheckAsymmetricByteOrder(t *testing.T) {
-	data, err := os.ReadFile("data/ip2region.xdb")
+	data, err := os.ReadFile("../../data/ip2region.xdb")
 	if err != nil {
 		t.Skipf("data/ip2region.xdb 不存在，跳过: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestIPCheckAsymmetricByteOrder(t *testing.T) {
 
 // TestIPCheckSplitFlags 验证国外/云厂商拦截开关独立生效
 func TestIPCheckSplitFlags(t *testing.T) {
-	data, err := os.ReadFile("data/ip2region.xdb")
+	data, err := os.ReadFile("../../data/ip2region.xdb")
 	if err != nil {
 		t.Skipf("data/ip2region.xdb 不存在，跳过: %v", err)
 	}

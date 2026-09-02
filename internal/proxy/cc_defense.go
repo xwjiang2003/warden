@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"log"
@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"warden/internal/config"
+	"warden/internal/util"
 )
 
 // 搜索引擎爬虫 UA 白名单——不挑战，直接放行
@@ -25,57 +27,6 @@ func isSearchBot(ua string) bool {
 		}
 	}
 	return false
-}
-
-type CCDefenseConfig struct {
-	Enabled               bool   `json:"enabled"`
-	GlobalQPSMax          int    `json:"global_qps_max"`
-	GlobalQPSBurst        int    `json:"global_qps_burst"`
-	TrustIPMinVisits      int    `json:"trust_ip_min_visits"`
-	TrustIPWindowSec      int    `json:"trust_ip_window_sec"`
-	NewIPQPSMax           int    `json:"new_ip_qps_max"`
-	NewIPQPSBurst         int    `json:"new_ip_qps_burst"`
-	NewIPRatioBlock       int    `json:"new_ip_ratio_block"`
-	NewIPCheckSec         int    `json:"new_ip_check_sec"`
-	NewIPCheckMinReqs     int    `json:"new_ip_check_min_reqs"`
-	ChallengeCookieKey    string `json:"challenge_cookie_key"`
-	FirewallOffenderLimit int    `json:"firewall_offender_limit"`
-}
-
-func (c *CCDefenseConfig) normalize() {
-	if c.GlobalQPSMax <= 0 {
-		c.GlobalQPSMax = 800
-	}
-	if c.GlobalQPSBurst <= 0 {
-		c.GlobalQPSBurst = 200
-	}
-	if c.TrustIPMinVisits <= 0 {
-		c.TrustIPMinVisits = 5
-	}
-	if c.TrustIPWindowSec <= 0 {
-		c.TrustIPWindowSec = 600
-	}
-	if c.NewIPQPSMax <= 0 {
-		c.NewIPQPSMax = 50
-	}
-	if c.NewIPQPSBurst <= 0 {
-		c.NewIPQPSBurst = 20
-	}
-	if c.NewIPCheckSec <= 0 {
-		c.NewIPCheckSec = 30
-	}
-	if c.NewIPRatioBlock <= 0 || c.NewIPRatioBlock > 100 {
-		c.NewIPRatioBlock = 80
-	}
-	if c.NewIPCheckMinReqs <= 0 {
-		c.NewIPCheckMinReqs = 60
-	}
-	if c.ChallengeCookieKey == "" {
-		c.ChallengeCookieKey = "warden-cc-secret"
-	}
-	if c.FirewallOffenderLimit <= 0 {
-		c.FirewallOffenderLimit = 10
-	}
 }
 
 // ---- IP 信任追踪器 (sync.Map 无锁版本) ----
@@ -433,11 +384,11 @@ func (st *sessionTracker) record(sessionID, ip string) (anomaly bool, reason str
 
 // ---- 主处理器 ----
 
-type ccDefenseHandler struct {
+type CCDefenseHandler struct {
 	dlimiter        *dualRateLimiter
 	trust           *ipTrustTracker
 	flood           *newIPFloodDetector
-	fw              *firewallBlocker
+	fw              *FirewallBlocker
 	offenders       sync.Map
 	behavior        *ipBehaviorTracker
 	sessions        *sessionTracker
@@ -446,7 +397,7 @@ type ccDefenseHandler struct {
 	trustedSessions sync.Map // sid -> time.Time，验证码通过后的可信会话
 	blockForeign    bool
 	blockCloud      bool
-	cfg             CCDefenseConfig
+	cfg             config.CCDefenseConfig
 	next            http.Handler
 }
 
@@ -455,9 +406,9 @@ type offenderTrack struct {
 	lastSeen   int64
 }
 
-func newCCDefense(cfg CCDefenseConfig, ipCfg IPCheckConfig, fw *firewallBlocker, next http.Handler) http.Handler {
-	cfg.normalize()
-	h := &ccDefenseHandler{
+func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *FirewallBlocker, next http.Handler) *CCDefenseHandler {
+	cfg.Normalize()
+	h := &CCDefenseHandler{
 		dlimiter:     newDualRateLimiter(cfg.GlobalQPSMax, cfg.GlobalQPSBurst, cfg.NewIPQPSMax, cfg.NewIPQPSBurst),
 		trust:        newIPTrustTracker(cfg.TrustIPWindowSec, cfg.TrustIPMinVisits),
 		flood:        newNewIPFloodDetector(cfg.NewIPCheckSec, cfg.NewIPRatioBlock, cfg.NewIPCheckMinReqs),
@@ -466,8 +417,8 @@ func newCCDefense(cfg CCDefenseConfig, ipCfg IPCheckConfig, fw *firewallBlocker,
 		sessions:     newSessionTracker(),
 		ipChecker:    newIPRegionChecker(),
 		captcha:      newCaptchaStore(),
-		blockForeign: ipCfg.blockForeign(),
-		blockCloud:   ipCfg.blockCloud(),
+		blockForeign: ipCfg.BlockForeignEnabled(),
+		blockCloud:   ipCfg.BlockCloudEnabled(),
 		cfg:          cfg,
 		next:         next,
 	}
@@ -477,7 +428,7 @@ func newCCDefense(cfg CCDefenseConfig, ipCfg IPCheckConfig, fw *firewallBlocker,
 	return h
 }
 
-func (h *ccDefenseHandler) reportOffender(ip string) {
+func (h *CCDefenseHandler) ReportOffender(ip string) {
 	if h.fw == nil {
 		return
 	}
@@ -492,12 +443,12 @@ func (h *ccDefenseHandler) reportOffender(ip string) {
 }
 
 // serveCaptcha 返回点选式数字验证码挑战页
-func (h *ccDefenseHandler) serveCaptcha(w http.ResponseWriter, r *http.Request, ip string) {
+func (h *CCDefenseHandler) serveCaptcha(w http.ResponseWriter, r *http.Request, ip string) {
 	sid := getOrSetSessionID(w, r)
 	id, imgB64, err := h.captcha.generate(sid, ip)
 	if err != nil {
 		// 兜底节流或生成失败：直接丢弃连接，避免泛洪时海量 PNG 编码导致 OOM
-		closeConnectionSilently(w)
+		util.CloseConnectionSilently(w)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -505,13 +456,13 @@ func (h *ccDefenseHandler) serveCaptcha(w http.ResponseWriter, r *http.Request, 
 }
 
 // handleCaptchaVerify 处理验证码提交：校验点击序列，通过则标记 IP 可信并跳回原地址
-func (h *ccDefenseHandler) handleCaptchaVerify(w http.ResponseWriter, r *http.Request) {
+func (h *CCDefenseHandler) handleCaptchaVerify(w http.ResponseWriter, r *http.Request) {
 	// 只处理 POST：GET/刷新等空请求直接回首页，避免触发验证码循环
 	if r.Method != http.MethodPost {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	ip := clientIPFromRequest(r)
+	ip := util.ClientIPFromRequest(r)
 	sid := getSessionID(r)
 	target := r.FormValue("url")
 	// 防开放重定向：仅允许站内相对路径
@@ -543,7 +494,7 @@ func (h *ccDefenseHandler) handleCaptchaVerify(w http.ResponseWriter, r *http.Re
 	h.serveCaptcha(w, r, ip)
 }
 
-func (h *ccDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !h.cfg.Enabled {
 		h.next.ServeHTTP(w, r)
 		return
@@ -555,13 +506,13 @@ func (h *ccDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := clientIPFromRequest(r)
+	ip := util.ClientIPFromRequest(r)
 
 	// IP 归属检测：按开关分别拦截国外 / 云厂商 IP
 	if h.ipChecker != nil && (h.blockForeign || h.blockCloud) {
 		if blocked, reason := h.ipChecker.isBlockedBy(ip, h.blockForeign, h.blockCloud); blocked {
 			log.Printf("[cc_defense] IP blocked ip=%s reason=%s", ip, reason)
-			closeConnectionSilently(w)
+			util.CloseConnectionSilently(w)
 			return
 		}
 	}
@@ -572,7 +523,7 @@ func (h *ccDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if t, ok := v.(time.Time); ok && time.Since(t) < 24*time.Hour {
 				if !h.dlimiter.trusted.allow() {
 					log.Printf("[cc_defense] trusted session rate limited, closing connection")
-					closeConnectionSilently(w)
+					util.CloseConnectionSilently(w)
 					return
 				}
 				h.next.ServeHTTP(w, r)
@@ -586,7 +537,7 @@ func (h *ccDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.trust.isTrusted(ip) {
 		if !h.dlimiter.trusted.allow() {
 			log.Printf("[cc_defense] trusted ip=%s rate limited, closing connection", ip)
-			closeConnectionSilently(w)
+			util.CloseConnectionSilently(w)
 			return
 		}
 		h.next.ServeHTTP(w, r)
@@ -601,14 +552,14 @@ func (h *ccDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 请求间隔均匀或路径单一 → 直接拦截
 	if h.behavior.isBotLike(ip, r.URL.Path) {
 		log.Printf("[cc_defense] bot-like behavior ip=%s, closing connection", ip)
-		closeConnectionSilently(w)
+		util.CloseConnectionSilently(w)
 		return
 	}
 	// Session-IP 映射异常检测
 	sid := extractSessionID(r.URL.Path)
 	if anom, reason := h.sessions.record(sid, ip); anom {
 		log.Printf("[cc_defense] session anomaly ip=%s reason=%s, closing connection", ip, reason)
-		closeConnectionSilently(w)
+		util.CloseConnectionSilently(w)
 		return
 	}
 
@@ -617,21 +568,21 @@ func (h *ccDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if isSearchBot(r.Header.Get("User-Agent")) {
 			if !h.dlimiter.untrusted.allow() {
 				log.Printf("[cc_defense] search bot ip=%s rate limited, closing connection", ip)
-				closeConnectionSilently(w)
+				util.CloseConnectionSilently(w)
 				return
 			}
 			h.next.ServeHTTP(w, r)
 			return
 		}
 
-		h.reportOffender(ip)
+		h.ReportOffender(ip)
 		h.serveCaptcha(w, r, ip)
 		return
 	}
 
 	if !h.dlimiter.untrusted.allow() {
 		log.Printf("[cc_defense] untrusted ip=%s rate limited, closing connection", ip)
-		closeConnectionSilently(w)
+		util.CloseConnectionSilently(w)
 		return
 	}
 

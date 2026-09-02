@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"log"
@@ -15,7 +15,7 @@ import (
 // ---- TCP 连接限流器 (L4 层) ----
 // 在 TCP accept 阶段就丢弃过量连接，避免进入 HTTP 处理
 
-type connLimitListener struct {
+type ConnLimitListener struct {
 	net.Listener
 	rate       float64
 	burst      float64
@@ -23,11 +23,11 @@ type connLimitListener struct {
 	lastUpdate int64
 }
 
-func newConnLimitListener(inner net.Listener, maxConnsPerSec, burst int) net.Listener {
+func NewConnLimitListener(inner net.Listener, maxConnsPerSec, burst int) net.Listener {
 	if maxConnsPerSec <= 0 {
 		return inner
 	}
-	return &connLimitListener{
+	return &ConnLimitListener{
 		Listener:   inner,
 		rate:       float64(maxConnsPerSec),
 		burst:      float64(burst),
@@ -36,7 +36,7 @@ func newConnLimitListener(inner net.Listener, maxConnsPerSec, burst int) net.Lis
 	}
 }
 
-func (l *connLimitListener) Accept() (net.Conn, error) {
+func (l *ConnLimitListener) Accept() (net.Conn, error) {
 	for {
 		conn, err := l.Listener.Accept()
 		if err != nil {
@@ -56,7 +56,7 @@ func (l *connLimitListener) Accept() (net.Conn, error) {
 	}
 }
 
-func (l *connLimitListener) allow() bool {
+func (l *ConnLimitListener) allow() bool {
 	now := time.Now().UnixNano()
 	for {
 		last := atomic.LoadInt64(&l.lastUpdate)
@@ -86,7 +86,7 @@ var discardCount int64
 
 const firewallRulePrefix = "warden-block-"
 
-type firewallBlocker struct {
+type FirewallBlocker struct {
 	mu          sync.Mutex
 	blockedIPs  map[string]time.Time
 	whitelist   []*net.IPNet
@@ -96,8 +96,8 @@ type firewallBlocker struct {
 	blockCount  int64
 }
 
-func newFirewallBlocker(enabled bool, expireMin int, whitelistCIDRs []string) *firewallBlocker {
-	fb := &firewallBlocker{
+func NewFirewallBlocker(enabled bool, expireMin int, whitelistCIDRs []string) *FirewallBlocker {
+	fb := &FirewallBlocker{
 		blockedIPs:  make(map[string]time.Time),
 		whitelistIP: make(map[string]bool),
 		expireAfter: time.Duration(expireMin) * time.Minute,
@@ -128,7 +128,7 @@ func newFirewallBlocker(enabled bool, expireMin int, whitelistCIDRs []string) *f
 	return fb
 }
 
-func (fb *firewallBlocker) isWhitelisted(ip string) bool {
+func (fb *FirewallBlocker) isWhitelisted(ip string) bool {
 	if fb.whitelistIP[ip] {
 		return true
 	}
@@ -145,7 +145,7 @@ func (fb *firewallBlocker) isWhitelisted(ip string) bool {
 	return false
 }
 
-func (fb *firewallBlocker) block(ip, reason string) {
+func (fb *FirewallBlocker) block(ip, reason string) {
 	if !fb.enabled || ip == "" || ip == "127.0.0.1" || ip == "::1" || fb.isWhitelisted(ip) {
 		return
 	}
@@ -180,7 +180,7 @@ func addRule(dir, name, ip string) {
 	go func() { cmd.Wait() }()
 }
 
-func (fb *firewallBlocker) removeRule(ip string) {
+func (fb *FirewallBlocker) removeRule(ip string) {
 	if runtime.GOOS != "windows" {
 		return
 	}
@@ -194,7 +194,7 @@ func (fb *firewallBlocker) removeRule(ip string) {
 	}
 }
 
-func (fb *firewallBlocker) reaper() {
+func (fb *FirewallBlocker) reaper() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -222,7 +222,7 @@ func (fb *firewallBlocker) reaper() {
 // 仅开启 NoDelay；去掉激进的 30s TCP keepalive（Windows 上会提前重置 nginx 的长连接，
 // 导致间歇性 500 / 空响应）。空闲连接由 http.Server 的 IdleTimeout 统一管理。
 
-func connTimeoutTuning(conn net.Conn) {
+func ConnTimeoutTuning(conn net.Conn) {
 	if tcp, ok := conn.(*net.TCPConn); ok {
 		tcp.SetNoDelay(true)
 	}

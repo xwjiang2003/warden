@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"log"
@@ -7,17 +7,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"warden/internal/config"
+	"warden/internal/util"
 )
-
-type RateLimitConfig struct {
-	Enabled          bool `json:"enabled"`
-	HotPathMax       int  `json:"hot_path_max"`
-	HotPathWindowSec int  `json:"hot_path_window_sec"`
-	SiteMaxPerMin    int  `json:"site_max_per_min"`
-	SubnetMaxPerMin  int  `json:"subnet_max_per_min"` // /24 子网限流，防同网段多IP攻击
-	// 仅对日志里确认的 CC 热点 URI 限流；不匹配普通 newsList 列表页
-	HotPathPatterns []string `json:"hot_path_patterns"`
-}
 
 // subnet24 提取 IP 的 /24 子网前缀
 func subnet24(ip string) string {
@@ -33,8 +25,8 @@ func subnet24(ip string) string {
 	return ip[:idx] + ".0/24"
 }
 
-type ipRateLimiter struct {
-	cfg         RateLimitConfig
+type IPRateLimiter struct {
+	cfg         config.RateLimitConfig
 	block       bool
 	hotPaths    []*regexp.Regexp
 	onBlock     func(ip string)
@@ -56,7 +48,7 @@ type ipCounters struct {
 	siteReset time.Time
 }
 
-func newIPRateLimiter(cfg RateLimitConfig, blockRequests bool, onBlock func(ip string)) *ipRateLimiter {
+func NewIPRateLimiter(cfg config.RateLimitConfig, blockRequests bool, onBlock func(ip string)) *IPRateLimiter {
 	if cfg.HotPathMax <= 0 {
 		cfg.HotPathMax = 60
 	}
@@ -79,7 +71,7 @@ func newIPRateLimiter(cfg RateLimitConfig, blockRequests bool, onBlock func(ip s
 		cfg.SubnetMaxPerMin = 500 // 默认每 /24 子网 500次/分钟
 	}
 
-	return &ipRateLimiter{
+	return &IPRateLimiter{
 		cfg:         cfg,
 		block:       blockRequests,
 		hotPaths:    compiled,
@@ -90,7 +82,7 @@ func newIPRateLimiter(cfg RateLimitConfig, blockRequests bool, onBlock func(ip s
 	}
 }
 
-func (rl *ipRateLimiter) isHotPath(path string) bool {
+func (rl *IPRateLimiter) isHotPath(path string) bool {
 	for _, re := range rl.hotPaths {
 		if re.MatchString(path) {
 			return true
@@ -99,12 +91,12 @@ func (rl *ipRateLimiter) isHotPath(path string) bool {
 	return false
 }
 
-func (rl *ipRateLimiter) middleware(next http.Handler) http.Handler {
+func (rl *IPRateLimiter) Middleware(next http.Handler) http.Handler {
 	if !rl.cfg.Enabled {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := clientIPFromRequest(r)
+		ip := util.ClientIPFromRequest(r)
 		hot := rl.isHotPath(r.URL.Path)
 		reason, over := rl.check(ip, hot)
 		if over {
@@ -124,7 +116,7 @@ func (rl *ipRateLimiter) middleware(next http.Handler) http.Handler {
 }
 
 // subnetCheckLocked 检查 /24 子网级别限流（需在 mu 锁内调用）
-func (rl *ipRateLimiter) subnetCheckLocked(ip string, now time.Time) (reason string, over bool) {
+func (rl *IPRateLimiter) subnetCheckLocked(ip string, now time.Time) (reason string, over bool) {
 	if rl.cfg.SubnetMaxPerMin <= 0 {
 		return "", false
 	}
@@ -146,7 +138,7 @@ func (rl *ipRateLimiter) subnetCheckLocked(ip string, now time.Time) (reason str
 	return "", false
 }
 
-func (rl *ipRateLimiter) check(ip string, hotPath bool) (reason string, over bool) {
+func (rl *IPRateLimiter) check(ip string, hotPath bool) (reason string, over bool) {
 	now := time.Now()
 	rl.mu.Lock()
 	defer rl.mu.Unlock()

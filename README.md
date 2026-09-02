@@ -28,7 +28,7 @@ set GOPROXY=https://goproxy.cn,https://goproxy.io,direct
 set GOSUMDB=sum.golang.google.cn
 cd /d d:\ai\log\warden
 go mod tidy
-go build -o warden.exe .
+go build -o warden.exe ./cmd/warden
 ```
 
 永久设置（新开 cmd 生效）：

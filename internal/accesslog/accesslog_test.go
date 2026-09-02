@@ -1,16 +1,18 @@
-package main
+package accesslog
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"warden/internal/config"
 )
 
 func TestAccessLogRotateConfigNormalize(t *testing.T) {
-	c := AccessLogRotateConfig{}
-	c.normalize()
-	if c.Mode != accessLogRotateDaily {
+	c := config.AccessLogRotateConfig{}
+	c.Normalize()
+	if c.Mode != rotateDaily {
 		t.Fatalf("mode=%q want daily", c.Mode)
 	}
 	if c.MaxSizeMB != 100 {
@@ -19,9 +21,9 @@ func TestAccessLogRotateConfigNormalize(t *testing.T) {
 }
 
 func TestDailyLogPath(t *testing.T) {
-	al := &accessLogger{
+	al := &Logger{
 		basePath: "logs/access.log",
-		rotate:   AccessLogRotateConfig{Mode: accessLogRotateDaily},
+		rotate:   config.AccessLogRotateConfig{Mode: rotateDaily},
 	}
 	now := time.Date(2026, 6, 28, 10, 0, 0, 0, time.UTC)
 	got := al.targetPath(now)
@@ -34,7 +36,7 @@ func TestDailyLogPath(t *testing.T) {
 func TestDailyRotationOpensNewFile(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "access.log")
-	al := newAccessLogger(base, AccessLogRotateConfig{Mode: accessLogRotateDaily})
+	al := New(base, config.AccessLogRotateConfig{Mode: rotateDaily})
 
 	now := time.Now()
 	path := al.targetPath(now)
@@ -42,13 +44,13 @@ func TestDailyRotationOpensNewFile(t *testing.T) {
 		t.Fatalf("daily log not created: %v", err)
 	}
 
-	al.close()
+	al.Close()
 }
 
 func TestSizeRotationRenamesFile(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "access.log")
-	al := newAccessLogger(base, AccessLogRotateConfig{Mode: accessLogRotateSize, MaxSizeMB: 0})
+	al := New(base, config.AccessLogRotateConfig{Mode: rotateSize, MaxSizeMB: 0})
 	al.rotate.MaxSizeMB = 1 // 1 MB for test; we'll force small threshold
 
 	// Force tiny threshold by writing directly
@@ -61,7 +63,7 @@ func TestSizeRotationRenamesFile(t *testing.T) {
 		t.Fatalf("rotateIfNeeded: %v", err)
 	}
 	al.mu.Unlock()
-	al.close()
+	al.Close()
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {

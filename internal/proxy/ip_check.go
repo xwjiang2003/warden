@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"encoding/binary"
@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"warden/internal/util"
 )
 
 const (
@@ -37,7 +38,7 @@ var cloudISPKeywords = []string{
 }
 
 func newIPRegionChecker() *IPRegionChecker {
-	exeDir, err := executableDir()
+	exeDir, err := util.ExecutableDir()
 	if err != nil {
 		log.Printf("[ip_check] executable dir error: %v", err)
 		return nil

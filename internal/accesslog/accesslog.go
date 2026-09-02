@@ -1,4 +1,4 @@
-package main
+package accesslog
 
 import (
 	"fmt"
@@ -10,31 +10,20 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"warden/internal/config"
+	"warden/internal/util"
 )
 
 const (
-	accessLogRotateDaily = "daily"
-	accessLogRotateSize  = "size"
+	rotateDaily = "daily"
+	rotateSize  = "size"
 )
 
-type AccessLogRotateConfig struct {
-	Mode      string `json:"mode"`        // daily (default) | size
-	MaxSizeMB int    `json:"max_size_mb"` // used when mode=size, default 100
-}
-
-func (c *AccessLogRotateConfig) normalize() {
-	if c.Mode == "" {
-		c.Mode = accessLogRotateDaily
-	}
-	c.Mode = strings.ToLower(c.Mode)
-	if c.MaxSizeMB <= 0 {
-		c.MaxSizeMB = 100
-	}
-}
-
-type accessLogger struct {
+// Logger 访问日志写入器，支持按天 / 按大小轮转
+type Logger struct {
 	basePath string
-	rotate   AccessLogRotateConfig
+	rotate   config.AccessLogRotateConfig
 	mu       sync.Mutex
 	f        *os.File
 	curPath  string
@@ -42,9 +31,9 @@ type accessLogger struct {
 	curSize  int64
 }
 
-func newAccessLogger(basePath string, rotate AccessLogRotateConfig) *accessLogger {
-	rotate.normalize()
-	al := &accessLogger{
+func New(basePath string, rotate config.AccessLogRotateConfig) *Logger {
+	rotate.Normalize()
+	al := &Logger{
 		basePath: basePath,
 		rotate:   rotate,
 	}
@@ -54,7 +43,7 @@ func newAccessLogger(basePath string, rotate AccessLogRotateConfig) *accessLogge
 	return al
 }
 
-func (al *accessLogger) close() {
+func (al *Logger) Close() {
 	al.mu.Lock()
 	defer al.mu.Unlock()
 	if al.f != nil {
@@ -63,14 +52,14 @@ func (al *accessLogger) close() {
 	}
 }
 
-func (al *accessLogger) targetPath(now time.Time) string {
-	if al.rotate.Mode == accessLogRotateSize {
+func (al *Logger) targetPath(now time.Time) string {
+	if al.rotate.Mode == rotateSize {
 		return al.basePath
 	}
 	return al.basePath + "." + now.Format("2006-01-02")
 }
 
-func (al *accessLogger) openCurrent() error {
+func (al *Logger) openCurrent() error {
 	now := time.Now()
 	path := al.targetPath(now)
 	if al.f != nil && path == al.curPath {
@@ -95,20 +84,20 @@ func (al *accessLogger) openCurrent() error {
 	al.f = f
 	al.curPath = path
 	al.curSize = info.Size()
-	if al.rotate.Mode == accessLogRotateDaily {
+	if al.rotate.Mode == rotateDaily {
 		al.curDay = now.Format("2006-01-02")
 	}
 	return nil
 }
 
-func (al *accessLogger) rotateIfNeeded(lineLen int, now time.Time) error {
+func (al *Logger) rotateIfNeeded(lineLen int, now time.Time) error {
 	switch al.rotate.Mode {
-	case accessLogRotateDaily:
+	case rotateDaily:
 		day := now.Format("2006-01-02")
 		if day != al.curDay {
 			return al.openCurrent()
 		}
-	case accessLogRotateSize:
+	case rotateSize:
 		maxBytes := int64(al.rotate.MaxSizeMB) * 1024 * 1024
 		if al.curSize+int64(lineLen) > maxBytes {
 			if err := al.rotateBySize(now); err != nil {
@@ -119,7 +108,7 @@ func (al *accessLogger) rotateIfNeeded(lineLen int, now time.Time) error {
 	return nil
 }
 
-func (al *accessLogger) rotateBySize(now time.Time) error {
+func (al *Logger) rotateBySize(now time.Time) error {
 	if al.f != nil {
 		_ = al.f.Close()
 		al.f = nil
@@ -129,7 +118,6 @@ func (al *accessLogger) rotateBySize(now time.Time) error {
 	}
 	archived := fmt.Sprintf("%s.%s", al.basePath, now.Format("20060102-150405"))
 	if err := os.Rename(al.curPath, archived); err != nil {
-		// If rename fails (e.g. cross-device), try copy-truncate approach
 		if err2 := copyFile(al.curPath, archived); err2 != nil {
 			return fmt.Errorf("rotate %s -> %s: %w", al.curPath, archived, err)
 		}
@@ -159,13 +147,14 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
-func (al *accessLogger) log(r *http.Request, status int, bytes int64) {
+// Log 记录一条访问日志
+func (al *Logger) Log(r *http.Request, status int, bytes int64) {
 	if r == nil {
 		return
 	}
 	now := time.Now()
 	line := fmt.Sprintf("%s - [%s] \"%s %s %s\" %d %d \"%s\" \"%s\"\n",
-		clientIPFromRequest(r),
+		util.ClientIPFromRequest(r),
 		now.Format("02/Jan/2006:15:04:05 -0700"),
 		r.Method,
 		r.URL.RequestURI(),

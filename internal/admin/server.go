@@ -1,9 +1,8 @@
-package main
+package admin
 
 import (
 	"crypto/sha256"
 	"crypto/subtle"
-	"embed"
 	"encoding/json"
 	"io/fs"
 	"log"
@@ -12,42 +11,23 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"warden"
+	"warden/internal/config"
 )
 
-//go:embed web/admin.html
-var adminHTML []byte
-
-//go:embed web/*
-var adminWebFS embed.FS
-
-// AdminConfig 管理后台配置
-type AdminConfig struct {
-	Enabled  bool   `json:"enabled"`
-	Listen   string `json:"listen"`
-	Username string `json:"username"`
-	Password string `json:"password"` // 为空则不启用认证
-}
-
-func (c *AdminConfig) normalize() {
-	if c.Listen == "" {
-		c.Listen = "127.0.0.1:9090"
-	}
-	if c.Username == "" {
-		c.Username = "admin"
-	}
-}
-
-type adminServer struct {
-	cfg       *Config
+// Server 管理后台服务
+type Server struct {
+	cfg       *config.Config
 	cfgPath   string
-	adminCfg  AdminConfig
+	adminCfg  config.AdminConfig
 	startTime time.Time
 	mux       *http.ServeMux
 }
 
-func newAdminServer(cfg *Config, cfgPath string, adminCfg AdminConfig) *adminServer {
-	adminCfg.normalize()
-	s := &adminServer{
+func NewServer(cfg *config.Config, cfgPath string, adminCfg config.AdminConfig) *Server {
+	adminCfg.Normalize()
+	s := &Server{
 		cfg:       cfg,
 		cfgPath:   cfgPath,
 		adminCfg:  adminCfg,
@@ -58,27 +38,23 @@ func newAdminServer(cfg *Config, cfgPath string, adminCfg AdminConfig) *adminSer
 	return s
 }
 
-func (s *adminServer) registerRoutes() {
-	// API 路由
+func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/health", s.handleHealth)
 	s.mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	s.mux.HandleFunc("PUT /api/config", s.handlePutConfig)
 	s.mux.HandleFunc("GET /api/stats", s.handleStats)
 	s.mux.HandleFunc("GET /api/logs", s.handleLogs)
-
-	// 静态文件: 优先用 admin.html，其他 web/* 文件也暴露
 	s.mux.HandleFunc("GET /", s.handleStatic)
 }
 
-func (s *adminServer) handler() http.Handler {
+func (s *Server) handler() http.Handler {
 	if s.adminCfg.Password != "" {
 		return s.authMiddleware(s.mux)
 	}
 	return s.mux
 }
 
-// authMiddleware HTTP Basic Auth
-func (s *adminServer) authMiddleware(next http.Handler) http.Handler {
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	expectedUser := s.adminCfg.Username
 	expectedHash := sha256.Sum256([]byte(s.adminCfg.Password))
 
@@ -100,10 +76,11 @@ func (s *adminServer) authMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func (s *adminServer) start() error {
+// Start 启动管理后台服务（非阻塞，goroutine 内监听）
+func (s *Server) Start() {
 	if !s.adminCfg.Enabled {
 		log.Printf("[admin] 管理后台已禁用")
-		return nil
+		return
 	}
 
 	srv := &http.Server{
@@ -121,12 +98,11 @@ func (s *adminServer) start() error {
 			log.Printf("[admin] 启动失败: %v", err)
 		}
 	}()
-	return nil
 }
 
 // ---- API Handlers ----
 
-func (s *adminServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":  "ok",
 		"uptime":  time.Since(s.startTime).String(),
@@ -134,21 +110,19 @@ func (s *adminServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *adminServer) handleGetConfig(w http.ResponseWriter, r *http.Request) {
-	// 返回当前配置，敏感字段脱敏
+func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	cfgCopy := *s.cfg
 	if cfgCopy.CCDefense.ChallengeCookieKey != "" {
 		cfgCopy.CCDefense.ChallengeCookieKey = "***"
 	}
-	// 管理后台密码不回显明文，用 "***" 占位表示已设置
 	if cfgCopy.Admin.Password != "" {
 		cfgCopy.Admin.Password = "***"
 	}
 	writeJSON(w, http.StatusOK, cfgCopy)
 }
 
-func (s *adminServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
-	var newCfg Config
+func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
+	var newCfg config.Config
 	if err := json.NewDecoder(r.Body).Decode(&newCfg); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "JSON 解析失败: " + err.Error(),
@@ -156,16 +130,13 @@ func (s *adminServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 保留未在请求中设置的敏感字段
 	if newCfg.CCDefense.ChallengeCookieKey == "***" || newCfg.CCDefense.ChallengeCookieKey == "" {
 		newCfg.CCDefense.ChallengeCookieKey = s.cfg.CCDefense.ChallengeCookieKey
 	}
-	// "***" 表示未修改，保留原密码；空字符串表示清除密码（关闭认证）
 	if newCfg.Admin.Password == "***" {
 		newCfg.Admin.Password = s.cfg.Admin.Password
 	}
 
-	// 应用默认值
 	if newCfg.Listen == "" {
 		newCfg.Listen = ":80"
 	}
@@ -178,52 +149,41 @@ func (s *adminServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	if newCfg.AccessLog == "" {
 		newCfg.AccessLog = "logs/access.log"
 	}
-	newCfg.AccessLogRotate.normalize()
-	newCfg.ConnLimit.normalize()
-	newCfg.FirewallBlock.normalize()
-	newCfg.CCDefense.normalize()
+	newCfg.AccessLogRotate.Normalize()
+	newCfg.ConnLimit.Normalize()
+	newCfg.FirewallBlock.Normalize()
+	newCfg.CCDefense.Normalize()
 
-	// 序列化为格式化的 JSON
-	data, err := json.MarshalIndent(newCfg, "", "  ")
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"error": "序列化配置失败: " + err.Error(),
-		})
-		return
-	}
-
-	// 写入配置文件
-	if err := os.WriteFile(s.cfgPath, data, 0644); err != nil {
+	if err := config.Save(s.cfgPath, &newCfg); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "写入配置文件失败: " + err.Error(),
 		})
 		return
 	}
 
-	// 更新内存中的配置引用
 	*s.cfg = newCfg
 
 	log.Printf("[admin] 配置已更新并保存到 %s (部分更改需重启生效)", s.cfgPath)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"message":        "配置已保存",
+		"message":          "配置已保存",
 		"restart_required": true,
 	})
 }
 
-func (s *adminServer) handleStats(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
 
 	stats := map[string]interface{}{
-		"uptime":       time.Since(s.startTime).String(),
-		"start_time":   s.startTime.Format(time.RFC3339),
-		"go_version":   runtime.Version(),
-		"num_goroutine": runtime.NumGoroutine(),
-		"num_cpu":      runtime.NumCPU(),
-		"memory_mb":    roundMB(mem.Alloc),
-		"memory_sys_mb": roundMB(mem.Sys),
-		"proxy_listen": s.cfg.Listen,
-		"proxy_backend": s.cfg.Backend,
+		"uptime":             time.Since(s.startTime).String(),
+		"start_time":         s.startTime.Format(time.RFC3339),
+		"go_version":         runtime.Version(),
+		"num_goroutine":      runtime.NumGoroutine(),
+		"num_cpu":            runtime.NumCPU(),
+		"memory_mb":          roundMB(mem.Alloc),
+		"memory_sys_mb":      roundMB(mem.Sys),
+		"proxy_listen":       s.cfg.Listen,
+		"proxy_backend":      s.cfg.Backend,
 		"cc_defense_enabled": s.cfg.CCDefense.Enabled,
 		"rate_limit_enabled": s.cfg.RateLimit.Enabled,
 		"block_requests":     s.cfg.BlockRequests,
@@ -231,15 +191,14 @@ func (s *adminServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stats)
 }
 
-func (s *adminServer) handleLogs(w http.ResponseWriter, r *http.Request) {
-	// 读取最近 200 行访问日志
+func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	lines := r.URL.Query().Get("lines")
 	if lines == "" {
 		lines = "100"
 	}
+	_ = lines
 
 	logPath := s.cfg.AccessLog
-	// 尝试读取当天的日志（daily 模式）
 	dailyPath := logPath + "." + time.Now().Format("2006-01-02")
 	if _, err := os.Stat(dailyPath); err == nil {
 		logPath = dailyPath
@@ -255,7 +214,6 @@ func (s *adminServer) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	allLines := strings.Split(string(data), "\n")
-	// 取最后 N 行，过滤空行
 	var recent []string
 	maxLines := 200
 	for i := len(allLines) - 1; i >= 0 && len(recent) < maxLines; i-- {
@@ -273,32 +231,26 @@ func (s *adminServer) handleLogs(w http.ResponseWriter, r *http.Request) {
 
 // ---- Static File Handler ----
 
-func (s *adminServer) handleStatic(w http.ResponseWriter, r *http.Request) {
-	// 禁止缓存，确保管理后台页面更新后能立即生效
+func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-	// SPA 回退：所有非 API 路径都返回 admin.html
 	if r.URL.Path == "/" || !strings.HasPrefix(r.URL.Path, "/api/") {
-		// 尝试从 web/ 目录提供静态文件
 		filePath := strings.TrimPrefix(r.URL.Path, "/")
 		if filePath == "" {
 			filePath = "admin.html"
 		}
 
-		// 先尝试从嵌入的文件系统读取
-		if f, err := adminWebFS.Open("web/" + filePath); err == nil {
+		if f, err := assets.WebFS.Open("web/" + filePath); err == nil {
 			f.Close()
-			content, err := fs.ReadFile(adminWebFS, "web/"+filePath)
+			content, err := fs.ReadFile(assets.WebFS, "web/"+filePath)
 			if err == nil {
-				contentType := contentTypeByExt(filePath)
-				w.Header().Set("Content-Type", contentType)
+				w.Header().Set("Content-Type", contentTypeByExt(filePath))
 				w.Write(content)
 				return
 			}
 		}
 
-		// 回退到 admin.html（SPA 路由）
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write(adminHTML)
+		w.Write(assets.AdminHTML)
 		return
 	}
 

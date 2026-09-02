@@ -1,40 +1,44 @@
-package main
+package waf
 
 import (
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
 	"strings"
+
+	"github.com/corazawaf/coraza/v3"
+	"github.com/corazawaf/coraza/v3/types"
+
+	"warden/internal/config"
 )
 
-type WAFRulesConfig struct {
-	CCPaths           []string `json:"cc_paths"`
-	CCNoRefererBlock  bool     `json:"cc_no_referer_block"`
-	ScannerPaths      []string `json:"scanner_paths,omitempty"`
-	ScannerUAs        []string `json:"scanner_uas,omitempty"`
-	BlockScriptUA     bool     `json:"block_script_ua"`
-	CustomScriptUAs   []string `json:"custom_script_uas,omitempty"`
-	CustomBlockPaths  []string `json:"custom_block_paths,omitempty"`
-	CustomBlockStatus int      `json:"custom_block_status,omitempty"`
+// New 根据规则文件与动态 waf_rules 配置创建 Coraza WAF 引擎
+func New(rulesFile string, wr *config.WAFRulesConfig) (coraza.WAF, error) {
+	abs, err := filepath.Abs(rulesFile)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return nil, fmt.Errorf("rules file missing: %s", abs)
+	}
+	dynamic := BuildRules(wr)
+	log.Printf("waf_rules: cc_paths=%d scanner_paths=%d scanner_uas=%d script_ua=%v custom_block=%d",
+		len(wr.CCPaths), len(wr.ScannerPaths), len(wr.ScannerUAs),
+		wr.BlockScriptUA, len(wr.CustomBlockPaths))
+	return coraza.NewWAF(
+		coraza.NewWAFConfig().
+			WithDirectivesFromFile(abs).
+			WithDirectives(dynamic).
+			WithErrorCallback(func(mr types.MatchedRule) {
+				log.Printf("[coraza][%s] %s", mr.Rule().Severity(), mr.ErrorLog())
+			}),
+	)
 }
 
-func (c *WAFRulesConfig) normalize() {
-	if c.CustomBlockStatus <= 0 {
-		c.CustomBlockStatus = 403
-	}
-	if len(c.ScannerPaths) == 0 {
-		c.ScannerPaths = []string{
-			"/developmentserver", "/phpmyadmin", "/wp-admin", "/xmlrpc",
-			"/.env", "/.git", "/manager", "/actuator",
-		}
-	}
-	if len(c.ScannerUAs) == 0 {
-		c.ScannerUAs = []string{
-			"zgrab", "masscan", "sqlmap", "nikto", "acunetix", "dirbuster",
-		}
-	}
-}
-
-func (c *WAFRulesConfig) build() string {
-	c.normalize()
+// BuildRules 把 waf_rules 配置转换为 Coraza SecRule 指令
+func BuildRules(c *config.WAFRulesConfig) string {
+	c.Normalize()
 	var b strings.Builder
 
 	if len(c.ScannerUAs) > 0 {

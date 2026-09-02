@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"log"
@@ -6,19 +6,20 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"warden/internal/util"
 )
 
-// ipWhitelist 全局 IP 白名单。
+// IPWhitelist 全局 IP 白名单。
 // 命中白名单的 IP 跳过 IP 归属检测、CC 防御、限流、防火墙自动拉黑，
 // 但仍经过 WAF 规则 (coraza) 与反向代理。
-type ipWhitelist struct {
+type IPWhitelist struct {
 	nets   []*net.IPNet
 	ips    map[string]bool
 	logged sync.Map // 记录已打印过日志的 IP，避免每个请求都刷日志
 }
 
-func newIPWhitelist(cidrs []string) *ipWhitelist {
-	w := &ipWhitelist{ips: make(map[string]bool)}
+func NewIPWhitelist(cidrs []string) *IPWhitelist {
+	w := &IPWhitelist{ips: make(map[string]bool)}
 	for _, cidr := range cidrs {
 		cidr = strings.TrimSpace(cidr)
 		if cidr == "" {
@@ -41,7 +42,7 @@ func newIPWhitelist(cidrs []string) *ipWhitelist {
 	return w
 }
 
-func (w *ipWhitelist) contains(ip string) bool {
+func (w *IPWhitelist) contains(ip string) bool {
 	if w == nil || len(w.nets) == 0 {
 		return false
 	}
@@ -61,14 +62,14 @@ func (w *ipWhitelist) contains(ip string) bool {
 	return false
 }
 
-// whitelistMiddleware 命中白名单时直接放行到 inner (WAF+proxy)，
+// WhitelistMiddleware 命中白名单时直接放行到 inner (WAF+proxy)，
 // 否则走 next (CC 防御 -> 限流 -> ...)。
-func whitelistMiddleware(w *ipWhitelist, enabled bool, inner, next http.Handler) http.Handler {
+func WhitelistMiddleware(w *IPWhitelist, enabled bool, inner, next http.Handler) http.Handler {
 	if !enabled || w == nil || len(w.nets) == 0 {
 		return next
 	}
 	return http.HandlerFunc(func(wr http.ResponseWriter, r *http.Request) {
-		ip := clientIPFromRequest(r)
+		ip := util.ClientIPFromRequest(r)
 		if w.contains(ip) {
 			if _, ok := w.logged.LoadOrStore(ip, true); !ok {
 				log.Printf("[whitelist] bypass ip=%s (首次命中)", ip)

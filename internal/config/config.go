@@ -50,6 +50,10 @@ type AlertConfig struct {
 	To                 []string `json:"to"`
 	CooldownMin        int      `json:"cooldown_min"`
 	BlockRateThreshold float64  `json:"block_rate_threshold"` // 告警拦截率阈值(百分比)
+	WebhookURL         string   `json:"webhook_url"`          // 通用 Webhook
+	DingTalkURL        string   `json:"dingtalk_url"`         // 钉钉机器人
+	WeComURL           string   `json:"wecom_url"`            // 企业微信机器人
+	FeishuURL          string   `json:"feishu_url"`           // 飞书机器人
 }
 
 func (c *AlertConfig) Normalize() {

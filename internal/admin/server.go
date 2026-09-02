@@ -200,13 +200,14 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAlertTest(w http.ResponseWriter, r *http.Request) {
-	err := alert.Send(&s.cfg.Alert, "[沃盾] 测试告警邮件",
-		"这是一封来自沃盾 WAF 的测试告警邮件。\n时间："+time.Now().Format(time.RFC3339))
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": false, "error": err.Error()})
+	a := &s.cfg.Alert
+	if a.SMTPHost == "" && a.WebhookURL == "" && a.DingTalkURL == "" && a.WeComURL == "" && a.FeishuURL == "" {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": false, "error": "尚未配置任何通知渠道（SMTP/Webhook/钉钉/企业微信/飞书）"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "message": "测试邮件已发送"})
+	alert.NotifyAll(a, "[沃盾] 测试告警",
+		"这是一条来自沃盾 WAF 的测试告警。\n时间："+time.Now().Format(time.RFC3339))
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "message": "测试告警已发送（邮件 + Webhook 渠道）"})
 }
 
 func (s *Server) handleAttackLogs(w http.ResponseWriter, r *http.Request) {

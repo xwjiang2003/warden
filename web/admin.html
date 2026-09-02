@@ -667,6 +667,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
               <el-input v-model="alertToText" type="textarea" :rows="3" placeholder="ops@example.com"></el-input>
               <div class="field-help">每行一个邮箱地址</div>
             </el-form-item>
+            <el-form-item label="Webhook URL">
+              <el-input v-model="config.alert.webhook_url" placeholder="https://example.com/webhook"></el-input>
+            </el-form-item>
+            <el-form-item label="钉钉机器人">
+              <el-input v-model="config.alert.dingtalk_url" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..."></el-input>
+            </el-form-item>
+            <el-form-item label="企业微信机器人">
+              <el-input v-model="config.alert.wecom_url" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."></el-input>
+            </el-form-item>
+            <el-form-item label="飞书机器人">
+              <el-input v-model="config.alert.feishu_url" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."></el-input>
+            </el-form-item>
             <el-row :gutter="20">
               <el-col :span="8">
                 <el-form-item label="冷却时间(分钟)">
@@ -757,7 +769,7 @@ function defaultConfig() {
     ip_check: { block_foreign: true, block_cloud: true },
     admin: { enabled: true, listen: '127.0.0.1:9090', username: 'admin', password: '' },
     sites: [],
-    alert: { enabled: false, smtp_host: '', smtp_port: 465, smtp_username: '', smtp_password: '', smtp_from: '', smtp_tls: true, to: [], cooldown_min: 10, block_rate_threshold: 50 }
+    alert: { enabled: false, smtp_host: '', smtp_port: 465, smtp_username: '', smtp_password: '', smtp_from: '', smtp_tls: true, to: [], cooldown_min: 10, block_rate_threshold: 50, webhook_url: '', dingtalk_url: '', wecom_url: '', feishu_url: '' }
   }
 }
 

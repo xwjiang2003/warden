@@ -1,10 +1,13 @@
 package alert
 
 import (
+	"bytes"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"net/smtp"
 	"strconv"
 	"strings"
@@ -121,11 +124,37 @@ func (ch *Checker) Run() {
 		subject := fmt.Sprintf("[沃盾] 拦截率告警 %.1f%%", rate)
 		body := fmt.Sprintf("最近 60 秒拦截率 %.1f%%（拦截 %d / 请求 %d），已超过阈值 %.1f%%\n时间：%s",
 			rate, dBlk, dReq, a.BlockRateThreshold, time.Now().Format(time.RFC3339))
-		if err := Send(a, subject, body); err != nil {
-			log.Printf("[alert] 发送告警邮件失败: %v", err)
+		NotifyAll(a, subject, body)
+		ch.lastSent = time.Now()
+	}
+}
+
+// NotifyAll 同时通过邮件与各 Webhook 渠道发送告警
+func NotifyAll(cfg *config.AlertConfig, subject, body string) {
+	if cfg.SMTPHost != "" && len(cfg.To) > 0 {
+		if err := Send(cfg, subject, body); err != nil {
+			log.Printf("[alert] 发送邮件失败: %v", err)
 		} else {
-			ch.lastSent = time.Now()
-			log.Printf("[alert] 已发送告警邮件: %s", subject)
+			log.Printf("[alert] 已发送邮件: %s", subject)
 		}
 	}
+	text := subject + "\n" + body
+	postJSON(cfg.WebhookURL, map[string]interface{}{"subject": subject, "body": body}, "webhook")
+	postJSON(cfg.DingTalkURL, map[string]interface{}{"msgtype": "text", "text": map[string]string{"content": text}}, "dingtalk")
+	postJSON(cfg.WeComURL, map[string]interface{}{"msgtype": "text", "text": map[string]string{"content": text}}, "wecom")
+	postJSON(cfg.FeishuURL, map[string]interface{}{"msg_type": "text", "content": map[string]string{"text": text}}, "feishu")
+}
+
+func postJSON(url string, v interface{}, name string) {
+	if url == "" {
+		return
+	}
+	b, _ := json.Marshal(v)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(b))
+	if err != nil {
+		log.Printf("[alert] %s 发送失败: %v", name, err)
+		return
+	}
+	resp.Body.Close()
+	log.Printf("[alert] 已发送到 %s", name)
 }

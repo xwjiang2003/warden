@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"warden/internal/metrics"
 	"warden/internal/restart"
 	"warden/internal/store"
+	"warden/internal/util"
 )
 
 // Server 管理后台服务
@@ -116,7 +118,7 @@ func (s *Server) Start() {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":  "ok",
-		"uptime":  time.Since(s.startTime).String(),
+		"uptime":  formatUptime(time.Since(s.startTime)),
 		"version": "1.0.0",
 	})
 }
@@ -228,13 +230,14 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	runtime.ReadMemStats(&mem)
 
 	stats := map[string]interface{}{
-		"uptime":             time.Since(s.startTime).String(),
+		"uptime":             formatUptime(time.Since(s.startTime)),
 		"start_time":         s.startTime.Format(time.RFC3339),
 		"go_version":         runtime.Version(),
 		"num_goroutine":      runtime.NumGoroutine(),
 		"num_cpu":            runtime.NumCPU(),
 		"memory_mb":          roundMB(mem.Alloc),
 		"memory_sys_mb":      roundMB(mem.Sys),
+		"system_total_mb":    util.SystemMemoryMB(),
 		"proxy_listen":       s.cfg.Listen,
 		"proxy_backend":      s.cfg.Backend,
 		"cc_defense_enabled": s.cfg.CCDefense.Enabled,
@@ -321,6 +324,21 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 
 func roundMB(bytes uint64) float64 {
 	return float64(bytes) / 1024 / 1024
+}
+
+// formatUptime 将运行时长格式化为可读字符串（如 "1小时2分3秒"）
+func formatUptime(d time.Duration) string {
+	s := int(d.Seconds())
+	if s < 60 {
+		return fmt.Sprintf("%d秒", s)
+	}
+	if s < 3600 {
+		return fmt.Sprintf("%d分%d秒", s/60, s%60)
+	}
+	if s < 86400 {
+		return fmt.Sprintf("%d小时%d分%d秒", s/3600, (s%3600)/60, s%60)
+	}
+	return fmt.Sprintf("%d天%d小时%d分", s/86400, (s%86400)/3600, (s%3600)/60)
 }
 
 func contentTypeByExt(path string) string {

@@ -11,6 +11,7 @@ import (
 	"github.com/corazawaf/coraza/v3/types"
 
 	"warden/internal/config"
+	"warden/internal/metrics"
 )
 
 // New 根据规则文件与动态 waf_rules 配置创建 Coraza WAF 引擎
@@ -31,6 +32,7 @@ func New(rulesFile string, wr *config.WAFRulesConfig) (coraza.WAF, error) {
 			WithDirectivesFromFile(abs).
 			WithDirectives(dynamic).
 			WithErrorCallback(func(mr types.MatchedRule) {
+				metrics.WAFBlocked.Inc()
 				log.Printf("[coraza][%s] %s", mr.Rule().Severity(), mr.ErrorLog())
 			}),
 	)

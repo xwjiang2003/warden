@@ -63,6 +63,27 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
     <el-main>
       <!-- 仪表盘 -->
       <template v-if="currentRoute==='dashboard'">
+        <div class="page-card" style="margin-bottom:16px">
+          <h3>实时拦截监控 <span style="font-weight:400;color:#909399;font-size:12px">（每 2 秒自动刷新）</span></h3>
+          <div class="stats-row">
+            <div class="stat-item"><span class="label">总请求数</span><span class="value blue">{{ metrics.total_requests }}</span></div>
+            <div class="stat-item"><span class="label">拦截总数</span><span class="value orange">{{ metrics.total_blocked }}</span></div>
+            <div class="stat-item"><span class="label">拦截率</span><span class="value orange">{{ blockRate }}%</span></div>
+            <div class="stat-item"><span class="label">实时 QPS</span><span class="value blue">{{ qps }}</span></div>
+          </div>
+          <div class="stats-row" style="margin-bottom:0">
+            <div class="stat-item"><span class="label">WAF 规则拦截</span><span class="value">{{ metrics.waf_blocked }}</span></div>
+            <div class="stat-item"><span class="label">CC 防御拦截</span><span class="value">{{ metrics.cc_blocked }}</span></div>
+            <div class="stat-item"><span class="label">频率限制(429)</span><span class="value">{{ metrics.rate_limit_blocked }}</span></div>
+            <div class="stat-item"><span class="label">IP 归属拦截</span><span class="value">{{ metrics.ip_check_blocked }}</span></div>
+          </div>
+          <div class="stats-row" style="margin-bottom:0">
+            <div class="stat-item"><span class="label">防火墙拉黑</span><span class="value">{{ metrics.firewall_blocked }}</span></div>
+            <div class="stat-item"><span class="label">连接限制丢弃</span><span class="value">{{ metrics.conn_limit_dropped }}</span></div>
+            <div class="stat-item"><span class="label">白名单放行</span><span class="value green">{{ metrics.whitelist_pass }}</span></div>
+            <div class="stat-item"><span class="label">监控模式</span><span class="value" :class="config.block_requests?'orange':'green'">{{ config.block_requests ? '拦截' : '仅记录' }}</span></div>
+          </div>
+        </div>
         <div class="stats-row">
           <div class="stat-item"><span class="label">运行时间</span><span class="value blue" style="font-size:18px">{{ stats.uptime }}</span></div>
           <div class="stat-item"><span class="label">CC 防御</span><span class="value" :class="stats.cc_defense_enabled?'green':'orange'">{{ stats.cc_defense_enabled ? '已开启' : '已关闭' }}</span></div>
@@ -624,6 +645,11 @@ const app = createApp({
   setup() {
     const config = reactive(defaultConfig())
     const stats = reactive({ uptime: '-', start_time: '-', go_version: '-', num_goroutine: 0, num_cpu: 0, memory_mb: 0, memory_sys_mb: 0, proxy_listen: '-', proxy_backend: '-', cc_defense_enabled: false, rate_limit_enabled: false, block_requests: false })
+    const metrics = reactive({ total_requests: 0, total_blocked: 0, waf_blocked: 0, cc_blocked: 0, rate_limit_blocked: 0, conn_limit_dropped: 0, ip_check_blocked: 0, firewall_blocked: 0, whitelist_pass: 0 })
+    const qps = ref(0)
+    const blockRate = ref('0.00')
+    let prevReq = 0
+    let prevTs = 0
     const currentRoute = ref('dashboard')
     const saving = ref(false)
     const restartNeeded = ref(false)
@@ -700,6 +726,21 @@ const app = createApp({
       } catch (e) { /* 静默失败 */ }
     }
 
+    async function loadMetrics() {
+      try {
+        const { data } = await api.get('/metrics')
+        const now = Date.now()
+        if (prevTs > 0) {
+          const dt = (now - prevTs) / 1000
+          if (dt > 0) qps.value = Math.round((data.total_requests - prevReq) / dt)
+        }
+        prevReq = data.total_requests
+        prevTs = now
+        Object.assign(metrics, data)
+        blockRate.value = data.total_requests > 0 ? (data.total_blocked / data.total_requests * 100).toFixed(2) : '0.00'
+      } catch (e) { /* 静默失败 */ }
+    }
+
     async function saveConfig() {
       saving.value = true
       restartNeeded.value = false
@@ -768,11 +809,13 @@ const app = createApp({
     onMounted(() => {
       loadConfig()
       loadStats()
+      loadMetrics()
       setInterval(loadStats, 30000) // 每 30s 刷新统计
+      setInterval(loadMetrics, 2000) // 每 2s 刷新拦截指标
     })
 
     return {
-      config, stats, currentRoute, saving, restartNeeded, restarting, configLoaded, logsLoading, logLines, logFile,
+      config, stats, metrics, qps, blockRate, currentRoute, saving, restartNeeded, restarting, configLoaded, logsLoading, logLines, logFile,
       hotPathsText, ccPathsText, scannerPathsText, scannerUAsText, customScriptUAsText, customBlockPathsText,
       whitelistCIDRsText, firewallWhitelistCIDRsText,
       pageTitle, blockType,

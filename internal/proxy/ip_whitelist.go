@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"warden/internal/metrics"
 	"log"
 	"net"
 	"net/http"
@@ -74,6 +75,7 @@ func WhitelistMiddleware(w *IPWhitelist, enabled bool, inner, next http.Handler)
 			if _, ok := w.logged.LoadOrStore(ip, true); !ok {
 				log.Printf("[whitelist] bypass ip=%s (首次命中)", ip)
 			}
+			metrics.WhitelistPass.Inc()
 			inner.ServeHTTP(wr, r)
 			return
 		}

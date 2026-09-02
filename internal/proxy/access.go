@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"warden/internal/attacklog"
+	"warden/internal/blockpage"
 	"warden/internal/metrics"
 	"warden/internal/util"
 )
@@ -21,7 +22,7 @@ func BlocklistMiddleware(block *IPWhitelist, enabled bool, next http.Handler) ht
 			metrics.IPCheckBlocked.Inc()
 			attacklog.Record(ip, r.Host, r.URL.Path, "IP黑名单", "blocklisted")
 			log.Printf("[blocklist] blocked ip=%s", ip)
-			util.CloseConnectionSilently(w)
+			blockpage.Serve(w, http.StatusForbidden)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -38,7 +39,7 @@ func URLMiddleware(allowlist, blocklist []string, rawProxy, next http.Handler) h
 		for _, b := range blocklist {
 			if strings.HasPrefix(p, b) {
 				log.Printf("[url] blocklisted path=%s rule=%s", p, b)
-				util.CloseConnectionSilently(w)
+				blockpage.Serve(w, http.StatusForbidden)
 				return
 			}
 		}

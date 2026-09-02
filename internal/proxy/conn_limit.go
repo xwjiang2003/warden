@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"warden/internal/metrics"
 	"log"
 	"math/rand"
 	"net"
@@ -50,6 +51,7 @@ func (l *ConnLimitListener) Accept() (net.Conn, error) {
 		}
 		conn.Close()
 		n := atomic.AddInt64(&discardCount, 1)
+		metrics.ConnLimitDropped.Inc()
 		if n%1000 == 0 {
 			log.Printf("[conn_limit] dropped %d excess connections", n)
 		}
@@ -160,6 +162,7 @@ func (fb *FirewallBlocker) block(ip, reason string) {
 	addRule("out", ruleName, ip)
 	fb.blockedIPs[ip] = time.Now()
 	fb.blockCount++
+	metrics.FirewallBlocked.Inc()
 	log.Printf("[firewall] BLOCKED ip=%s reason=%s total=%d", ip, reason, fb.blockCount)
 }
 

@@ -17,6 +17,7 @@ import (
 
 	"warden/internal/accesslog"
 	"warden/internal/admin"
+	"warden/internal/metrics"
 	"warden/internal/proxy"
 	"warden/internal/router"
 	"warden/internal/store"
@@ -102,7 +103,7 @@ func main() {
 	idleTO := util.DurationSec(cfg.IdleTimeoutSec, 120)
 
 	srv := &http.Server{
-		Handler:      mux,
+		Handler:      metricsMiddleware(mux),
 		ReadTimeout:  readTO,
 		WriteTimeout: writeTO,
 		IdleTimeout:  idleTO,
@@ -159,6 +160,13 @@ func fatalStartup(exeDir, format string, args ...interface{}) {
 	_ = os.WriteFile(logFile, []byte(time.Now().Format(time.RFC3339)+" "+msg+"\n"), 0644)
 	log.SetOutput(os.Stderr)
 	log.Fatal(msg + " (详情已写入 logs/startup-error.log)")
+}
+
+func metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		metrics.TotalRequests.Inc()
+		next.ServeHTTP(w, r)
+	})
 }
 
 func realIPMiddleware(next http.Handler) http.Handler {

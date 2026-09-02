@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 	"warden/internal/config"
+	"warden/internal/metrics"
 	"warden/internal/util"
 )
 
@@ -103,6 +104,7 @@ func (rl *IPRateLimiter) Middleware(next http.Handler) http.Handler {
 			log.Printf("[ratelimit] ip=%s uri=%s reason=%s block=%v", ip, r.URL.Path, reason, rl.block)
 			if rl.block {
 				// 普通限流返回 429（而非静默断连），避免 nginx 端显示 500/空响应、也便于前端排查
+				metrics.RateLimitBlocked.Inc()
 				w.Header().Set("Retry-After", "1")
 				http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 				if rl.onBlock != nil {

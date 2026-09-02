@@ -180,7 +180,7 @@ func main() {
 		},
 	}
 
-	log.Printf("pyfls-waf listening on %s -> %s", cfg.Listen, cfg.Backend)
+	log.Printf("沃盾 listening on %s -> %s", cfg.Listen, cfg.Backend)
 	log.Printf("rules: %s", rulesPath)
 	cfg.AccessLogRotate.normalize()
 	log.Printf("rate_limit: enabled=%v hot=%d/%ds site=%d/min hot_patterns=%d block=%v",

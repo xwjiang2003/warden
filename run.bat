@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul 2>&1
-title pyfls-waf
+title 沃盾
 cd /d "%~dp0"
 
-if not exist "pyfls-waf.exe" (
-  echo [错误] 未找到 pyfls-waf.exe，请先运行 install.bat 编译
+if not exist "warden.exe" (
+  echo [错误] 未找到 warden.exe，请先运行 install.bat 编译
   goto :end
 )
 if not exist "config.json" (
@@ -23,7 +23,7 @@ echo 健康检查: http://127.0.0.1/healthz  （WAF 监听 80，需管理员运�
 echo 按 Ctrl+C 可停止
 echo.
 
-pyfls-waf.exe -config config.json
+warden.exe -config config.json
 echo.
 echo 进程已退出，退出码: %ERRORLEVEL%
 if exist "logs\startup-error.log" (

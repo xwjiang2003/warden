@@ -40,7 +40,7 @@ for line in p.open(encoding="utf-8", errors="ignore"):
     except Exception:
         pass
 
-print("=== pyfls-waf access.log ===")
+print("=== 沃盾 access.log ===")
 print("Total:", total)
 print("Status:", status.most_common(10))
 print("Unique IPs:", len(ips))

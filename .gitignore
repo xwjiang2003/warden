@@ -1,4 +1,5 @@
 # === Binary / Build ===
+/warden
 *.exe
 *.exe~
 *.dll

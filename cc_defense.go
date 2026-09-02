@@ -71,7 +71,7 @@ func (c *CCDefenseConfig) normalize() {
 		c.NewIPCheckMinReqs = 60
 	}
 	if c.ChallengeCookieKey == "" {
-		c.ChallengeCookieKey = "pyfls-cc-secret"
+		c.ChallengeCookieKey = "warden-cc-secret"
 	}
 	if c.FirewallOffenderLimit <= 0 {
 		c.FirewallOffenderLimit = 10

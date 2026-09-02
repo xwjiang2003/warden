@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Pyfls WAF - 管理后台</title>
+<title>沃盾 - 管理后台</title>
 <link rel="stylesheet" href="https://unpkg.com/element-plus@2.9.7/dist/index.css">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -27,6 +27,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .stat-item .value.orange{color:#e6a23c}
 .stat-item .value.blue{color:#409eff}
 .el-form-item__label{font-weight:500}
+.field-help{font-size:12px;color:#909399;line-height:1.5;margin-top:4px;flex-basis:100%}
 .log-viewer{background:#1e1e1e;color:#d4d4d4;border-radius:6px;padding:16px;font-family:"Cascadia Code","Fira Code",monospace;font-size:12px;line-height:1.7;max-height:500px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
 .tag-input-wrap{display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-height:34px;border:1px solid #dcdfe6;border-radius:4px;padding:4px 8px;background:#fff;cursor:text}
 .tag-input-wrap:focus-within{border-color:#409eff}
@@ -38,7 +39,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 <div id="app">
 <el-container style="min-height:100vh">
   <el-aside width="220px">
-    <div class="logo">🛡️ Pyfls WAF</div>
+    <div class="logo">🛡️ 沃盾</div>
     <el-menu :default-active="currentRoute" @select="navigate" background-color="#1d1e2c" text-color="rgba(255,255,255,0.65)" active-text-color="#fff">
       <el-menu-item index="dashboard">📊 仪表盘</el-menu-item>
       <el-menu-item index="basic">⚙️ 基本设置</el-menu-item>
@@ -46,6 +47,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
       <el-menu-item index="ccdefense">🛡️ CC 防御</el-menu-item>
       <el-menu-item index="wafrules">🔒 WAF 规则</el-menu-item>
       <el-menu-item index="connlimit">🔗 连接限制</el-menu-item>
+      <el-menu-item index="ipprotection">🌐 IP 防护</el-menu-item>
       <el-menu-item index="logs">📋 访问日志</el-menu-item>
     </el-menu>
   </el-aside>
@@ -90,30 +92,58 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
           <el-form :model="config" label-width="130px" label-position="left">
             <el-row :gutter="20">
               <el-col :span="12">
-                <el-form-item label="监听地址"><el-input v-model="config.listen" placeholder=":80" /></el-form-item>
+                <el-form-item label="监听地址">
+                  <el-input v-model="config.listen" placeholder=":80" >
+</el-input>
+                  <div class="field-help">WAF 对外监听地址，如 :80；Linux 下小于 1024 的端口需 root 权限</div>
+                </el-form-item>
               </el-col>
               <el-col :span="12">
-                <el-form-item label="后端地址"><el-input v-model="config.backend" placeholder="http://127.0.0.1:81" /></el-form-item>
+                <el-form-item label="后端地址">
+                  <el-input v-model="config.backend" placeholder="http://127.0.0.1:81" >
+</el-input>
+                  <div class="field-help">请求转发目标（上游 Nginx / Tomcat 地址）</div>
+                </el-form-item>
               </el-col>
             </el-row>
             <el-row :gutter="20">
               <el-col :span="8">
-                <el-form-item label="读超时(秒)"><el-input-number v-model="config.read_timeout_sec" :min="1" :max="600" /></el-form-item>
+                <el-form-item label="读超时(秒)">
+                  <el-input-number v-model="config.read_timeout_sec" :min="1" :max="600" >
+</el-input-number>
+                  <div class="field-help">读取客户端请求的超时时间</div>
+                </el-form-item>
               </el-col>
               <el-col :span="8">
-                <el-form-item label="写超时(秒)"><el-input-number v-model="config.write_timeout_sec" :min="1" :max="600" /></el-form-item>
+                <el-form-item label="写超时(秒)">
+                  <el-input-number v-model="config.write_timeout_sec" :min="1" :max="600" >
+</el-input-number>
+                  <div class="field-help">向客户端写响应的超时时间</div>
+                </el-form-item>
               </el-col>
               <el-col :span="8">
-                <el-form-item label="空闲超时(秒)"><el-input-number v-model="config.idle_timeout_sec" :min="1" :max="600" /></el-form-item>
+                <el-form-item label="空闲超时(秒)">
+                  <el-input-number v-model="config.idle_timeout_sec" :min="1" :max="600" >
+</el-input-number>
+                  <div class="field-help">Keep-Alive 连接的最大空闲时间，超时自动关闭</div>
+                </el-form-item>
               </el-col>
             </el-row>
-            <el-form-item label="规则文件"><el-input v-model="config.rules_file" placeholder="rules/coraza.conf" /></el-form-item>
+            <el-form-item label="规则文件">
+              <el-input v-model="config.rules_file" placeholder="rules/coraza.conf" >
+</el-input>
+              <div class="field-help">Coraza WAF 规则文件路径，启动时加载（文件缺失会导致启动失败）</div>
+            </el-form-item>
           </el-form>
         </div>
         <div class="page-card">
           <h3>访问日志</h3>
           <el-form :model="config" label-width="130px" label-position="left">
-            <el-form-item label="日志路径"><el-input v-model="config.access_log" placeholder="logs/access.log" /></el-form-item>
+            <el-form-item label="日志路径">
+              <el-input v-model="config.access_log" placeholder="logs/access.log" >
+</el-input>
+              <div class="field-help">访问日志文件路径，记录经 WAF 转发的请求</div>
+            </el-form-item>
             <el-row :gutter="20">
               <el-col :span="12">
                 <el-form-item label="轮转模式">
@@ -121,11 +151,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
                     <el-option label="按天 (daily)" value="daily" />
                     <el-option label="按大小 (size)" value="size" />
                   </el-select>
+                  <div class="field-help">daily=每天一个文件；size=单文件达到上限后轮转归档</div>
                 </el-form-item>
               </el-col>
               <el-col :span="12">
                 <el-form-item v-if="config.access_log_rotate.mode==='size'" label="最大大小(MB)">
-                  <el-input-number v-model="config.access_log_rotate.max_size_mb" :min="1" :max="10000" />
+                  <el-input-number v-model="config.access_log_rotate.max_size_mb" :min="1" :max="10000" >
+</el-input-number>
+                  <div class="field-help">size 模式下日志文件达到该大小即轮转</div>
                 </el-form-item>
               </el-col>
             </el-row>
@@ -135,8 +168,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
           <h3>全局开关</h3>
           <el-form :model="config" label-width="130px" label-position="left">
             <el-form-item label="拦截请求">
-              <el-switch v-model="config.block_requests" active-text="拦截" inactive-text="仅记录" />
-              <span style="margin-left:8px;color:#909399;font-size:12px">关闭后 WAF 只记录不拦截，用于调试</span>
+              <el-switch v-model="config.block_requests" active-text="拦截" inactive-text="仅记录" >
+</el-switch>
+              <div class="field-help">关闭后 WAF 只记录不拦截（监控/观察模式），用于调试或灰度验证</div>
             </el-form-item>
           </el-form>
         </div>
@@ -145,18 +179,31 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
           <el-form :model="config.admin" label-width="130px" label-position="left">
             <el-row :gutter="20">
               <el-col :span="8">
-                <el-form-item label="启用后台"><el-switch v-model="config.admin.enabled" /></el-form-item>
+                <el-form-item label="启用后台">
+                  <el-switch v-model="config.admin.enabled" >
+</el-switch>
+                  <div class="field-help">是否启动本管理后台服务</div>
+                </el-form-item>
               </el-col>
               <el-col :span="8">
-                <el-form-item label="监听地址"><el-input v-model="config.admin.listen" placeholder="127.0.0.1:9090" /></el-form-item>
+                <el-form-item label="监听地址">
+                  <el-input v-model="config.admin.listen" placeholder="127.0.0.1:9090" >
+</el-input>
+                  <div class="field-help">管理后台监听地址，建议仅绑定 127.0.0.1 本机</div>
+                </el-form-item>
               </el-col>
               <el-col :span="8">
-                <el-form-item label="用户名"><el-input v-model="config.admin.username" placeholder="admin" /></el-form-item>
+                <el-form-item label="用户名">
+                  <el-input v-model="config.admin.username" placeholder="admin" >
+</el-input>
+                  <div class="field-help">HTTP Basic Auth 用户名</div>
+                </el-form-item>
               </el-col>
             </el-row>
             <el-form-item label="管理密码">
-              <el-input v-model="config.admin.password" placeholder="留空则不启用认证" show-password />
-              <span style="color:#909399;font-size:12px">设置密码后，访问管理后台需输入用户名密码（HTTP Basic Auth）</span>
+              <el-input v-model="config.admin.password" placeholder="留空则不启用认证" show-password >
+</el-input>
+              <div class="field-help">设置密码后需用户名密码（HTTP Basic Auth）才能访问。已设置时显示 ***，保存即保持不变；清空后保存则关闭认证</div>
             </el-form-item>
           </el-form>
         </div>
@@ -171,29 +218,50 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         <div class="page-card">
           <h3>频率限制设置</h3>
           <el-form :model="config.rate_limit" label-width="160px" label-position="left">
-            <el-form-item label="启用频率限制"><el-switch v-model="config.rate_limit.enabled" /></el-form-item>
+            <el-form-item label="启用频率限制">
+              <el-switch v-model="config.rate_limit.enabled" >
+</el-switch>
+              <div class="field-help">开启后按 IP / 子网进行频率限制，超限返回 429</div>
+            </el-form-item>
             <el-row :gutter="20">
               <el-col :span="8">
-                <el-form-item label="热点路径上限"><el-input-number v-model="config.rate_limit.hot_path_max" :min="1" :max="10000" /></el-form-item>
+                <el-form-item label="热点路径上限">
+                  <el-input-number v-model="config.rate_limit.hot_path_max" :min="1" :max="10000" >
+</el-input-number>
+                  <div class="field-help">单个 IP 在热点窗口内访问热点路径的最大次数</div>
+                </el-form-item>
               </el-col>
               <el-col :span="8">
-                <el-form-item label="热点窗口(秒)"><el-input-number v-model="config.rate_limit.hot_path_window_sec" :min="1" :max="3600" /></el-form-item>
+                <el-form-item label="热点窗口(秒)">
+                  <el-input-number v-model="config.rate_limit.hot_path_window_sec" :min="1" :max="3600" >
+</el-input-number>
+                  <div class="field-help">热点路径限流的统计时间窗口</div>
+                </el-form-item>
               </el-col>
             </el-row>
             <el-row :gutter="20">
               <el-col :span="8">
-                <el-form-item label="站点总限速(/分)"><el-input-number v-model="config.rate_limit.site_max_per_min" :min="1" :max="100000" /></el-form-item>
+                <el-form-item label="站点总限速(/分)">
+                  <el-input-number v-model="config.rate_limit.site_max_per_min" :min="1" :max="100000" >
+</el-input-number>
+                  <div class="field-help">单个 IP 每分钟访问全站的最大请求数</div>
+                </el-form-item>
               </el-col>
               <el-col :span="8">
-                <el-form-item label="子网限速(/分)"><el-input-number v-model="config.rate_limit.subnet_max_per_min" :min="1" :max="100000" /></el-form-item>
+                <el-form-item label="子网限速(/分)">
+                  <el-input-number v-model="config.rate_limit.subnet_max_per_min" :min="1" :max="100000" >
+</el-input-number>
+                  <div class="field-help">每个 /24 子网每分钟的最大请求数，防同网段多 IP 攻击</div>
+                </el-form-item>
               </el-col>
             </el-row>
           </el-form>
         </div>
         <div class="page-card">
           <h3>热点路径正则 (Hot Path Patterns)</h3>
-          <p style="color:#909399;font-size:13px;margin-bottom:12px">匹配这些正则的 URI 将受到单独的热点路径频率限制。每行一个正则表达式。</p>
-          <el-input v-model="hotPathsText" type="textarea" :rows="6" placeholder="^/pub/news/4($|;|\\?)" />
+          <el-input v-model="hotPathsText" type="textarea" :rows="6" placeholder="^/pub/news/4($|;|\\?)" >
+</el-input>
+          <div class="field-help">匹配这些正则的 URI 将受到单独的热点路径频率限制。每行一个正则表达式。</div>
         </div>
         <div style="text-align:right;margin-top:8px">
           <el-button type="primary" @click="saveRateLimit" :loading="saving">保存配置</el-button>
@@ -206,48 +274,96 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         <div class="page-card">
           <h3>CC 攻击防御设置</h3>
           <el-form :model="config.cc_defense" label-width="180px" label-position="left">
-            <el-form-item label="启用 CC 防御"><el-switch v-model="config.cc_defense.enabled" /></el-form-item>
+            <el-form-item label="启用 CC 防御">
+              <el-switch v-model="config.cc_defense.enabled" >
+</el-switch>
+              <div class="field-help">开启令牌桶限流、新 IP 泛洪检测与验证码挑战</div>
+            </el-form-item>
             <el-row :gutter="20">
               <el-col :span="8">
-                <el-form-item label="全局 QPS 上限"><el-input-number v-model="config.cc_defense.global_qps_max" :min="1" :max="100000" /></el-form-item>
+                <el-form-item label="全局 QPS 上限">
+                  <el-input-number v-model="config.cc_defense.global_qps_max" :min="1" :max="100000" >
+</el-input-number>
+                  <div class="field-help">可信 IP 共享的全局每秒请求上限</div>
+                </el-form-item>
               </el-col>
               <el-col :span="8">
-                <el-form-item label="全局突发容量"><el-input-number v-model="config.cc_defense.global_qps_burst" :min="1" :max="100000" /></el-form-item>
+                <el-form-item label="全局突发容量">
+                  <el-input-number v-model="config.cc_defense.global_qps_burst" :min="1" :max="100000" >
+</el-input-number>
+                  <div class="field-help">可信 IP 令牌桶突发容量，允许短时超过 QPS</div>
+                </el-form-item>
               </el-col>
             </el-row>
             <el-row :gutter="20">
               <el-col :span="8">
-                <el-form-item label="新 IP QPS 上限"><el-input-number v-model="config.cc_defense.new_ip_qps_max" :min="1" :max="10000" /></el-form-item>
+                <el-form-item label="新 IP QPS 上限">
+                  <el-input-number v-model="config.cc_defense.new_ip_qps_max" :min="1" :max="10000" >
+</el-input-number>
+                  <div class="field-help">未信任 IP 的每秒请求上限</div>
+                </el-form-item>
               </el-col>
               <el-col :span="8">
-                <el-form-item label="新 IP 突发容量"><el-input-number v-model="config.cc_defense.new_ip_qps_burst" :min="1" :max="10000" /></el-form-item>
-              </el-col>
-            </el-row>
-            <el-row :gutter="20">
-              <el-col :span="8">
-                <el-form-item label="信任 IP 最少访问"><el-input-number v-model="config.cc_defense.trust_ip_min_visits" :min="1" :max="10000" /></el-form-item>
-              </el-col>
-              <el-col :span="8">
-                <el-form-item label="信任窗口(秒)"><el-input-number v-model="config.cc_defense.trust_ip_window_sec" :min="10" :max="86400" /></el-form-item>
-              </el-col>
-            </el-row>
-            <el-row :gutter="20">
-              <el-col :span="8">
-                <el-form-item label="新 IP 占比阈值(%)"><el-input-number v-model="config.cc_defense.new_ip_ratio_block" :min="1" :max="100" /></el-form-item>
-              </el-col>
-              <el-col :span="8">
-                <el-form-item label="检测窗口(秒)"><el-input-number v-model="config.cc_defense.new_ip_check_sec" :min="5" :max="3600" /></el-form-item>
-              </el-col>
-              <el-col :span="8">
-                <el-form-item label="最小请求数"><el-input-number v-model="config.cc_defense.new_ip_check_min_reqs" :min="1" :max="100000" /></el-form-item>
+                <el-form-item label="新 IP 突发容量">
+                  <el-input-number v-model="config.cc_defense.new_ip_qps_burst" :min="1" :max="10000" >
+</el-input-number>
+                  <div class="field-help">未信任 IP 令牌桶突发容量</div>
+                </el-form-item>
               </el-col>
             </el-row>
             <el-row :gutter="20">
               <el-col :span="8">
-                <el-form-item label="防火墙触发次数"><el-input-number v-model="config.cc_defense.firewall_offender_limit" :min="1" :max="1000" /></el-form-item>
+                <el-form-item label="信任 IP 最少访问">
+                  <el-input-number v-model="config.cc_defense.trust_ip_min_visits" :min="1" :max="10000" >
+</el-input-number>
+                  <div class="field-help">窗口内访问达到该次数即视为可信 IP</div>
+                </el-form-item>
               </el-col>
               <el-col :span="8">
-                <el-form-item label="挑战 Cookie Key"><el-input v-model="config.cc_defense.challenge_cookie_key" placeholder="留空使用默认值" /></el-form-item>
+                <el-form-item label="信任窗口(秒)">
+                  <el-input-number v-model="config.cc_defense.trust_ip_window_sec" :min="10" :max="86400" >
+</el-input-number>
+                  <div class="field-help">判定 IP 是否可信的统计窗口</div>
+                </el-form-item>
+              </el-col>
+            </el-row>
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <el-form-item label="新 IP 占比阈值(%)">
+                  <el-input-number v-model="config.cc_defense.new_ip_ratio_block" :min="1" :max="100" >
+</el-input-number>
+                  <div class="field-help">新 IP 请求占比达到该值即判定为泛洪攻击</div>
+                </el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="检测窗口(秒)">
+                  <el-input-number v-model="config.cc_defense.new_ip_check_sec" :min="5" :max="3600" >
+</el-input-number>
+                  <div class="field-help">新 IP 泛洪检测的统计窗口</div>
+                </el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="最小请求数">
+                  <el-input-number v-model="config.cc_defense.new_ip_check_min_reqs" :min="1" :max="100000" >
+</el-input-number>
+                  <div class="field-help">窗口内总请求达到该值才触发泛洪判定</div>
+                </el-form-item>
+              </el-col>
+            </el-row>
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <el-form-item label="防火墙触发次数">
+                  <el-input-number v-model="config.cc_defense.firewall_offender_limit" :min="1" :max="1000" >
+</el-input-number>
+                  <div class="field-help">单 IP 被判定违规达到该次数后加入防火墙拉黑（仅 Windows）</div>
+                </el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="挑战 Cookie Key">
+                  <el-input v-model="config.cc_defense.challenge_cookie_key" placeholder="留空使用默认值" >
+</el-input>
+                  <div class="field-help">验证码挑战 Cookie 键名，留空用默认值；修改会强制重新验证</div>
+                </el-form-item>
               </el-col>
             </el-row>
           </el-form>
@@ -263,35 +379,52 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         <div class="page-card">
           <h3>WAF 规则设置</h3>
           <el-form :model="config.waf_rules" label-width="150px" label-position="left">
-            <el-form-item label="拦截脚本 UA"><el-switch v-model="config.waf_rules.block_script_ua" /></el-form-item>
-            <el-form-item label="CC 无 Referer 拦截"><el-switch v-model="config.waf_rules.cc_no_referer_block" /></el-form-item>
-            <el-form-item label="自定义拦截状态码"><el-input-number v-model="config.waf_rules.custom_block_status" :min="200" :max="599" /></el-form-item>
+            <el-form-item label="拦截脚本 UA">
+              <el-switch v-model="config.waf_rules.block_script_ua" >
+</el-switch>
+              <div class="field-help">拦截 curl / wget / python-requests 等脚本 UA 及下方「自定义脚本 UA」</div>
+            </el-form-item>
+            <el-form-item label="CC 无 Referer 拦截">
+              <el-switch v-model="config.waf_rules.cc_no_referer_block" >
+</el-switch>
+              <div class="field-help">匹配 CC 热点路径且无 Referer 的请求直接拦截</div>
+            </el-form-item>
+            <el-form-item label="自定义拦截状态码">
+              <el-input-number v-model="config.waf_rules.custom_block_status" :min="200" :max="599" >
+</el-input-number>
+              <div class="field-help">命中「自定义拦截路径」时返回的 HTTP 状态码（默认 403）</div>
+            </el-form-item>
           </el-form>
         </div>
         <div class="page-card">
           <h3>CC 热点路径 (URI 正则)</h3>
-          <p style="color:#909399;font-size:13px;margin-bottom:8px">匹配这些路径且无 Referer 的请求将被拦截（需开启上面的 CC 无 Referer 拦截）。每行一个正则。</p>
-          <el-input v-model="ccPathsText" type="textarea" :rows="3" placeholder="^/pub/news/4($|;|\\?)" />
+          <el-input v-model="ccPathsText" type="textarea" :rows="3" placeholder="^/pub/news/4($|;|\\?)" >
+</el-input>
+          <div class="field-help">匹配这些路径且无 Referer 的请求将被拦截（需开启上面的 CC 无 Referer 拦截）。每行一个正则。</div>
         </div>
         <div class="page-card">
           <h3>扫描器路径</h3>
-          <p style="color:#909399;font-size:13px;margin-bottom:8px">访问这些路径的请求将被拦截。每行一个路径。</p>
-          <el-input v-model="scannerPathsText" type="textarea" :rows="5" placeholder="/phpmyadmin" />
+          <el-input v-model="scannerPathsText" type="textarea" :rows="5" placeholder="/phpmyadmin" >
+</el-input>
+          <div class="field-help">访问这些路径的请求将被拦截。每行一个路径。</div>
         </div>
         <div class="page-card">
           <h3>扫描器 UA</h3>
-          <p style="color:#909399;font-size:13px;margin-bottom:8px">包含这些关键词的 User-Agent 将被拦截。每行一个关键词。</p>
-          <el-input v-model="scannerUAsText" type="textarea" :rows="4" placeholder="zgrab" />
+          <el-input v-model="scannerUAsText" type="textarea" :rows="4" placeholder="zgrab" >
+</el-input>
+          <div class="field-help">包含这些关键词的 User-Agent 将被拦截。每行一个关键词。</div>
         </div>
         <div class="page-card">
           <h3>自定义脚本 UA（额外拦截）</h3>
-          <p style="color:#909399;font-size:13px;margin-bottom:8px">在默认脚本 UA 拦截基础上额外添加。每行一个关键词。</p>
-          <el-input v-model="customScriptUAsText" type="textarea" :rows="4" placeholder="ShapBot" />
+          <el-input v-model="customScriptUAsText" type="textarea" :rows="4" placeholder="ShapBot" >
+</el-input>
+          <div class="field-help">在默认脚本 UA 拦截基础上额外添加。每行一个关键词。</div>
         </div>
         <div class="page-card">
           <h3>自定义拦截路径</h3>
-          <p style="color:#909399;font-size:13px;margin-bottom:8px">匹配这些正则的 URI 将被直接拦截。每行一个正则表达式。</p>
-          <el-input v-model="customBlockPathsText" type="textarea" :rows="3" placeholder="^/secret(/|$)" />
+          <el-input v-model="customBlockPathsText" type="textarea" :rows="3" placeholder="^/secret(/|$)" >
+</el-input>
+          <div class="field-help">匹配这些正则的 URI 将被直接拦截。每行一个正则表达式。</div>
         </div>
         <div style="text-align:right;margin-top:8px">
           <el-button type="primary" @click="saveWAFRules" :loading="saving">保存配置</el-button>
@@ -306,10 +439,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
           <el-form :model="config.conn_limit" label-width="160px" label-position="left">
             <el-row :gutter="20">
               <el-col :span="8">
-                <el-form-item label="每秒最大连接数"><el-input-number v-model="config.conn_limit.max_conns_per_sec" :min="1" :max="100000" /></el-form-item>
+                <el-form-item label="每秒最大连接数">
+                  <el-input-number v-model="config.conn_limit.max_conns_per_sec" :min="1" :max="100000" >
+</el-input-number>
+                  <div class="field-help">TCP 层每秒接受的最大新连接数，超过直接丢弃</div>
+                </el-form-item>
               </el-col>
               <el-col :span="8">
-                <el-form-item label="突发容量"><el-input-number v-model="config.conn_limit.burst" :min="1" :max="100000" /></el-form-item>
+                <el-form-item label="突发容量">
+                  <el-input-number v-model="config.conn_limit.burst" :min="1" :max="100000" >
+</el-input-number>
+                  <div class="field-help">令牌桶突发容量，允许短时超过每秒上限</div>
+                </el-form-item>
               </el-col>
             </el-row>
           </el-form>
@@ -318,19 +459,75 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
           <h3>Windows 防火墙拦截</h3>
           <p style="color:#909399;font-size:13px;margin-bottom:12px">仅 Windows 系统有效，Linux 下此配置无实际效果。</p>
           <el-form :model="config.firewall_block" label-width="160px" label-position="left">
-            <el-form-item label="启用防火墙拦截"><el-switch v-model="config.firewall_block.enabled" /></el-form-item>
-            <el-form-item label="自动拦截"><el-switch v-model="config.firewall_block.auto_block" /></el-form-item>
+            <el-form-item label="启用防火墙拦截">
+              <el-switch v-model="config.firewall_block.enabled" >
+</el-switch>
+              <div class="field-help">是否启用 Windows 防火墙内核层拉黑（仅 Windows 有效）</div>
+            </el-form-item>
+            <el-form-item label="自动拦截">
+              <el-switch v-model="config.firewall_block.auto_block" >
+</el-switch>
+              <div class="field-help">IP 被判定为攻击者后自动加入防火墙规则</div>
+            </el-form-item>
             <el-row :gutter="20">
               <el-col :span="8">
-                <el-form-item label="拦截过期(分钟)"><el-input-number v-model="config.firewall_block.expire_min" :min="1" :max="10080" /></el-form-item>
+                <el-form-item label="拦截过期(分钟)">
+                  <el-input-number v-model="config.firewall_block.expire_min" :min="1" :max="10080" >
+</el-input-number>
+                  <div class="field-help">被拉黑 IP 的自动解封时间</div>
+                </el-form-item>
               </el-col>
             </el-row>
+            <el-form-item label="防火墙白名单">
+              <el-input v-model="firewallWhitelistCIDRsText" type="textarea" :rows="3" placeholder="1.2.3.4&#10;10.0.0.0/8" >
+</el-input>
+              <div class="field-help">每行一个 IP 或 CIDR，命中白名单的 IP 不会被 Windows 防火墙自动拉黑</div>
+            </el-form-item>
           </el-form>
         </div>
         <div style="text-align:right;margin-top:8px">
           <el-button type="primary" @click="saveConfig" :loading="saving">保存配置</el-button>
         </div>
         <div v-if="restartNeeded" class="restart-notice">⚠️ 连接限制配置已保存，需重启 WAF 服务生效</div>
+      </template>
+
+      <!-- IP 防护 -->
+      <template v-if="currentRoute==='ipprotection'">
+        <div class="page-card">
+          <h3>IP 白名单</h3>
+          <el-form :model="config.ip_whitelist" label-width="140px" label-position="left">
+            <el-form-item label="启用白名单">
+              <el-switch v-model="config.ip_whitelist.enabled" >
+</el-switch>
+              <div class="field-help">开启全局 IP 白名单</div>
+            </el-form-item>
+            <el-form-item label="白名单 IP / CIDR">
+              <el-input v-model="whitelistCIDRsText" type="textarea" :rows="5" placeholder="1.2.3.4&#10;10.0.0.0/8&#10;192.168.1.0/24" >
+</el-input>
+              <div class="field-help">每行一个 IP 或 CIDR。命中白名单的 IP 跳过 IP 归属检测、CC 防御、频率限制与防火墙自动拉黑，但仍经过 WAF 规则与反向代理</div>
+            </el-form-item>
+          </el-form>
+        </div>
+        <div class="page-card">
+          <h3>IP 归属检测</h3>
+          <p style="color:#909399;font-size:13px;margin-bottom:12px">基于 data/ip2region.xdb 归属库对公网 IP 进行地域 / ISP 判断，内网、回环等私有地址自动放行。缺省均开启。</p>
+          <el-form :model="config.ip_check" label-width="140px" label-position="left">
+            <el-form-item label="拦截国外 IP">
+              <el-switch v-model="config.ip_check.block_foreign" >
+</el-switch>
+              <div class="field-help">拦截归属地不在中国大陆的 IP（基于 data/ip2region.xdb）</div>
+            </el-form-item>
+            <el-form-item label="拦截云厂商/IDC">
+              <el-switch v-model="config.ip_check.block_cloud" >
+</el-switch>
+              <div class="field-help">拦截阿里云 / 腾讯云 / AWS 等云服务商与机房 IP</div>
+            </el-form-item>
+          </el-form>
+        </div>
+        <div style="text-align:right;margin-top:8px">
+          <el-button type="primary" @click="saveConfig" :loading="saving">保存配置</el-button>
+        </div>
+        <div v-if="restartNeeded" class="restart-notice">⚠️ IP 防护配置已保存，需重启 WAF 服务生效</div>
       </template>
 
       <!-- 访问日志 -->
@@ -374,6 +571,8 @@ function defaultConfig() {
     waf_rules: { cc_paths: [], cc_no_referer_block: true, scanner_paths: [], scanner_uas: [], block_script_ua: true, custom_script_uas: [], custom_block_paths: [], custom_block_status: 403 },
     conn_limit: { max_conns_per_sec: 500, burst: 100 },
     firewall_block: { enabled: true, expire_min: 30, auto_block: true, whitelist_cidrs: [] },
+    ip_whitelist: { enabled: false, cidrs: [] },
+    ip_check: { block_foreign: true, block_cloud: true },
     admin: { enabled: true, listen: '127.0.0.1:9090', username: 'admin', password: '' }
   }
 }
@@ -397,9 +596,11 @@ const app = createApp({
     const scannerUAsText = ref('')
     const customScriptUAsText = ref('')
     const customBlockPathsText = ref('')
+    const whitelistCIDRsText = ref('')
+    const firewallWhitelistCIDRsText = ref('')
 
     const pageTitle = computed(() => {
-      const m = { dashboard:'仪表盘', basic:'基本设置', ratelimit:'频率限制', ccdefense:'CC 防御', wafrules:'WAF 规则', connlimit:'连接限制', logs:'访问日志' }
+      const m = { dashboard:'仪表盘', basic:'基本设置', ratelimit:'频率限制', ccdefense:'CC 防御', wafrules:'WAF 规则', connlimit:'连接限制', ipprotection:'IP 防护', logs:'访问日志' }
       return m[currentRoute.value] || '管理后台'
     })
     const blockType = computed(() => config.block_requests ? 'danger' : 'success')
@@ -415,6 +616,8 @@ const app = createApp({
       scannerUAsText.value = arrToText(config.waf_rules.scanner_uas)
       customScriptUAsText.value = arrToText(config.waf_rules.custom_script_uas)
       customBlockPathsText.value = arrToText(config.waf_rules.custom_block_paths)
+      whitelistCIDRsText.value = arrToText(config.ip_whitelist.cidrs)
+      firewallWhitelistCIDRsText.value = arrToText(config.firewall_block.whitelist_cidrs)
     }
 
     function syncToConfig() {
@@ -424,12 +627,17 @@ const app = createApp({
       config.waf_rules.scanner_uas = textToArr(scannerUAsText.value)
       config.waf_rules.custom_script_uas = textToArr(customScriptUAsText.value)
       config.waf_rules.custom_block_paths = textToArr(customBlockPathsText.value)
+      config.ip_whitelist.cidrs = textToArr(whitelistCIDRsText.value)
+      config.firewall_block.whitelist_cidrs = textToArr(firewallWhitelistCIDRsText.value)
     }
 
     async function loadConfig() {
       try {
         const { data } = await api.get('/config')
         Object.assign(config, data)
+        // ip_check 后端为可空指针，null 时按缺省 true 处理，避免开关显示为关但实际仍拦截
+        if (config.ip_check.block_foreign == null) config.ip_check.block_foreign = true
+        if (config.ip_check.block_cloud == null) config.ip_check.block_cloud = true
         syncFromConfig()
         configLoaded.value = true
       } catch (e) {
@@ -493,6 +701,7 @@ const app = createApp({
     return {
       config, stats, currentRoute, saving, restartNeeded, configLoaded, logsLoading, logLines, logFile,
       hotPathsText, ccPathsText, scannerPathsText, scannerUAsText, customScriptUAsText, customBlockPathsText,
+      whitelistCIDRsText, firewallWhitelistCIDRsText,
       pageTitle, blockType,
       navigate, saveConfig, saveRateLimit, saveWAFRules, loadLogs
     }

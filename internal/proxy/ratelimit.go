@@ -9,6 +9,7 @@ import (
 	"time"
 	"warden/internal/config"
 	"warden/internal/attacklog"
+	"warden/internal/blockpage"
 	"warden/internal/metrics"
 	"warden/internal/util"
 )
@@ -108,7 +109,7 @@ func (rl *IPRateLimiter) Middleware(next http.Handler) http.Handler {
 				metrics.RateLimitBlocked.Inc()
 				attacklog.Record(ip, r.Host, r.URL.Path, "频率限制", reason)
 				w.Header().Set("Retry-After", "1")
-				http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+				blockpage.Serve(w, http.StatusTooManyRequests)
 				if rl.onBlock != nil {
 					rl.onBlock(ip)
 				}

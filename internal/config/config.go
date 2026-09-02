@@ -30,6 +30,7 @@ type Config struct {
 	IPBlacklist     IPBlacklistConfig     `json:"ip_blacklist"`
 	URLAllowlist    []string              `json:"url_allowlist"`
 	URLBlocklist    []string              `json:"url_blocklist"`
+	BlockPage       string                `json:"block_page"` // 自定义拦截页面 HTML
 }
 
 // IPBlacklistConfig IP 黑名单配置

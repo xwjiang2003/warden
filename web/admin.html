@@ -460,6 +460,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
           <p class="field-help" style="margin:0 0 8px">命中这些路径前缀的请求直接拦截。每行一个路径前缀。</p>
           <el-input v-model="urlBlocklistText" type="textarea" :rows="3" placeholder="/private"></el-input>
         </div>
+        <div class="page-card">
+          <h3>自定义拦截页面</h3>
+          <p class="field-help" style="margin:0 0 8px">留空使用默认拦截页。命中 URL 黑名单/IP 黑名单/频率限制时返回此 HTML（状态码 403/429）。</p>
+          <el-input v-model="config.block_page" type="textarea" :rows="6" placeholder="<h1>访问被拒绝</h1>"></el-input>
+        </div>
         <div style="text-align:right;margin-top:8px">
           <el-button type="primary" @click="saveWAFRules" :loading="saving">保存配置</el-button>
         </div>
@@ -766,6 +771,7 @@ function defaultConfig() {
     ip_blacklist: { enabled: false, cidrs: [] },
     url_allowlist: [],
     url_blocklist: [],
+    block_page: '',
     ip_check: { block_foreign: true, block_cloud: true },
     admin: { enabled: true, listen: '127.0.0.1:9090', username: 'admin', password: '' },
     sites: [],

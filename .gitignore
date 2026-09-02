@@ -19,6 +19,11 @@ vendor/
 logs/
 *.log
 
+# === Database ===
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
 # === IDE / Editor ===
 .idea/
 .vscode/

@@ -203,6 +203,12 @@ func Load(path string) (*Config, error) {
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return nil, err
 	}
+	ApplyDefaults(&cfg)
+	return &cfg, nil
+}
+
+// ApplyDefaults 应用缺失字段的默认值
+func ApplyDefaults(cfg *Config) {
 	if cfg.Listen == "" {
 		cfg.Listen = ":80"
 	}
@@ -216,7 +222,6 @@ func Load(path string) (*Config, error) {
 		cfg.AccessLog = "logs/access.log"
 	}
 	cfg.AccessLogRotate.Normalize()
-	return &cfg, nil
 }
 
 // Save 将配置序列化为格式化 JSON 并写入文件

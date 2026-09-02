@@ -19,8 +19,8 @@ import (
 
 	"warden/internal/accesslog"
 	"warden/internal/admin"
-	"warden/internal/config"
 	"warden/internal/proxy"
+	"warden/internal/store"
 	"warden/internal/util"
 	"warden/internal/waf"
 )
@@ -45,12 +45,13 @@ func main() {
 		cfgPath = filepath.Join(exeDir, cfgPath)
 	}
 
-	cfg, err := config.Load(cfgPath)
+	dbPath := filepath.Join(exeDir, store.DefaultDBPath)
+	cfg, err := store.Load(cfgPath, dbPath)
 	if err != nil {
 		fatalStartup(exeDir, "config: %v", err)
 	}
 
-	adminSrv := admin.NewServer(cfg, cfgPath, cfg.Admin)
+	adminSrv := admin.NewServer(cfg, cfgPath, dbPath, cfg.Admin)
 	adminSrv.Start()
 
 	for _, d := range []string{"logs", "rules"} {

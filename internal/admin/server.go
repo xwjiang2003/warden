@@ -14,6 +14,7 @@ import (
 
 	"warden"
 	"warden/internal/alert"
+	"warden/internal/attacklog"
 	"warden/internal/config"
 	"warden/internal/metrics"
 	"warden/internal/restart"
@@ -50,6 +51,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /api/config", s.handlePutConfig)
 	s.mux.HandleFunc("GET /api/stats", s.handleStats)
 	s.mux.HandleFunc("GET /api/logs", s.handleLogs)
+	s.mux.HandleFunc("GET /api/attack_logs", s.handleAttackLogs)
 	s.mux.HandleFunc("GET /api/metrics", s.handleMetrics)
 	s.mux.HandleFunc("POST /api/restart", s.handleRestart)
 	s.mux.HandleFunc("POST /api/alert/test", s.handleAlertTest)
@@ -205,6 +207,13 @@ func (s *Server) handleAlertTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "message": "测试邮件已发送"})
+}
+
+func (s *Server) handleAttackLogs(w http.ResponseWriter, r *http.Request) {
+	limit := 200
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"logs": attacklog.List(limit),
+	})
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {

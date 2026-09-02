@@ -18,6 +18,7 @@ import (
 	"warden/internal/accesslog"
 	"warden/internal/admin"
 	"warden/internal/alert"
+	"warden/internal/attacklog"
 	"warden/internal/metrics"
 	"warden/internal/proxy"
 	"warden/internal/router"
@@ -51,6 +52,7 @@ func main() {
 	if err != nil {
 		fatalStartup(exeDir, "config: %v", err)
 	}
+	attacklog.Init(dbPath)
 
 	adminSrv := admin.NewServer(cfg, cfgPath, dbPath, cfg.Admin)
 	adminSrv.Start()

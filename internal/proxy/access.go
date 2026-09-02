@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"warden/internal/attacklog"
 	"warden/internal/metrics"
 	"warden/internal/util"
 )
@@ -18,6 +19,7 @@ func BlocklistMiddleware(block *IPWhitelist, enabled bool, next http.Handler) ht
 		ip := util.ClientIPFromRequest(r)
 		if block.contains(ip) {
 			metrics.IPCheckBlocked.Inc()
+			attacklog.Record(ip, r.Host, r.URL.Path, "IP黑名单", "blocklisted")
 			log.Printf("[blocklist] blocked ip=%s", ip)
 			util.CloseConnectionSilently(w)
 			return

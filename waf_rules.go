@@ -69,8 +69,9 @@ func (c *WAFRulesConfig) build() string {
 
 	for i, p := range c.CustomBlockPaths {
 		rid := 910100 + i
-		b.WriteString(fmt.Sprintf("SecRule REQUEST_URI \"@rx %s\" \\\n    \"id:%d,phase:1,drop,log,auditlog,msg:'Custom block path'\"\n",
-			p, rid))
+		// 使用自定义拦截状态码（默认 403）返回 HTTP 响应，而非直接断连
+		b.WriteString(fmt.Sprintf("SecRule REQUEST_URI \"@rx %s\" \\\n    \"id:%d,phase:1,deny,status:%d,log,auditlog,msg:'Custom block path'\"\n",
+			p, rid, c.CustomBlockStatus))
 	}
 
 	return b.String()

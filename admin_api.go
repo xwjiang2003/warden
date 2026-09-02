@@ -107,6 +107,7 @@ func (s *adminServer) start() error {
 	}
 
 	srv := &http.Server{
+		Addr:         s.adminCfg.Listen,
 		Handler:      s.handler(),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
@@ -139,6 +140,10 @@ func (s *adminServer) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	if cfgCopy.CCDefense.ChallengeCookieKey != "" {
 		cfgCopy.CCDefense.ChallengeCookieKey = "***"
 	}
+	// 管理后台密码不回显明文，用 "***" 占位表示已设置
+	if cfgCopy.Admin.Password != "" {
+		cfgCopy.Admin.Password = "***"
+	}
 	writeJSON(w, http.StatusOK, cfgCopy)
 }
 
@@ -154,6 +159,10 @@ func (s *adminServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	// 保留未在请求中设置的敏感字段
 	if newCfg.CCDefense.ChallengeCookieKey == "***" || newCfg.CCDefense.ChallengeCookieKey == "" {
 		newCfg.CCDefense.ChallengeCookieKey = s.cfg.CCDefense.ChallengeCookieKey
+	}
+	// "***" 表示未修改，保留原密码；空字符串表示清除密码（关闭认证）
+	if newCfg.Admin.Password == "***" {
+		newCfg.Admin.Password = s.cfg.Admin.Password
 	}
 
 	// 应用默认值
@@ -265,6 +274,8 @@ func (s *adminServer) handleLogs(w http.ResponseWriter, r *http.Request) {
 // ---- Static File Handler ----
 
 func (s *adminServer) handleStatic(w http.ResponseWriter, r *http.Request) {
+	// 禁止缓存，确保管理后台页面更新后能立即生效
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
 	// SPA 回退：所有非 API 路径都返回 admin.html
 	if r.URL.Path == "/" || !strings.HasPrefix(r.URL.Path, "/api/") {
 		// 尝试从 web/ 目录提供静态文件
@@ -298,6 +309,7 @@ func (s *adminServer) handleStatic(w http.ResponseWriter, r *http.Request) {
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
 }

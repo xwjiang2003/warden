@@ -84,7 +84,7 @@ var discardCount int64
 // ---- Windows Firewall IP 黑名单 (内核层拦截) ----
 // 被确认的攻击 IP 加入系统防火墙，在 TCP 三次握手之前就丢弃
 
-const firewallRulePrefix = "pyfls-waf-block-"
+const firewallRulePrefix = "warden-block-"
 
 type firewallBlocker struct {
 	mu          sync.Mutex

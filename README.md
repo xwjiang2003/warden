@@ -1,11 +1,11 @@
-# pyfls-waf
+# 沃盾（warden）
 
-Go + OWASP Coraza 反向代理 WAF，面向 Windows/Linux，编译为单个 `pyfls-waf.exe`。
+Go + OWASP Coraza 反向代理 WAF，面向 Windows/Linux，编译为单个 `warden.exe`。
 
 ## 架构
 
 ```text
-外网 → pyfls-waf.exe (:80)  [Coraza + Go 限流]
+外网 → warden.exe (:80)  [Coraza + Go 限流]
            ↓
       Nginx (:81) → Tomcat (:8001)
 ```
@@ -15,7 +15,7 @@ Go + OWASP Coraza 反向代理 WAF，面向 Windows/Linux，编译为单个 `pyf
 ## 环境要求
 
 - Go 1.21+：https://go.dev/dl/
-- Windows：在 `pyfls-waf` 目录打开 PowerShell
+- Windows：在 `warden` 目录打开 PowerShell
 
 ## 编译
 
@@ -26,9 +26,9 @@ Go + OWASP Coraza 反向代理 WAF，面向 Windows/Linux，编译为单个 `pyf
 ```cmd
 set GOPROXY=https://goproxy.cn,https://goproxy.io,direct
 set GOSUMDB=sum.golang.google.cn
-cd /d d:\ai\log\pyfls-waf
+cd /d d:\ai\log\warden
 go mod tidy
-go build -o pyfls-waf.exe .
+go build -o warden.exe .
 ```
 
 永久设置（新开 cmd 生效）：
@@ -55,7 +55,7 @@ setx GOSUMDB "sum.golang.google.cn"
 
 当前默认方案：
 
-- **pyfls-waf** 监听 **80**（对外）
+- **warden** 监听 **80**（对外）
 - **Nginx** 监听 **81**（仅本机，由 WAF 转发）
 - 改 `nginx.conf` 后执行 `nginx -s reload`
 
@@ -68,8 +68,8 @@ SecRuleEngine DetectionOnly
 ```
 
 ```powershell
-cd d:\ai\log\pyfls-waf
-.\pyfls-waf.exe -config config.json
+cd d:\ai\log\warden
+.\warden.exe -config config.json
 ```
 
 检查：
@@ -87,17 +87,17 @@ curl -I http://127.0.0.1/
 SecRuleEngine On
 ```
 
-重启 `pyfls-waf.exe`。
+重启 `warden.exe`。
 
 ### 4. 注册 Windows 服务（可选）
 
 使用 [NSSM](https://nssm.cc/)：
 
 ```text
-nssm install pyfls-waf "D:\path\pyfls-waf\pyfls-waf.exe"
-nssm set pyfls-waf AppDirectory "D:\path\pyfls-waf"
-nssm set pyfls-waf AppParameters "-config config.json"
-nssm start pyfls-waf
+nssm install warden "D:\path\warden\warden.exe"
+nssm set warden AppDirectory "D:\path\warden"
+nssm set warden AppParameters "-config config.json"
+nssm start warden
 ```
 
 ## 规则调参（分布式 CC）

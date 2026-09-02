@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul 2>&1
-title pyfls-waf build
+title 沃盾 编译
 cd /d "%~dp0"
 
 REM 国内网络：使用 Go 模块镜像（可编辑为本机代理）
@@ -8,7 +8,7 @@ set "GOPROXY=https://goproxy.cn,https://goproxy.io,direct"
 set "GOSUMDB=sum.golang.google.cn"
 
 echo ========================================
-echo   pyfls-waf 编译安装
+echo   沃盾 编译安装
 echo   目录: %CD%
 echo   GOPROXY=%GOPROXY%
 echo ========================================
@@ -45,8 +45,8 @@ if errorlevel 1 (
 )
 echo.
 
-echo [3/3] 编译 pyfls-waf.exe ...
-go build -o pyfls-waf.exe .
+echo [3/3] 编译 warden.exe ...
+go build -o warden.exe .
 if errorlevel 1 (
   echo [错误] 编译失败
   goto :end_pause
@@ -54,7 +54,7 @@ if errorlevel 1 (
 
 echo.
 echo ========================================
-echo   编译成功: %CD%\pyfls-waf.exe
+echo   编译成功: %CD%\warden.exe
 echo   运行: 请双击 run.bat（不要直接双击 exe，否则窗口会闪退）
 echo ========================================
 echo.

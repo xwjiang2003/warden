@@ -13,7 +13,7 @@ echo.
 echo 本窗口已生效。请在本窗口执行:
 echo   cd /d %~dp0
 echo   go mod tidy
-echo   go build -o pyfls-waf.exe .
+echo   go build -o warden.exe .
 echo.
 echo 要永久生效（用户环境变量），以管理员运行:
 echo   setx GOPROXY "https://goproxy.cn,https://goproxy.io,direct"

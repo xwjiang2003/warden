@@ -14,6 +14,7 @@ import (
 
 	"warden"
 	"warden/internal/config"
+	"warden/internal/restart"
 	"warden/internal/store"
 )
 
@@ -47,6 +48,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /api/config", s.handlePutConfig)
 	s.mux.HandleFunc("GET /api/stats", s.handleStats)
 	s.mux.HandleFunc("GET /api/logs", s.handleLogs)
+	s.mux.HandleFunc("POST /api/restart", s.handleRestart)
 	s.mux.HandleFunc("GET /", s.handleStatic)
 }
 
@@ -171,6 +173,17 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		"message":          "配置已保存",
 		"restart_required": true,
 	})
+}
+
+func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{
+		"message": "正在重启服务…",
+	})
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		log.Printf("[admin] 收到重启指令，进程即将重启")
+		restart.Restart()
+	}()
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {

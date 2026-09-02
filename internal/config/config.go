@@ -26,6 +26,33 @@ type Config struct {
 	IPCheck         IPCheckConfig         `json:"ip_check"`
 	Admin           AdminConfig           `json:"admin"`
 	Sites           []SiteConfig          `json:"sites"`
+	Alert           AlertConfig           `json:"alert"`
+}
+
+// AlertConfig 邮件告警配置
+type AlertConfig struct {
+	Enabled            bool     `json:"enabled"`
+	SMTPHost           string   `json:"smtp_host"`
+	SMTPPort           int      `json:"smtp_port"`
+	SMTPUsername       string   `json:"smtp_username"`
+	SMTPPassword       string   `json:"smtp_password"`
+	SMTPFrom           string   `json:"smtp_from"`
+	SMTPTLS            bool     `json:"smtp_tls"`
+	To                 []string `json:"to"`
+	CooldownMin        int      `json:"cooldown_min"`
+	BlockRateThreshold float64  `json:"block_rate_threshold"` // 告警拦截率阈值(百分比)
+}
+
+func (c *AlertConfig) Normalize() {
+	if c.SMTPPort <= 0 {
+		c.SMTPPort = 465
+	}
+	if c.CooldownMin <= 0 {
+		c.CooldownMin = 10
+	}
+	if c.BlockRateThreshold <= 0 {
+		c.BlockRateThreshold = 50
+	}
 }
 
 // SiteConfig 单个代理站点（按 Host 头路由到对应上游）

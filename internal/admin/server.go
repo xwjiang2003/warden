@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"warden"
+	"warden/internal/alert"
 	"warden/internal/config"
 	"warden/internal/metrics"
 	"warden/internal/restart"
@@ -51,6 +52,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/logs", s.handleLogs)
 	s.mux.HandleFunc("GET /api/metrics", s.handleMetrics)
 	s.mux.HandleFunc("POST /api/restart", s.handleRestart)
+	s.mux.HandleFunc("POST /api/alert/test", s.handleAlertTest)
 	s.mux.HandleFunc("GET /", s.handleStatic)
 }
 
@@ -125,6 +127,9 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	if cfgCopy.Admin.Password != "" {
 		cfgCopy.Admin.Password = "***"
 	}
+	if cfgCopy.Alert.SMTPPassword != "" {
+		cfgCopy.Alert.SMTPPassword = "***"
+	}
 	writeJSON(w, http.StatusOK, cfgCopy)
 }
 
@@ -143,6 +148,9 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	if newCfg.Admin.Password == "***" {
 		newCfg.Admin.Password = s.cfg.Admin.Password
 	}
+	if newCfg.Alert.SMTPPassword == "***" {
+		newCfg.Alert.SMTPPassword = s.cfg.Alert.SMTPPassword
+	}
 
 	if newCfg.Listen == "" {
 		newCfg.Listen = ":80"
@@ -160,6 +168,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	newCfg.ConnLimit.Normalize()
 	newCfg.FirewallBlock.Normalize()
 	newCfg.CCDefense.Normalize()
+	newCfg.Alert.Normalize()
 
 	if err := store.Save(s.cfgPath, s.dbPath, &newCfg); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
@@ -186,6 +195,16 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[admin] 收到重启指令，进程即将重启")
 		restart.Restart()
 	}()
+}
+
+func (s *Server) handleAlertTest(w http.ResponseWriter, r *http.Request) {
+	err := alert.Send(&s.cfg.Alert, "[沃盾] 测试告警邮件",
+		"这是一封来自沃盾 WAF 的测试告警邮件。\n时间："+time.Now().Format(time.RFC3339))
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "message": "测试邮件已发送"})
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {

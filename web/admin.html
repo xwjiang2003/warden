@@ -49,6 +49,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
       <el-menu-item index="connlimit">🔗 连接限制</el-menu-item>
       <el-menu-item index="sites">🌐 代理站点</el-menu-item>
       <el-menu-item index="ipprotection">🌐 IP 防护</el-menu-item>
+      <el-menu-item index="alert">📧 告警通知</el-menu-item>
       <el-menu-item index="logs">📋 访问日志</el-menu-item>
     </el-menu>
   </el-aside>
@@ -593,6 +594,78 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         <div v-if="restartNeeded" class="restart-notice"><span>⚠️ IP 防护配置已保存，需重启 WAF 服务生效</span><el-button type="danger" size="small" @click="restartService" :loading="restarting">立即重启</el-button></div>
       </template>
 
+      <!-- 告警通知 -->
+      <template v-if="currentRoute==='alert'">
+        <div class="page-card">
+          <h3>邮件告警设置</h3>
+          <el-form :model="config.alert" label-width="150px" label-position="left">
+            <el-form-item label="启用告警">
+              <el-switch v-model="config.alert.enabled"></el-switch>
+              <div class="field-help">开启后每 60 秒检查一次拦截率，超过阈值即发送告警邮件</div>
+            </el-form-item>
+            <el-row :gutter="20">
+              <el-col :span="10">
+                <el-form-item label="SMTP 服务器">
+                  <el-input v-model="config.alert.smtp_host" placeholder="smtp.example.com"></el-input>
+                </el-form-item>
+              </el-col>
+              <el-col :span="6">
+                <el-form-item label="端口">
+                  <el-input-number v-model="config.alert.smtp_port" :min="1" :max="65535"></el-input-number>
+                </el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="SSL/TLS">
+                  <el-switch v-model="config.alert.smtp_tls"></el-switch>
+                  <div class="field-help">465 端口通常开启，587 走 STARTTLS</div>
+                </el-form-item>
+              </el-col>
+            </el-row>
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <el-form-item label="用户名">
+                  <el-input v-model="config.alert.smtp_username"></el-input>
+                </el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="密码">
+                  <el-input v-model="config.alert.smtp_password" show-password placeholder="留空则无认证"></el-input>
+                  <div class="field-help">已设置时显示 ***，保存即保持不变</div>
+                </el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="发件人">
+                  <el-input v-model="config.alert.smtp_from" placeholder="waf@example.com"></el-input>
+                </el-form-item>
+              </el-col>
+            </el-row>
+            <el-form-item label="收件人">
+              <el-input v-model="alertToText" type="textarea" :rows="3" placeholder="ops@example.com"></el-input>
+              <div class="field-help">每行一个邮箱地址</div>
+            </el-form-item>
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <el-form-item label="冷却时间(分钟)">
+                  <el-input-number v-model="config.alert.cooldown_min" :min="1" :max="1440"></el-input-number>
+                  <div class="field-help">两次告警之间的最小间隔，防刷屏</div>
+                </el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="拦截率阈值(%)">
+                  <el-input-number v-model="config.alert.block_rate_threshold" :min="1" :max="100"></el-input-number>
+                  <div class="field-help">最近 60 秒拦截率超过该值即告警</div>
+                </el-form-item>
+              </el-col>
+            </el-row>
+          </el-form>
+        </div>
+        <div style="text-align:right;margin-top:8px">
+          <el-button @click="sendTestEmail" :loading="emailTesting" style="margin-right:8px">发送测试邮件</el-button>
+          <el-button type="primary" @click="saveConfig" :loading="saving">保存配置</el-button>
+        </div>
+        <div v-if="restartNeeded" class="restart-notice"><span>⚠️ 告警配置已保存，需重启 WAF 服务生效</span><el-button type="danger" size="small" @click="restartService" :loading="restarting">立即重启</el-button></div>
+      </template>
+
       <!-- 访问日志 -->
       <template v-if="currentRoute==='logs'">
         <div class="page-card">
@@ -637,7 +710,8 @@ function defaultConfig() {
     ip_whitelist: { enabled: false, cidrs: [] },
     ip_check: { block_foreign: true, block_cloud: true },
     admin: { enabled: true, listen: '127.0.0.1:9090', username: 'admin', password: '' },
-    sites: []
+    sites: [],
+    alert: { enabled: false, smtp_host: '', smtp_port: 465, smtp_username: '', smtp_password: '', smtp_from: '', smtp_tls: true, to: [], cooldown_min: 10, block_rate_threshold: 50 }
   }
 }
 
@@ -668,9 +742,11 @@ const app = createApp({
     const customBlockPathsText = ref('')
     const whitelistCIDRsText = ref('')
     const firewallWhitelistCIDRsText = ref('')
+    const alertToText = ref('')
+    const emailTesting = ref(false)
 
     const pageTitle = computed(() => {
-      const m = { dashboard:'仪表盘', basic:'基本设置', ratelimit:'频率限制', ccdefense:'CC 防御', wafrules:'WAF 规则', connlimit:'连接限制', sites:'代理站点', ipprotection:'IP 防护', logs:'访问日志' }
+      const m = { dashboard:'仪表盘', basic:'基本设置', ratelimit:'频率限制', ccdefense:'CC 防御', wafrules:'WAF 规则', connlimit:'连接限制', sites:'代理站点', ipprotection:'IP 防护', alert:'告警通知', logs:'访问日志' }
       return m[currentRoute.value] || '管理后台'
     })
     const blockType = computed(() => config.block_requests ? 'danger' : 'success')
@@ -690,6 +766,8 @@ const app = createApp({
       firewallWhitelistCIDRsText.value = arrToText(config.firewall_block.whitelist_cidrs)
       if (!config.sites) config.sites = []
       config.sites.forEach(s => { s.hosts_text = (s.hosts || []).join(', ') })
+      if (!config.alert) config.alert = { enabled: false, to: [] }
+      alertToText.value = arrToText(config.alert.to)
     }
 
     function syncToConfig() {
@@ -702,6 +780,7 @@ const app = createApp({
       config.ip_whitelist.cidrs = textToArr(whitelistCIDRsText.value)
       config.firewall_block.whitelist_cidrs = textToArr(firewallWhitelistCIDRsText.value)
       if (config.sites) config.sites.forEach(s => { s.hosts = (s.hosts_text || '').split(/[,，\s]+/).map(x => x.trim()).filter(x => x !== '') })
+      if (config.alert) config.alert.to = textToArr(alertToText.value)
     }
 
     async function loadConfig() {
@@ -789,6 +868,17 @@ const app = createApp({
       }
     }
 
+    async function sendTestEmail() {
+      emailTesting.value = true
+      try {
+        const { data } = await api.post('/alert/test')
+        if (data.ok) ElementPlus.ElMessage.success(data.message || '测试邮件已发送')
+        else ElementPlus.ElMessage.error('发送失败: ' + (data.error || ''))
+      } catch (e) {
+        ElementPlus.ElMessage.error('发送失败: ' + (e.response?.data?.error || e.message))
+      } finally { emailTesting.value = false }
+    }
+
     async function loadLogs() {
       logsLoading.value = true
       try {
@@ -817,9 +907,9 @@ const app = createApp({
     return {
       config, stats, metrics, qps, blockRate, currentRoute, saving, restartNeeded, restarting, configLoaded, logsLoading, logLines, logFile,
       hotPathsText, ccPathsText, scannerPathsText, scannerUAsText, customScriptUAsText, customBlockPathsText,
-      whitelistCIDRsText, firewallWhitelistCIDRsText,
+      whitelistCIDRsText, firewallWhitelistCIDRsText, alertToText, emailTesting,
       pageTitle, blockType,
-      navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, loadLogs
+      navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, sendTestEmail, loadLogs
     }
   }
 })

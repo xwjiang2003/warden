@@ -100,7 +100,10 @@ func main() {
 	handler := rl.Middleware(inner)
 	ccDef = proxy.NewCCDefense(cfg.CCDefense, cfg.IPCheck, fwBlocker, handler)
 	whitelist := proxy.NewIPWhitelist(cfg.IPWhitelist.CIDRs)
-	mux.Handle("/", proxy.WhitelistMiddleware(whitelist, cfg.IPWhitelist.Enabled, inner, ccDef))
+	blocklist := proxy.NewIPWhitelist(cfg.IPBlacklist.CIDRs)
+	mux.Handle("/", proxy.BlocklistMiddleware(blocklist, cfg.IPBlacklist.Enabled,
+		proxy.URLMiddleware(cfg.URLAllowlist, cfg.URLBlocklist, siteRouter,
+			proxy.WhitelistMiddleware(whitelist, cfg.IPWhitelist.Enabled, inner, ccDef))))
 
 	readTO := util.DurationSec(cfg.ReadTimeoutSec, 60)
 	writeTO := util.DurationSec(cfg.WriteTimeoutSec, 60)

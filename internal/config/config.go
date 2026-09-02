@@ -27,6 +27,15 @@ type Config struct {
 	Admin           AdminConfig           `json:"admin"`
 	Sites           []SiteConfig          `json:"sites"`
 	Alert           AlertConfig           `json:"alert"`
+	IPBlacklist     IPBlacklistConfig     `json:"ip_blacklist"`
+	URLAllowlist    []string              `json:"url_allowlist"`
+	URLBlocklist    []string              `json:"url_blocklist"`
+}
+
+// IPBlacklistConfig IP 黑名单配置
+type IPBlacklistConfig struct {
+	Enabled bool     `json:"enabled"`
+	CIDRs   []string `json:"cidrs"`
 }
 
 // AlertConfig 邮件告警配置

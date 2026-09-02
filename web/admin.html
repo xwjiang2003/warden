@@ -449,6 +449,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 </el-input>
           <div class="field-help">匹配这些正则的 URI 将被直接拦截。每行一个正则表达式。</div>
         </div>
+        <div class="page-card">
+          <h3>URL 白名单</h3>
+          <p class="field-help" style="margin:0 0 8px">命中这些路径前缀的请求直接转发到后端，跳过 WAF/CC/限流等防护。每行一个路径前缀。</p>
+          <el-input v-model="urlAllowlistText" type="textarea" :rows="3" placeholder="/healthz"></el-input>
+        </div>
+        <div class="page-card">
+          <h3>URL 黑名单</h3>
+          <p class="field-help" style="margin:0 0 8px">命中这些路径前缀的请求直接拦截。每行一个路径前缀。</p>
+          <el-input v-model="urlBlocklistText" type="textarea" :rows="3" placeholder="/private"></el-input>
+        </div>
         <div style="text-align:right;margin-top:8px">
           <el-button type="primary" @click="saveWAFRules" :loading="saving">保存配置</el-button>
         </div>
@@ -569,6 +579,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
               <el-input v-model="whitelistCIDRsText" type="textarea" :rows="5" placeholder="1.2.3.4&#10;10.0.0.0/8&#10;192.168.1.0/24" >
 </el-input>
               <div class="field-help">每行一个 IP 或 CIDR。命中白名单的 IP 跳过 IP 归属检测、CC 防御、频率限制与防火墙自动拉黑，但仍经过 WAF 规则与反向代理</div>
+            </el-form-item>
+          </el-form>
+        </div>
+        <div class="page-card">
+          <h3>IP 黑名单</h3>
+          <el-form :model="config.ip_blacklist" label-width="140px" label-position="left">
+            <el-form-item label="启用黑名单">
+              <el-switch v-model="config.ip_blacklist.enabled"></el-switch>
+              <div class="field-help">命中黑名单的 IP 将被直接拦截（静默断连）</div>
+            </el-form-item>
+            <el-form-item label="黑名单 IP / CIDR">
+              <el-input v-model="blacklistCIDRsText" type="textarea" :rows="4" placeholder="1.2.3.4&#10;10.0.0.0/8"></el-input>
+              <div class="field-help">每行一个 IP 或 CIDR</div>
             </el-form-item>
           </el-form>
         </div>
@@ -708,6 +731,9 @@ function defaultConfig() {
     conn_limit: { max_conns_per_sec: 500, burst: 100 },
     firewall_block: { enabled: true, expire_min: 30, auto_block: true, whitelist_cidrs: [] },
     ip_whitelist: { enabled: false, cidrs: [] },
+    ip_blacklist: { enabled: false, cidrs: [] },
+    url_allowlist: [],
+    url_blocklist: [],
     ip_check: { block_foreign: true, block_cloud: true },
     admin: { enabled: true, listen: '127.0.0.1:9090', username: 'admin', password: '' },
     sites: [],
@@ -742,6 +768,9 @@ const app = createApp({
     const customBlockPathsText = ref('')
     const whitelistCIDRsText = ref('')
     const firewallWhitelistCIDRsText = ref('')
+    const blacklistCIDRsText = ref('')
+    const urlAllowlistText = ref('')
+    const urlBlocklistText = ref('')
     const alertToText = ref('')
     const emailTesting = ref(false)
 
@@ -763,6 +792,9 @@ const app = createApp({
       customScriptUAsText.value = arrToText(config.waf_rules.custom_script_uas)
       customBlockPathsText.value = arrToText(config.waf_rules.custom_block_paths)
       whitelistCIDRsText.value = arrToText(config.ip_whitelist.cidrs)
+      blacklistCIDRsText.value = arrToText(config.ip_blacklist ? config.ip_blacklist.cidrs : [])
+      urlAllowlistText.value = arrToText(config.url_allowlist)
+      urlBlocklistText.value = arrToText(config.url_blocklist)
       firewallWhitelistCIDRsText.value = arrToText(config.firewall_block.whitelist_cidrs)
       if (!config.sites) config.sites = []
       config.sites.forEach(s => { s.hosts_text = (s.hosts || []).join(', ') })
@@ -778,6 +810,9 @@ const app = createApp({
       config.waf_rules.custom_script_uas = textToArr(customScriptUAsText.value)
       config.waf_rules.custom_block_paths = textToArr(customBlockPathsText.value)
       config.ip_whitelist.cidrs = textToArr(whitelistCIDRsText.value)
+      if (config.ip_blacklist) config.ip_blacklist.cidrs = textToArr(blacklistCIDRsText.value)
+      config.url_allowlist = textToArr(urlAllowlistText.value)
+      config.url_blocklist = textToArr(urlBlocklistText.value)
       config.firewall_block.whitelist_cidrs = textToArr(firewallWhitelistCIDRsText.value)
       if (config.sites) config.sites.forEach(s => { s.hosts = (s.hosts_text || '').split(/[,，\s]+/).map(x => x.trim()).filter(x => x !== '') })
       if (config.alert) config.alert.to = textToArr(alertToText.value)
@@ -791,6 +826,9 @@ const app = createApp({
         if (config.ip_check.block_foreign == null) config.ip_check.block_foreign = true
         if (config.ip_check.block_cloud == null) config.ip_check.block_cloud = true
         if (config.sites == null) config.sites = []
+        if (config.ip_blacklist == null) config.ip_blacklist = { enabled: false, cidrs: [] }
+        if (config.url_allowlist == null) config.url_allowlist = []
+        if (config.url_blocklist == null) config.url_blocklist = []
         syncFromConfig()
         configLoaded.value = true
       } catch (e) {
@@ -907,7 +945,7 @@ const app = createApp({
     return {
       config, stats, metrics, qps, blockRate, currentRoute, saving, restartNeeded, restarting, configLoaded, logsLoading, logLines, logFile,
       hotPathsText, ccPathsText, scannerPathsText, scannerUAsText, customScriptUAsText, customBlockPathsText,
-      whitelistCIDRsText, firewallWhitelistCIDRsText, alertToText, emailTesting,
+      whitelistCIDRsText, firewallWhitelistCIDRsText, blacklistCIDRsText, urlAllowlistText, urlBlocklistText, alertToText, emailTesting,
       pageTitle, blockType,
       navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, sendTestEmail, loadLogs
     }

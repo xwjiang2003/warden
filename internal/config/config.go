@@ -25,6 +25,14 @@ type Config struct {
 	IPWhitelist     IPWhitelistConfig     `json:"ip_whitelist"`
 	IPCheck         IPCheckConfig         `json:"ip_check"`
 	Admin           AdminConfig           `json:"admin"`
+	Sites           []SiteConfig          `json:"sites"`
+}
+
+// SiteConfig 单个代理站点（按 Host 头路由到对应上游）
+type SiteConfig struct {
+	Name    string   `json:"name"`
+	Hosts   []string `json:"hosts"`
+	Backend string   `json:"backend"`
 }
 
 type ConnLimitConfig struct {

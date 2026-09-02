@@ -7,8 +7,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -20,6 +18,7 @@ import (
 	"warden/internal/accesslog"
 	"warden/internal/admin"
 	"warden/internal/proxy"
+	"warden/internal/router"
 	"warden/internal/store"
 	"warden/internal/util"
 	"warden/internal/waf"
@@ -70,14 +69,12 @@ func main() {
 		fatalStartup(exeDir, "waf: %v", err)
 	}
 
-	backendURL, err := url.Parse(cfg.Backend)
-	if err != nil {
-		fatalStartup(exeDir, "backend url: %v", err)
-	}
-
 	accessLog := accesslog.New(cfg.AccessLog, cfg.AccessLogRotate)
 	defer accessLog.Close()
-	proxyHandler := newReverseProxy(backendURL, accessLog)
+	siteRouter, err := router.New(cfg, accessLog)
+	if err != nil {
+		fatalStartup(exeDir, "router: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -88,7 +85,7 @@ func main() {
 	cfg.FirewallBlock.Normalize()
 	fwBlocker := proxy.NewFirewallBlocker(cfg.FirewallBlock.Enabled && cfg.FirewallBlock.AutoBlock, cfg.FirewallBlock.ExpireMin, cfg.FirewallBlock.WhitelistCIDRs)
 
-	inner := realIPMiddleware(txhttp.WrapHandler(wafEngine, proxyHandler))
+	inner := realIPMiddleware(txhttp.WrapHandler(wafEngine, siteRouter))
 	var ccDef *proxy.CCDefenseHandler
 	rl := proxy.NewIPRateLimiter(cfg.RateLimit, cfg.BlockRequests, func(ip string) {
 		if ccDef != nil {
@@ -162,31 +159,6 @@ func fatalStartup(exeDir, format string, args ...interface{}) {
 	_ = os.WriteFile(logFile, []byte(time.Now().Format(time.RFC3339)+" "+msg+"\n"), 0644)
 	log.SetOutput(os.Stderr)
 	log.Fatal(msg + " (详情已写入 logs/startup-error.log)")
-}
-
-func newReverseProxy(target *url.URL, al *accesslog.Logger) http.Handler {
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	origDirector := proxy.Director
-	proxy.Director = func(r *http.Request) {
-		origDirector(r)
-		clientIP := util.ClientIPFromRequest(r)
-		r.Header.Set("X-Real-IP", clientIP)
-		if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
-			r.Header.Set("X-Forwarded-For", prior+", "+clientIP)
-		} else {
-			r.Header.Set("X-Forwarded-For", clientIP)
-		}
-	}
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("proxy error: %v", err)
-		al.Log(r, 502, 0)
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
-	}
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		al.Log(resp.Request, resp.StatusCode, resp.ContentLength)
-		return nil
-	}
-	return proxy
 }
 
 func realIPMiddleware(next http.Handler) http.Handler {

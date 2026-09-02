@@ -47,6 +47,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
       <el-menu-item index="ccdefense">🛡️ CC 防御</el-menu-item>
       <el-menu-item index="wafrules">🔒 WAF 规则</el-menu-item>
       <el-menu-item index="connlimit">🔗 连接限制</el-menu-item>
+      <el-menu-item index="sites">🌐 代理站点</el-menu-item>
       <el-menu-item index="ipprotection">🌐 IP 防护</el-menu-item>
       <el-menu-item index="logs">📋 访问日志</el-menu-item>
     </el-menu>
@@ -55,7 +56,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
     <el-header>
       <h2>{{ pageTitle }}</h2>
       <div style="display:flex;align-items:center;gap:16px;font-size:13px;color:#909399">
-        <span v-if="configLoaded">代理: {{ config.listen }} → {{ config.backend }}</span>
+        <span v-if="configLoaded">代理: {{ config.listen }} → {{ (config.sites && config.sites.length) ? config.sites.length + ' 站点' : config.backend }}</span>
         <el-tag :type="blockType" size="small">{{ config.block_requests ? '拦截模式' : '监控模式' }}</el-tag>
       </div>
     </el-header>
@@ -491,6 +492,47 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         <div v-if="restartNeeded" class="restart-notice">⚠️ 连接限制配置已保存，需重启 WAF 服务生效</div>
       </template>
 
+      <!-- 代理站点 -->
+      <template v-if="currentRoute==='sites'">
+        <div class="page-card">
+          <h3>默认上游</h3>
+          <el-form :model="config" label-width="130px" label-position="left">
+            <el-form-item label="默认后端地址">
+              <el-input v-model="config.backend" placeholder="http://127.0.0.1:81"></el-input>
+              <div class="field-help">未匹配到任何站点 Host 时，请求转发到该默认上游</div>
+            </el-form-item>
+          </el-form>
+        </div>
+        <div class="page-card">
+          <h3>代理站点（按 Host 路由）</h3>
+          <p class="field-help" style="margin:0 0 12px">每个站点按 Host 头匹配到对应上游；Host 用逗号分隔，可填多个域名（如 www.a.com, a.com）。</p>
+          <div v-for="(site, idx) in config.sites" :key="idx" style="border:1px solid #ebeef5;border-radius:6px;padding:12px;margin-bottom:12px">
+            <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">
+              <div style="flex:1;min-width:170px">
+                <label style="font-size:13px;color:#606266">站点名称</label>
+                <el-input v-model="site.name" placeholder="主站" style="margin-top:4px"></el-input>
+              </div>
+              <div style="flex:2;min-width:220px">
+                <label style="font-size:13px;color:#606266">Host（逗号分隔）</label>
+                <el-input v-model="site.hosts_text" placeholder="www.a.com, a.com" style="margin-top:4px"></el-input>
+              </div>
+              <div style="flex:2;min-width:220px">
+                <label style="font-size:13px;color:#606266">后端地址</label>
+                <el-input v-model="site.backend" placeholder="http://127.0.0.1:8001" style="margin-top:4px"></el-input>
+              </div>
+              <div>
+                <el-button type="danger" plain @click="removeSite(idx)">删除</el-button>
+              </div>
+            </div>
+          </div>
+          <el-button type="primary" plain @click="addSite">+ 添加站点</el-button>
+        </div>
+        <div style="text-align:right;margin-top:8px">
+          <el-button type="primary" @click="saveConfig" :loading="saving">保存配置</el-button>
+        </div>
+        <div v-if="restartNeeded" class="restart-notice">⚠️ 站点配置已保存，需重启 WAF 服务生效</div>
+      </template>
+
       <!-- IP 防护 -->
       <template v-if="currentRoute==='ipprotection'">
         <div class="page-card">
@@ -573,7 +615,8 @@ function defaultConfig() {
     firewall_block: { enabled: true, expire_min: 30, auto_block: true, whitelist_cidrs: [] },
     ip_whitelist: { enabled: false, cidrs: [] },
     ip_check: { block_foreign: true, block_cloud: true },
-    admin: { enabled: true, listen: '127.0.0.1:9090', username: 'admin', password: '' }
+    admin: { enabled: true, listen: '127.0.0.1:9090', username: 'admin', password: '' },
+    sites: []
   }
 }
 
@@ -600,7 +643,7 @@ const app = createApp({
     const firewallWhitelistCIDRsText = ref('')
 
     const pageTitle = computed(() => {
-      const m = { dashboard:'仪表盘', basic:'基本设置', ratelimit:'频率限制', ccdefense:'CC 防御', wafrules:'WAF 规则', connlimit:'连接限制', ipprotection:'IP 防护', logs:'访问日志' }
+      const m = { dashboard:'仪表盘', basic:'基本设置', ratelimit:'频率限制', ccdefense:'CC 防御', wafrules:'WAF 规则', connlimit:'连接限制', sites:'代理站点', ipprotection:'IP 防护', logs:'访问日志' }
       return m[currentRoute.value] || '管理后台'
     })
     const blockType = computed(() => config.block_requests ? 'danger' : 'success')
@@ -618,6 +661,8 @@ const app = createApp({
       customBlockPathsText.value = arrToText(config.waf_rules.custom_block_paths)
       whitelistCIDRsText.value = arrToText(config.ip_whitelist.cidrs)
       firewallWhitelistCIDRsText.value = arrToText(config.firewall_block.whitelist_cidrs)
+      if (!config.sites) config.sites = []
+      config.sites.forEach(s => { s.hosts_text = (s.hosts || []).join(', ') })
     }
 
     function syncToConfig() {
@@ -629,6 +674,7 @@ const app = createApp({
       config.waf_rules.custom_block_paths = textToArr(customBlockPathsText.value)
       config.ip_whitelist.cidrs = textToArr(whitelistCIDRsText.value)
       config.firewall_block.whitelist_cidrs = textToArr(firewallWhitelistCIDRsText.value)
+      if (config.sites) config.sites.forEach(s => { s.hosts = (s.hosts_text || '').split(/[,，\s]+/).map(x => x.trim()).filter(x => x !== '') })
     }
 
     async function loadConfig() {
@@ -638,6 +684,7 @@ const app = createApp({
         // ip_check 后端为可空指针，null 时按缺省 true 处理，避免开关显示为关但实际仍拦截
         if (config.ip_check.block_foreign == null) config.ip_check.block_foreign = true
         if (config.ip_check.block_cloud == null) config.ip_check.block_cloud = true
+        if (config.sites == null) config.sites = []
         syncFromConfig()
         configLoaded.value = true
       } catch (e) {
@@ -675,6 +722,15 @@ const app = createApp({
       await saveConfig()
     }
 
+    function addSite() {
+      if (!config.sites) config.sites = []
+      config.sites.push({ name: '', hosts_text: '', backend: '' })
+    }
+
+    function removeSite(idx) {
+      config.sites.splice(idx, 1)
+    }
+
     async function loadLogs() {
       logsLoading.value = true
       try {
@@ -703,7 +759,7 @@ const app = createApp({
       hotPathsText, ccPathsText, scannerPathsText, scannerUAsText, customScriptUAsText, customBlockPathsText,
       whitelistCIDRsText, firewallWhitelistCIDRsText,
       pageTitle, blockType,
-      navigate, saveConfig, saveRateLimit, saveWAFRules, loadLogs
+      navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, loadLogs
     }
   }
 })

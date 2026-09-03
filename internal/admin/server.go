@@ -54,6 +54,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/stats", s.handleStats)
 	s.mux.HandleFunc("GET /api/logs", s.handleLogs)
 	s.mux.HandleFunc("GET /api/attack_logs", s.handleAttackLogs)
+	s.mux.HandleFunc("POST /api/attack_logs/clear", s.handleAttackLogsClear)
 	s.mux.HandleFunc("GET /api/metrics", s.handleMetrics)
 	s.mux.HandleFunc("POST /api/restart", s.handleRestart)
 	s.mux.HandleFunc("POST /api/alert/test", s.handleAlertTest)
@@ -216,6 +217,13 @@ func (s *Server) handleAttackLogs(w http.ResponseWriter, r *http.Request) {
 	limit := 200
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"logs": attacklog.List(limit),
+	})
+}
+
+func (s *Server) handleAttackLogsClear(w http.ResponseWriter, r *http.Request) {
+	attacklog.Clear()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"message": "攻击日志已清空",
 	})
 }
 

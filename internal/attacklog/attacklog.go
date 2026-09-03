@@ -105,3 +105,15 @@ func writer() {
 		}
 	}
 }
+
+// Clear 清空内存缓冲与 SQLite 中的全部攻击日志
+func Clear() {
+	mu.Lock()
+	events = nil
+	mu.Unlock()
+	if db != nil {
+		if _, err := db.Exec(`DELETE FROM attack_log`); err != nil {
+			log.Printf("[attacklog] 清空失败: %v", err)
+		}
+	}
+}

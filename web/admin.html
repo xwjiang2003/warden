@@ -712,20 +712,31 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
       <template v-if="currentRoute==='attacklogs'">
         <div class="page-card">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-            <h3 style="margin:0;padding:0;border:none">攻击日志（最近 200 条，每 3 秒刷新）</h3>
-            <el-button @click="loadAttackLogs" size="small">🔄 刷新</el-button>
+            <h3 style="margin:0;padding:0;border:none">攻击日志（最近 {{ attackLogs.length }} 条，每 3 秒刷新）</h3>
+            <div>
+              <el-button @click="clearAttackLogs" size="small" type="danger" plain>🗑 清空</el-button>
+              <el-button @click="loadAttackLogs" size="small">🔄 刷新</el-button>
+            </div>
           </div>
           <el-table :data="attackLogs" size="small" border style="width:100%">
-            <el-table-column prop="time" label="时间" width="150" />
-            <el-table-column prop="ip" label="IP" width="130" />
-            <el-table-column prop="host" label="Host" width="140" show-overflow-tooltip />
+            <el-table-column label="时间" width="150">
+              <template #default="{ row }">{{ row.time || '-' }}</template>
+            </el-table-column>
+            <el-table-column label="IP" width="130">
+              <template #default="{ row }">{{ row.ip || '-' }}</template>
+            </el-table-column>
+            <el-table-column label="Host" width="140" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.host || '-' }}</template>
+            </el-table-column>
             <el-table-column label="分类" width="110">
               <template #default="{ row }">
                 <el-tag :type="categoryType(row.category)" size="small">{{ row.category || '未知' }}</el-tag>
               </template>
             </el-table-column>
-            <el-table-column prop="path" label="路径" min-width="200" show-overflow-tooltip />
-            <el-table-column label="详情" min-width="220" show-overflow-tooltip>
+            <el-table-column label="路径" min-width="200" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.path || '-' }}</template>
+            </el-table-column>
+            <el-table-column label="详情" min-width="200" show-overflow-tooltip>
               <template #default="{ row }">{{ fmtDetail(row.detail) }}</template>
             </el-table-column>
           </el-table>
@@ -997,6 +1008,21 @@ const app = createApp({
       } catch (e) { /* 静默失败 */ }
     }
 
+    async function clearAttackLogs() {
+      try {
+        await ElementPlus.ElMessageBox.confirm('确定清空全部攻击日志吗？', '清空确认', {
+          confirmButtonText: '清空', cancelButtonText: '取消', type: 'warning'
+        })
+      } catch (e) { return }
+      try {
+        const { data } = await api.post('/attack_logs/clear')
+        attackLogs.value = []
+        ElementPlus.ElMessage.success(data.message || '已清空')
+      } catch (e) {
+        ElementPlus.ElMessage.error('清空失败: ' + (e.response?.data?.error || e.message))
+      }
+    }
+
     async function loadLogs() {
       logsLoading.value = true
       try {
@@ -1029,7 +1055,7 @@ const app = createApp({
       hotPathsText, ccPathsText, scannerPathsText, scannerUAsText, customScriptUAsText, customBlockPathsText,
       whitelistCIDRsText, firewallWhitelistCIDRsText, blacklistCIDRsText, urlAllowlistText, urlBlocklistText, alertToText, emailTesting,
       pageTitle, blockType,
-      navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, sendTestEmail, loadLogs, loadAttackLogs, attackLogs,
+      navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, sendTestEmail, loadLogs, loadAttackLogs, clearAttackLogs, attackLogs,
       categoryType, fmtDetail
     }
   }

@@ -1,31 +1,30 @@
 @echo off
-chcp 65001 >nul 2>&1
-title 沃盾
+title Warden WAF
 cd /d "%~dp0"
 
 if not exist "warden.exe" (
-  echo [错误] 未找到 warden.exe，请先运行 install.bat 编译
+  echo [Error] warden.exe not found. Run install.bat first.
   goto :end
 )
 if not exist "config.json" (
-  echo [错误] 未找到 config.json
+  echo [Error] config.json not found
   goto :end
 )
 if not exist "rules\coraza.conf" (
-  echo [错误] 未找到 rules\coraza.conf
+  echo [Error] rules\coraza.conf not found
   goto :end
 )
 
-echo 启动 WAF（本窗口需保持打开）...
-echo 配置: %CD%\config.json
-echo 若刚改过 main.go / ratelimit.go 请先运行 install.bat 重新编译
-echo 健康检查: http://127.0.0.1/healthz  （WAF 监听 80，需管理员运行）
-echo 按 Ctrl+C 可停止
+echo Starting WAF (keep this window open)...
+echo Config: %CD%\config.json
+echo If you edited main.go or other source, run install.bat to rebuild first.
+echo Health check: http://127.0.0.1/healthz
+echo Press Ctrl+C to stop
 echo.
 
 warden.exe -config config.json
 echo.
-echo 进程已退出，退出码: %ERRORLEVEL%
+echo Process exited, code: %ERRORLEVEL%
 if exist "logs\startup-error.log" (
   echo.
   echo --- logs\startup-error.log ---

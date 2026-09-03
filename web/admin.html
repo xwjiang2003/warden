@@ -716,12 +716,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
             <el-button @click="loadAttackLogs" size="small">🔄 刷新</el-button>
           </div>
           <el-table :data="attackLogs" size="small" border style="width:100%">
-            <el-table-column prop="time" label="时间" width="160" />
-            <el-table-column prop="ip" label="IP" width="140" />
-            <el-table-column prop="host" label="Host" width="160" />
-            <el-table-column prop="category" label="分类" width="110" />
+            <el-table-column prop="time" label="时间" width="150" />
+            <el-table-column prop="ip" label="IP" width="130" />
+            <el-table-column prop="host" label="Host" width="140" show-overflow-tooltip />
+            <el-table-column label="分类" width="110">
+              <template #default="{ row }">
+                <el-tag :type="categoryType(row.category)" size="small">{{ row.category || '未知' }}</el-tag>
+              </template>
+            </el-table-column>
             <el-table-column prop="path" label="路径" min-width="200" show-overflow-tooltip />
-            <el-table-column prop="detail" label="详情" min-width="160" show-overflow-tooltip />
+            <el-table-column label="详情" min-width="220" show-overflow-tooltip>
+              <template #default="{ row }">{{ fmtDetail(row.detail) }}</template>
+            </el-table-column>
           </el-table>
           <el-empty v-if="attackLogs.length === 0" description="暂无攻击日志" />
         </div>
@@ -955,6 +961,33 @@ const app = createApp({
       } catch (e) {
         ElementPlus.ElMessage.error('发送失败: ' + (e.response?.data?.error || e.message))
       } finally { emailTesting.value = false }
+    }
+
+    function categoryType(c) {
+      const m = { 'IP归属':'danger', 'CC限速':'warning', 'CC行为':'danger', 'CC会话':'danger', 'CC挑战':'info', '频率限制':'warning', 'IP黑名单':'danger', 'WAF规则':'danger', 'URL黑名单':'danger' }
+      return m[c] || 'info'
+    }
+
+    function fmtDetail(d) {
+      const m = {
+        'session_shared_by_many_ips':'会话被多个IP共享',
+        'ip_uses_many_sessions':'IP使用大量会话',
+        'hot_cc_path':'热点路径超限',
+        'site_rpm':'全站每分钟超限',
+        'subnet_rpm':'子网每分钟超限',
+        'bot-like':'行为像脚本',
+        'captcha':'验证码挑战',
+        'blocklisted':'命中黑名单',
+        'trusted session':'可信会话限速',
+        'trusted ip':'可信IP限速',
+        'search bot':'搜索爬虫限速',
+        'untrusted':'未信任IP限速'
+      }
+      if (!d) return '-'
+      if (m[d] !== undefined) return m[d]
+      if (String(d).startsWith('cloud:')) return '云厂商: ' + String(d).slice(6)
+      if (String(d).startsWith('foreign:')) return '国外: ' + String(d).slice(8)
+      return d
     }
 
     async function loadAttackLogs() {

@@ -2,15 +2,32 @@ package router
 
 import (
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"time"
 
 	"warden/internal/accesslog"
 	"warden/internal/config"
 	"warden/internal/util"
 )
+
+// sharedTransport 所有反向代理共享的连接池。
+// 提高 MaxIdleConnsPerHost 让连接被复用而非频繁关闭，避免 Windows 临时端口(TIME_WAIT)耗尽。
+var sharedTransport = &http.Transport{
+	MaxIdleConns:          200,
+	MaxIdleConnsPerHost:   100,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	ResponseHeaderTimeout: 60 * time.Second,
+	DialContext: (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+}
 
 // Router 按 Host 头把请求路由到对应站点的上游代理
 type Router struct {
@@ -63,6 +80,7 @@ func hostOnly(host string) string {
 
 func newReverseProxy(target *url.URL, al *accesslog.Logger) http.Handler {
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = sharedTransport
 	origDirector := proxy.Director
 	proxy.Director = func(r *http.Request) {
 		origDirector(r)

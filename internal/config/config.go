@@ -8,29 +8,30 @@ import (
 
 // Config 顶层配置
 type Config struct {
-	Listen          string                `json:"listen"`
-	Backend         string                `json:"backend"`
-	RulesFile       string                `json:"rules_file"`
-	ReadTimeoutSec  int                   `json:"read_timeout_sec"`
-	WriteTimeoutSec int                   `json:"write_timeout_sec"`
-	IdleTimeoutSec  int                   `json:"idle_timeout_sec"`
-	AccessLog       string                `json:"access_log"`
-	AccessLogRotate AccessLogRotateConfig `json:"access_log_rotate"`
-	BlockRequests   bool                  `json:"block_requests"`
-	RateLimit       RateLimitConfig       `json:"rate_limit"`
-	CCDefense       CCDefenseConfig       `json:"cc_defense"`
-	WAFRules        WAFRulesConfig        `json:"waf_rules"`
-	ConnLimit       ConnLimitConfig       `json:"conn_limit"`
-	FirewallBlock   FirewallBlockConfig   `json:"firewall_block"`
-	IPWhitelist     IPWhitelistConfig     `json:"ip_whitelist"`
-	IPCheck         IPCheckConfig         `json:"ip_check"`
-	Admin           AdminConfig           `json:"admin"`
-	Sites           []SiteConfig          `json:"sites"`
-	Alert           AlertConfig           `json:"alert"`
-	IPBlacklist     IPBlacklistConfig     `json:"ip_blacklist"`
-	URLAllowlist    []string              `json:"url_allowlist"`
-	URLBlocklist    []string              `json:"url_blocklist"`
-	BlockPage       string                `json:"block_page"` // 自定义拦截页面 HTML
+	Listen              string                `json:"listen"`
+	Backend             string                `json:"backend"`
+	RulesFile           string                `json:"rules_file"`
+	ReadTimeoutSec      int                   `json:"read_timeout_sec"`
+	WriteTimeoutSec     int                   `json:"write_timeout_sec"`
+	IdleTimeoutSec      int                   `json:"idle_timeout_sec"`
+	AccessLog           string                `json:"access_log"`
+	AccessLogRotate     AccessLogRotateConfig `json:"access_log_rotate"`
+	AttackLogRetainDays int                   `json:"attack_log_retain_days"` // 攻击日志保留天数，0 用默认值
+	BlockRequests       bool                  `json:"block_requests"`
+	RateLimit           RateLimitConfig       `json:"rate_limit"`
+	CCDefense           CCDefenseConfig       `json:"cc_defense"`
+	WAFRules            WAFRulesConfig        `json:"waf_rules"`
+	ConnLimit           ConnLimitConfig       `json:"conn_limit"`
+	FirewallBlock       FirewallBlockConfig   `json:"firewall_block"`
+	IPWhitelist         IPWhitelistConfig     `json:"ip_whitelist"`
+	IPCheck             IPCheckConfig         `json:"ip_check"`
+	Admin               AdminConfig           `json:"admin"`
+	Sites               []SiteConfig          `json:"sites"`
+	Alert               AlertConfig           `json:"alert"`
+	IPBlacklist         IPBlacklistConfig     `json:"ip_blacklist"`
+	URLAllowlist        []string              `json:"url_allowlist"`
+	URLBlocklist        []string              `json:"url_blocklist"`
+	BlockPage           string                `json:"block_page"` // 自定义拦截页面 HTML
 }
 
 // IPBlacklistConfig IP 黑名单配置
@@ -137,6 +138,7 @@ type CCDefenseConfig struct {
 	GlobalQPSBurst        int    `json:"global_qps_burst"`
 	TrustIPMinVisits      int    `json:"trust_ip_min_visits"`
 	TrustIPWindowSec      int    `json:"trust_ip_window_sec"`
+	TrustIPTTLSec         int    `json:"trust_ip_ttl_sec"`
 	NewIPQPSMax           int    `json:"new_ip_qps_max"`
 	NewIPQPSBurst         int    `json:"new_ip_qps_burst"`
 	NewIPRatioBlock       int    `json:"new_ip_ratio_block"`
@@ -144,6 +146,7 @@ type CCDefenseConfig struct {
 	NewIPCheckMinReqs     int    `json:"new_ip_check_min_reqs"`
 	ChallengeCookieKey    string `json:"challenge_cookie_key"`
 	FirewallOffenderLimit int    `json:"firewall_offender_limit"`
+	OffenderTTLSec        int    `json:"offender_ttl_sec"`
 }
 
 func (c *CCDefenseConfig) Normalize() {
@@ -158,6 +161,9 @@ func (c *CCDefenseConfig) Normalize() {
 	}
 	if c.TrustIPWindowSec <= 0 {
 		c.TrustIPWindowSec = 600
+	}
+	if c.TrustIPTTLSec <= 0 {
+		c.TrustIPTTLSec = 86400
 	}
 	if c.NewIPQPSMax <= 0 {
 		c.NewIPQPSMax = 50
@@ -179,6 +185,9 @@ func (c *CCDefenseConfig) Normalize() {
 	}
 	if c.FirewallOffenderLimit <= 0 {
 		c.FirewallOffenderLimit = 10
+	}
+	if c.OffenderTTLSec <= 0 {
+		c.OffenderTTLSec = 86400
 	}
 }
 
@@ -269,6 +278,9 @@ func ApplyDefaults(cfg *Config) {
 	}
 	if cfg.AccessLog == "" {
 		cfg.AccessLog = "logs/access.log"
+	}
+	if cfg.AttackLogRetainDays <= 0 {
+		cfg.AttackLogRetainDays = 90
 	}
 	cfg.AccessLogRotate.Normalize()
 }

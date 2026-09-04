@@ -37,7 +37,11 @@
     "new_ip_check_sec": 30,
     "new_ip_check_min_reqs": 60,
     "challenge_cookie_key": "",
-    "offender_ttl_sec": 86400
+    "offender_ttl_sec": 86400,
+    "behavior_idle_reset_sec": 600,
+    "flood_sliding_window_sec": 600,
+    "untrusted_ip_qps_max": 30,
+    "untrusted_ip_burst": 40
   },
   "waf_rules": {
     "cc_paths": [

@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"warden/internal/metrics"
 	"log"
 	"math/rand"
 	"net"
@@ -11,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"warden/internal/fwstore"
+	"warden/internal/metrics"
 )
 
 // ---- TCP 连接限流器 (L4 层) ----
@@ -96,14 +97,16 @@ type FirewallBlocker struct {
 	expireAfter time.Duration
 	enabled     bool
 	blockCount  int64
+	store       *fwstore.Store
 }
 
-func NewFirewallBlocker(enabled bool, expireMin int, whitelistCIDRs []string) *FirewallBlocker {
+func NewFirewallBlocker(enabled bool, expireMin int, whitelistCIDRs []string, store *fwstore.Store) *FirewallBlocker {
 	fb := &FirewallBlocker{
 		blockedIPs:  make(map[string]time.Time),
 		whitelistIP: make(map[string]bool),
 		expireAfter: time.Duration(expireMin) * time.Minute,
 		enabled:     enabled && runtime.GOOS == "windows",
+		store:       store,
 	}
 	if fb.enabled && expireMin <= 0 {
 		fb.expireAfter = 30 * time.Minute
@@ -124,6 +127,7 @@ func NewFirewallBlocker(enabled bool, expireMin int, whitelistCIDRs []string) *F
 		fb.whitelist = append(fb.whitelist, netw)
 	}
 	if fb.enabled {
+		fb.restore()
 		log.Printf("[firewall] enabled, auto-expire=%v whitelist=%d ranges", fb.expireAfter, len(fb.whitelist))
 		go fb.reaper()
 	}
@@ -147,6 +151,43 @@ func (fb *FirewallBlocker) isWhitelisted(ip string) bool {
 	return false
 }
 
+// restore 启动时从数据库恢复拉黑列表：
+//   - 仍在有效期内：恢复到内存并补回防火墙规则；
+//   - 已过期：清理孤儿防火墙规则并删除记录，避免重启后无法回收。
+func (fb *FirewallBlocker) restore() {
+	if fb.store == nil {
+		return
+	}
+	blocks := fb.store.LoadAll()
+	if len(blocks) == 0 {
+		return
+	}
+	now := time.Now()
+	restored, cleaned := 0, 0
+	for _, b := range blocks {
+		if fb.isWhitelisted(b.IP) {
+			fb.store.Delete(b.IP)
+			fb.removeRule(b.IP)
+			continue
+		}
+		if now.Sub(b.BlockedAt) > fb.expireAfter {
+			fb.removeRule(b.IP)
+			fb.store.Delete(b.IP)
+			cleaned++
+			continue
+		}
+		fb.blockedIPs[b.IP] = b.BlockedAt
+		fb.blockCount++
+		ruleName := firewallRulePrefix + b.IP
+		addRule("in", ruleName, b.IP)
+		addRule("out", ruleName, b.IP)
+		restored++
+	}
+	if restored > 0 || cleaned > 0 {
+		log.Printf("[firewall] 启动恢复拉黑: restored=%d cleaned_orphan=%d", restored, cleaned)
+	}
+}
+
 func (fb *FirewallBlocker) block(ip, reason string) {
 	if !fb.enabled || ip == "" || ip == "127.0.0.1" || ip == "::1" || fb.isWhitelisted(ip) {
 		return
@@ -160,10 +201,30 @@ func (fb *FirewallBlocker) block(ip, reason string) {
 	// 同时阻断入站和出站
 	addRule("in", ruleName, ip)
 	addRule("out", ruleName, ip)
-	fb.blockedIPs[ip] = time.Now()
+	now := time.Now()
+	fb.blockedIPs[ip] = now
 	fb.blockCount++
 	metrics.FirewallBlocked.Inc()
+	if fb.store != nil {
+		fb.store.Save(ip, reason, now)
+	}
 	log.Printf("[firewall] BLOCKED ip=%s reason=%s total=%d", ip, reason, fb.blockCount)
+}
+
+// unblock 解除一个 IP 的防火墙拉黑（验证码通过时调用）。
+func (fb *FirewallBlocker) unblock(ip string) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	if _, exists := fb.blockedIPs[ip]; !exists {
+		return
+	}
+	delete(fb.blockedIPs, ip)
+	fb.blockCount--
+	fb.removeRule(ip)
+	if fb.store != nil {
+		fb.store.Delete(ip)
+	}
+	log.Printf("[firewall] UNBLOCKED ip=%s (验证码通过)", ip)
 }
 
 func addRule(dir, name, ip string) {
@@ -180,7 +241,11 @@ func addRule(dir, name, ip string) {
 		log.Printf("[firewall] add rule %s: %v", name, err)
 		return
 	}
-	go func() { cmd.Wait() }()
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			log.Printf("[firewall] 添加规则失败 name=%s dir=%s: %v", name, dir, err)
+		}
+	}()
 }
 
 func (fb *FirewallBlocker) removeRule(ip string) {
@@ -191,8 +256,9 @@ func (fb *FirewallBlocker) removeRule(ip string) {
 	for _, dir := range []string{"in", "out"} {
 		cmd := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule",
 			"name="+ruleName, "dir="+dir)
-		if err := cmd.Start(); err == nil {
-			go cmd.Wait()
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			log.Printf("[firewall] 删除规则失败 name=%s dir=%s: %v (输出: %s)", ruleName, dir, err, strings.TrimSpace(string(out)))
 		}
 	}
 }
@@ -212,6 +278,9 @@ func (fb *FirewallBlocker) reaper() {
 		for _, ip := range expired {
 			delete(fb.blockedIPs, ip)
 			fb.removeRule(ip)
+			if fb.store != nil {
+				fb.store.Delete(ip)
+			}
 		}
 		n := len(expired)
 		fb.mu.Unlock()

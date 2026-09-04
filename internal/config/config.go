@@ -132,6 +132,21 @@ type RateLimitConfig struct {
 	HotPathPatterns  []string `json:"hot_path_patterns"`
 }
 
+func (c *RateLimitConfig) Normalize() {
+	if c.HotPathMax <= 0 {
+		c.HotPathMax = 60
+	}
+	if c.HotPathWindowSec <= 0 {
+		c.HotPathWindowSec = 60
+	}
+	if c.SiteMaxPerMin <= 0 {
+		c.SiteMaxPerMin = 300
+	}
+	if c.SubnetMaxPerMin <= 0 {
+		c.SubnetMaxPerMin = 500
+	}
+}
+
 type CCDefenseConfig struct {
 	Enabled               bool   `json:"enabled"`
 	GlobalQPSMax          int    `json:"global_qps_max"`
@@ -281,7 +296,7 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// ApplyDefaults 应用缺失字段的默认值
+// ApplyDefaults 应用缺失字段的默认值（覆盖所有顶层字段与各子模块）。
 func ApplyDefaults(cfg *Config) {
 	if cfg.Listen == "" {
 		cfg.Listen = ":80"
@@ -299,6 +314,13 @@ func ApplyDefaults(cfg *Config) {
 		cfg.AttackLogRetainDays = 90
 	}
 	cfg.AccessLogRotate.Normalize()
+	cfg.RateLimit.Normalize()
+	cfg.CCDefense.Normalize()
+	cfg.WAFRules.Normalize()
+	cfg.ConnLimit.Normalize()
+	cfg.FirewallBlock.Normalize()
+	cfg.Alert.Normalize()
+	cfg.Admin.Normalize()
 }
 
 // Save 将配置序列化为格式化 JSON 并写入文件

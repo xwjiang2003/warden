@@ -153,38 +153,69 @@ func (fb *FirewallBlocker) isWhitelisted(ip string) bool {
 
 // restore 启动时从数据库恢复拉黑列表：
 //   - 仍在有效期内：恢复到内存并补回防火墙规则；
-//   - 已过期：清理孤儿防火墙规则并删除记录，避免重启后无法回收。
+//   - 已过期：清理孤儿防火墙规则并删除记录；
+//   - 并清理防火墙中不属于当前拉黑列表的孤儿 warden-block-* 规则（旧版本遗留）。
 func (fb *FirewallBlocker) restore() {
-	if fb.store == nil {
+	if fb.store != nil {
+		blocks := fb.store.LoadAll()
+		now := time.Now()
+		restored, cleaned := 0, 0
+		for _, b := range blocks {
+			if fb.isWhitelisted(b.IP) {
+				fb.store.Delete(b.IP)
+				fb.removeRule(b.IP)
+				continue
+			}
+			if now.Sub(b.BlockedAt) > fb.expireAfter {
+				fb.removeRule(b.IP)
+				fb.store.Delete(b.IP)
+				cleaned++
+				continue
+			}
+			fb.blockedIPs[b.IP] = b.BlockedAt
+			fb.blockCount++
+			ruleName := firewallRulePrefix + b.IP
+			addRule("in", ruleName, b.IP)
+			addRule("out", ruleName, b.IP)
+			restored++
+		}
+		if restored > 0 || cleaned > 0 {
+			log.Printf("[firewall] 启动恢复拉黑: restored=%d cleaned=%d", restored, cleaned)
+		}
+	}
+	fb.cleanOrphans()
+}
+
+// cleanOrphans 清理 Windows 防火墙中不属于当前拉黑列表的 warden-block-* 规则。
+// 这些规则来自旧版本（无持久化）遗留、或进程崩溃前未及删除。
+func (fb *FirewallBlocker) cleanOrphans() {
+	if runtime.GOOS != "windows" {
 		return
 	}
-	blocks := fb.store.LoadAll()
-	if len(blocks) == 0 {
+	out, err := exec.Command("netsh", "advfirewall", "firewall", "show", "rule", "name=all").Output()
+	if err != nil {
+		log.Printf("[firewall] 查询防火墙规则失败: %v", err)
 		return
 	}
-	now := time.Now()
-	restored, cleaned := 0, 0
-	for _, b := range blocks {
-		if fb.isWhitelisted(b.IP) {
-			fb.store.Delete(b.IP)
-			fb.removeRule(b.IP)
+	seen := map[string]bool{}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "Rule Name:") {
 			continue
 		}
-		if now.Sub(b.BlockedAt) > fb.expireAfter {
-			fb.removeRule(b.IP)
-			fb.store.Delete(b.IP)
-			cleaned++
+		name := strings.TrimSpace(strings.TrimPrefix(line, "Rule Name:"))
+		if !strings.HasPrefix(name, firewallRulePrefix) {
 			continue
 		}
-		fb.blockedIPs[b.IP] = b.BlockedAt
-		fb.blockCount++
-		ruleName := firewallRulePrefix + b.IP
-		addRule("in", ruleName, b.IP)
-		addRule("out", ruleName, b.IP)
-		restored++
-	}
-	if restored > 0 || cleaned > 0 {
-		log.Printf("[firewall] 启动恢复拉黑: restored=%d cleaned_orphan=%d", restored, cleaned)
+		ip := strings.TrimPrefix(name, firewallRulePrefix)
+		if seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		if _, exists := fb.blockedIPs[ip]; !exists {
+			fb.removeRule(ip)
+			log.Printf("[firewall] 清理孤儿规则 name=%s", name)
+		}
 	}
 }
 

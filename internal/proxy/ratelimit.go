@@ -7,9 +7,9 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"warden/internal/config"
 	"warden/internal/attacklog"
 	"warden/internal/blockpage"
+	"warden/internal/config"
 	"warden/internal/metrics"
 	"warden/internal/util"
 )
@@ -52,15 +52,7 @@ type ipCounters struct {
 }
 
 func NewIPRateLimiter(cfg config.RateLimitConfig, blockRequests bool, onBlock func(ip string)) *IPRateLimiter {
-	if cfg.HotPathMax <= 0 {
-		cfg.HotPathMax = 60
-	}
-	if cfg.HotPathWindowSec <= 0 {
-		cfg.HotPathWindowSec = 60
-	}
-	if cfg.SiteMaxPerMin <= 0 {
-		cfg.SiteMaxPerMin = 300
-	}
+	cfg.Normalize()
 
 	var compiled []*regexp.Regexp
 	for _, p := range cfg.HotPathPatterns {
@@ -68,10 +60,6 @@ func NewIPRateLimiter(cfg config.RateLimitConfig, blockRequests bool, onBlock fu
 			continue
 		}
 		compiled = append(compiled, regexp.MustCompile(p))
-	}
-
-	if cfg.SubnetMaxPerMin <= 0 {
-		cfg.SubnetMaxPerMin = 500 // 默认每 /24 子网 500次/分钟
 	}
 
 	return &IPRateLimiter{

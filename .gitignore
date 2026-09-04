@@ -14,6 +14,7 @@ dist/
 # === Go ===
 *.out
 vendor/
+!web/vendor/
 
 # === Logs ===
 logs/

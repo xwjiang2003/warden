@@ -10,6 +10,7 @@
     "mode": "daily",
     "max_size_mb": 100
   },
+  "attack_log_retain_days": 90,
   "block_requests": true,
   "rate_limit": {
     "enabled": true,
@@ -29,12 +30,14 @@
     "global_qps_burst": 200,
     "trust_ip_min_visits": 5,
     "trust_ip_window_sec": 600,
+    "trust_ip_ttl_sec": 86400,
     "new_ip_qps_max": 50,
     "new_ip_qps_burst": 20,
     "new_ip_ratio_block": 80,
     "new_ip_check_sec": 30,
     "new_ip_check_min_reqs": 60,
-    "challenge_cookie_key": ""
+    "challenge_cookie_key": "",
+    "offender_ttl_sec": 86400
   },
   "waf_rules": {
     "cc_paths": [

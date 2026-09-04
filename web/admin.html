@@ -187,6 +187,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
                 </el-form-item>
               </el-col>
             </el-row>
+            <el-form-item label="攻击日志保留(天)">
+              <el-input-number v-model="config.attack_log_retain_days" :min="1" :max="3650" >
+</el-input-number>
+              <div class="field-help">攻击日志在数据库中的保留天数，超期自动清理，默认 90 天</div>
+            </el-form-item>
           </el-form>
         </div>
         <div class="page-card">
@@ -351,6 +356,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
                   <div class="field-help">判定 IP 是否可信的统计窗口</div>
                 </el-form-item>
               </el-col>
+              <el-col :span="8">
+                <el-form-item label="可信 IP 有效期(秒)">
+                  <el-input-number v-model="config.cc_defense.trust_ip_ttl_sec" :min="60" :max="2592000" >
+</el-input-number>
+                  <div class="field-help">可信 IP 状态有效期，过期后回到未信任通道，遇泛洪/限速需重新验证</div>
+                </el-form-item>
+              </el-col>
             </el-row>
             <el-row :gutter="20">
               <el-col :span="8">
@@ -381,6 +393,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
                   <el-input-number v-model="config.cc_defense.firewall_offender_limit" :min="1" :max="1000" >
 </el-input-number>
                   <div class="field-help">单 IP 被判定违规达到该次数后加入防火墙拉黑（仅 Windows）</div>
+                </el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="违规记录有效期(秒)">
+                  <el-input-number v-model="config.cc_defense.offender_ttl_sec" :min="60" :max="2592000" >
+</el-input-number>
+                  <div class="field-help">违规 IP 计数在内存中的保留时长，超时未活动即清除；默认 86400（24 小时）</div>
                 </el-form-item>
               </el-col>
               <el-col :span="8">
@@ -779,9 +798,10 @@ function defaultConfig() {
     read_timeout_sec: 60, write_timeout_sec: 60, idle_timeout_sec: 120,
     access_log: 'logs/access.log',
     access_log_rotate: { mode: 'daily', max_size_mb: 100 },
+    attack_log_retain_days: 90,
     block_requests: true,
     rate_limit: { enabled: true, hot_path_max: 30, hot_path_window_sec: 30, site_max_per_min: 300, subnet_max_per_min: 500, hot_path_patterns: [] },
-    cc_defense: { enabled: true, global_qps_max: 800, global_qps_burst: 200, trust_ip_min_visits: 5, trust_ip_window_sec: 600, new_ip_qps_max: 50, new_ip_qps_burst: 20, new_ip_ratio_block: 80, new_ip_check_sec: 30, new_ip_check_min_reqs: 60, challenge_cookie_key: '', firewall_offender_limit: 10 },
+    cc_defense: { enabled: true, global_qps_max: 800, global_qps_burst: 200, trust_ip_min_visits: 5, trust_ip_window_sec: 600, trust_ip_ttl_sec: 86400, new_ip_qps_max: 50, new_ip_qps_burst: 20, new_ip_ratio_block: 80, new_ip_check_sec: 30, new_ip_check_min_reqs: 60, challenge_cookie_key: '', firewall_offender_limit: 10, offender_ttl_sec: 86400 },
     waf_rules: { cc_paths: [], cc_no_referer_block: true, scanner_paths: [], scanner_uas: [], block_script_ua: true, custom_script_uas: [], custom_block_paths: [], custom_block_status: 403 },
     conn_limit: { max_conns_per_sec: 500, burst: 100 },
     firewall_block: { enabled: true, expire_min: 30, auto_block: true, whitelist_cidrs: [] },

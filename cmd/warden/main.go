@@ -53,7 +53,7 @@ func main() {
 	if err != nil {
 		fatalStartup(exeDir, "config: %v", err)
 	}
-	attacklog.Init(dbPath)
+	attacklog.Init(dbPath, cfg.AttackLogRetainDays)
 	blockpage.Set(cfg.BlockPage)
 
 	adminSrv := admin.NewServer(cfg, cfgPath, dbPath, cfg.Admin)

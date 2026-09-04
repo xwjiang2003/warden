@@ -296,7 +296,7 @@ func TestFloodDoesNotPromoteTrust(t *testing.T) {
 	h.flood.recentOld = 100
 	h.flood.mu.Unlock()
 	// 清空行为检测状态，避免泛洪期均匀间隔触发 bot-like 干扰后续断言
-	h.behavior = newIPBehaviorTracker()
+	h.behavior = newIPBehaviorTracker(600)
 
 	// 泛洪结束后仍需重新累计 minVisits 次才晋升
 	if rec := do("/d"); rec.Body.String() != "OK" {
@@ -326,7 +326,7 @@ func TestTrustedIPTTL(t *testing.T) {
 	}
 
 	// 模拟过期：把存储时间回拨到 2 天前
-	tr.trustedMap.Store("1.2.3.4", time.Now().Add(-2*24*time.Hour))
+	tr.trustedMap.Store("1.2.3.4", trustEntry{since: time.Now().Add(-2 * 24 * time.Hour), reason: "captcha"})
 	if tr.isTrusted("1.2.3.4") {
 		t.Fatalf("过期后不应可信")
 	}
@@ -361,7 +361,7 @@ func TestTrustedIPSweepExpired(t *testing.T) {
 	tr.setTrusted("5.6.7.8")
 
 	// 让第一个过期，第二个保持有效
-	tr.trustedMap.Store("1.2.3.4", time.Now().Add(-2*24*time.Hour))
+	tr.trustedMap.Store("1.2.3.4", trustEntry{since: time.Now().Add(-2 * 24 * time.Hour), reason: "captcha"})
 
 	if n := tr.sweepExpired(); n != 1 {
 		t.Fatalf("应清理 1 条过期记录, 实际 %d", n)
@@ -371,5 +371,171 @@ func TestTrustedIPSweepExpired(t *testing.T) {
 	}
 	if !tr.isTrusted("5.6.7.8") {
 		t.Fatalf("未过期 IP 应保留")
+	}
+}
+
+// TestBehaviorIdleDecay 验证：IP 空闲超过阈值后，行为检测状态被清空，
+// "路径单一"等累计判定不再永久记住，恢复正常访问。
+func TestBehaviorIdleDecay(t *testing.T) {
+	bt := newIPBehaviorTracker(1) // idleReset = 1 秒
+
+	// 直接构造"累计 >10 次、单一路径"的状态
+	bt.mu.Lock()
+	bt.paths["1.2.3.4"] = map[string]int{"/": 11}
+	bt.lastSeen["1.2.3.4"] = time.Now()
+	bt.mu.Unlock()
+
+	// 未空闲：应判定为脚本
+	if !bt.isBotLike("1.2.3.4", "/") {
+		t.Fatalf("单一路径应判定为脚本")
+	}
+
+	// 空闲超过 1 秒：状态应被清空，下次访问不再判定为脚本
+	bt.mu.Lock()
+	bt.lastSeen["1.2.3.4"] = time.Now().Add(-2 * time.Second)
+	bt.mu.Unlock()
+
+	if bt.isBotLike("1.2.3.4", "/") {
+		t.Fatalf("空闲衰减后不应判定为脚本")
+	}
+}
+
+// TestTrustedIPStillBehaviorChecked 验证：可信 IP 仍过行为检测，
+// 行为像脚本时照样被拦截（堵住"毕业即免检"）。
+func TestTrustedIPStillBehaviorChecked(t *testing.T) {
+	f := false
+	cfg := config.CCDefenseConfig{
+		Enabled:        true,
+		GlobalQPSMax:   1000,
+		GlobalQPSBurst: 1000,
+		NewIPQPSMax:    1000,
+		NewIPQPSBurst:  1000,
+	}
+	cfg.Normalize()
+
+	var hits int32
+	h := NewCCDefense(cfg, config.IPCheckConfig{BlockForeign: &f, BlockCloud: &f}, nil,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&hits, 1)
+			w.Write([]byte("OK"))
+		}))
+
+	const ip = "203.0.113.88"
+	h.trust.setTrusted(ip) // 直接设为可信 IP
+
+	// 预置"累计 >10 次、单一路径"的行为状态
+	h.behavior.mu.Lock()
+	h.behavior.paths[ip] = map[string]int{"/pub/newsList/110": 11}
+	h.behavior.lastSeen[ip] = time.Now()
+	h.behavior.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "http://www.zzfls.com.cn/pub/newsList/110", nil)
+	req.RemoteAddr = ip + ":12345"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusOK && rec.Body.String() == "OK" {
+		t.Fatalf("可信 IP 行为像脚本时仍应被拦截")
+	}
+	if atomic.LoadInt32(&hits) != 0 {
+		t.Fatalf("被行为检测拦截的可信 IP 请求不应转发后端, hits=%d", hits)
+	}
+}
+
+// TestFloodSeenSlidingWindow 验证：seen 有滑动窗口时效，
+// 超过 seenTTL 未出现的 IP 会被重新视为"新 IP"。
+func TestFloodSeenSlidingWindow(t *testing.T) {
+	d := newNewIPFloodDetector(30, 50, 2, 1) // checkSec=30s, ratio=50%, minReqs=2, seenTTL=1s
+
+	// 第 1 次出现 → 新
+	d.isFlooding("1.1.1.1")
+	// 立即再来 → 老（仍在 seenTTL 内）
+	d.isFlooding("1.1.1.1")
+	// 让 seen 过期（回拨到 2 秒前）
+	d.mu.Lock()
+	d.seen["1.1.1.1"] = time.Now().Add(-2 * time.Second).UnixNano()
+	d.mu.Unlock()
+	// 再来 → 应重新视为新
+	d.isFlooding("1.1.1.1")
+
+	d.mu.Lock()
+	newCnt := atomic.LoadInt64(&d.recentNew)
+	oldCnt := atomic.LoadInt64(&d.recentOld)
+	d.mu.Unlock()
+	if newCnt != 2 || oldCnt != 1 {
+		t.Fatalf("期望 new=2 old=1, 实际 new=%d old=%d", newCnt, oldCnt)
+	}
+}
+
+// TestTrustEntryReason 验证：可信 IP 记录进入途径（验证码 / 次数晋升）。
+func TestTrustEntryReason(t *testing.T) {
+	tr := newIPTrustTracker(600, 2, 86400)
+
+	tr.setTrusted("1.2.3.4")       // 验证码进入
+	if tr.recordVisit("5.6.7.8") { // 第 1 次
+		t.Fatalf("第 1 次访问不应晋升")
+	}
+	if !tr.recordVisit("5.6.7.8") { // 第 2 次 → 次数进入
+		t.Fatalf("第 2 次访问应晋升")
+	}
+
+	reasons := map[string]string{}
+	for _, e := range tr.listTrusted() {
+		reasons[e.IP] = e.Reason
+	}
+	if reasons["1.2.3.4"] != "captcha" {
+		t.Fatalf("1.2.3.4 应标记为 captcha, 实际 %q", reasons["1.2.3.4"])
+	}
+	if reasons["5.6.7.8"] != "visit-count" {
+		t.Fatalf("5.6.7.8 应标记为 visit-count, 实际 %q", reasons["5.6.7.8"])
+	}
+}
+
+// TestUntrustedPerIPRateLimit 验证：单个未信任 IP 超过每 IP 限速后弹验证码挑战。
+func TestUntrustedPerIPRateLimit(t *testing.T) {
+	f := false
+	cfg := config.CCDefenseConfig{
+		Enabled:           true,
+		GlobalQPSMax:      1000,
+		GlobalQPSBurst:    1000,
+		NewIPQPSMax:       1000,
+		NewIPQPSBurst:     1000,
+		UntrustedIPQPSMax: 1, // 每 IP 1 QPS
+		UntrustedIPBurst:  1,
+		TrustIPMinVisits:  5,
+		TrustIPWindowSec:  600,
+		NewIPCheckMinReqs: 1 << 30, // 关闭泛洪
+	}
+	cfg.Normalize()
+
+	var hits int32
+	h := NewCCDefense(cfg, config.IPCheckConfig{BlockForeign: &f, BlockCloud: &f}, nil,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&hits, 1)
+			w.Write([]byte("OK"))
+		}))
+
+	do := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "http://www.zzfls.com.cn/pub/newsList/110", nil)
+		req.RemoteAddr = "203.0.113.66:12345"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 第一次：桶有令牌 → 放行
+	if rec := do(); rec.Body.String() != "OK" {
+		t.Fatalf("第一次应放行, body=%q", truncate(rec.Body.String(), 200))
+	}
+	// 第二次：令牌耗尽 → 验证码挑战
+	rec := do()
+	if rec.Code == http.StatusOK && rec.Body.String() == "OK" {
+		t.Fatalf("超每 IP 限速后应弹验证码挑战，而非放行")
+	}
+	if !strings.Contains(rec.Body.String(), "安全验证") {
+		t.Fatalf("应返回验证码挑战页, body 前 200=%q", truncate(rec.Body.String(), 200))
+	}
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("第二次请求不应转发后端, hits=%d", hits)
 	}
 }

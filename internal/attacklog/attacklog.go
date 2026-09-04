@@ -49,6 +49,13 @@ func Init(dbPath string, days int) {
 		return
 	}
 	d.SetMaxOpenConns(1)
+	// 与配置表共用同一 DB 文件，设置 busy_timeout 避免并发写触发 SQLITE_BUSY
+	if _, err := d.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		log.Printf("[attacklog] 设置 busy_timeout 失败: %v", err)
+	}
+	if _, err := d.Exec(`PRAGMA journal_mode = WAL`); err != nil {
+		log.Printf("[attacklog] 设置 WAL 失败: %v", err)
+	}
 	if _, err := d.Exec(`CREATE TABLE IF NOT EXISTS attack_log (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		time TEXT NOT NULL,

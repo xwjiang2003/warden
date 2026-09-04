@@ -20,6 +20,7 @@ import (
 	"warden/internal/alert"
 	"warden/internal/attacklog"
 	"warden/internal/blockpage"
+	"warden/internal/fwstore"
 	"warden/internal/metrics"
 	"warden/internal/proxy"
 	"warden/internal/router"
@@ -92,7 +93,14 @@ func main() {
 	})
 	cfg.ConnLimit.Normalize()
 	cfg.FirewallBlock.Normalize()
-	fwBlocker := proxy.NewFirewallBlocker(cfg.FirewallBlock.Enabled && cfg.FirewallBlock.AutoBlock, cfg.FirewallBlock.ExpireMin, cfg.FirewallBlock.WhitelistCIDRs)
+	fwStore, fwErr := fwstore.Open(dbPath)
+	if fwErr != nil {
+		log.Printf("[firewall] 打开拉黑持久化失败(%v)，拉黑将不持久化", fwErr)
+	}
+	if fwStore != nil {
+		defer fwStore.Close()
+	}
+	fwBlocker := proxy.NewFirewallBlocker(cfg.FirewallBlock.Enabled && cfg.FirewallBlock.AutoBlock, cfg.FirewallBlock.ExpireMin, cfg.FirewallBlock.WhitelistCIDRs, fwStore)
 
 	inner := realIPMiddleware(txhttp.WrapHandler(wafEngine, siteRouter))
 	var ccDef *proxy.CCDefenseHandler
@@ -103,6 +111,7 @@ func main() {
 	})
 	handler := rl.Middleware(inner)
 	ccDef = proxy.NewCCDefense(cfg.CCDefense, cfg.IPCheck, fwBlocker, handler)
+	adminSrv.SetTrustedIPsProvider(ccDef.TrustedIPs)
 	whitelist := proxy.NewIPWhitelist(cfg.IPWhitelist.CIDRs)
 	blocklist := proxy.NewIPWhitelist(cfg.IPBlacklist.CIDRs)
 	mux.Handle("/", proxy.BlocklistMiddleware(blocklist, cfg.IPBlacklist.Enabled,

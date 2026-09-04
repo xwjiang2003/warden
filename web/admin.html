@@ -76,6 +76,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
           <div class="stats-row" style="margin-bottom:0">
             <div class="stat-item"><span class="label">WAF 规则拦截</span><span class="value">{{ metrics.waf_blocked }}</span></div>
             <div class="stat-item"><span class="label">CC 防御拦截</span><span class="value">{{ metrics.cc_blocked }}</span></div>
+            <div class="stat-item"><span class="label">验证码挑战</span><span class="value">{{ metrics.cc_challenged }}</span></div>
             <div class="stat-item"><span class="label">频率限制(429)</span><span class="value">{{ metrics.rate_limit_blocked }}</span></div>
             <div class="stat-item"><span class="label">IP 归属拦截</span><span class="value">{{ metrics.ip_check_blocked }}</span></div>
           </div>
@@ -84,6 +85,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
             <div class="stat-item"><span class="label">连接限制丢弃</span><span class="value">{{ metrics.conn_limit_dropped }}</span></div>
             <div class="stat-item"><span class="label">白名单放行</span><span class="value green">{{ metrics.whitelist_pass }}</span></div>
             <div class="stat-item"><span class="label">监控模式</span><span class="value" :class="config.block_requests?'orange':'green'">{{ config.block_requests ? '拦截' : '仅记录' }}</span></div>
+          </div>
+          <div class="stats-row" style="margin-bottom:0">
+            <div class="stat-item"><span class="label">验证码通过</span><span class="value green">{{ metrics.captcha_passed }}</span></div>
+            <div class="stat-item"><span class="label">验证码失败</span><span class="value orange">{{ metrics.captcha_failed }}</span></div>
+            <div class="stat-item"><span class="label">挑战通过率</span><span class="value blue">{{ captchaSuccessRate }}%</span></div>
+            <div class="stat-item"><span class="label">可信 IP 数</span><span class="value blue">{{ trustedIPs.length }}</span></div>
           </div>
         </div>
         <div class="stats-row">
@@ -98,6 +105,20 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
           <div class="stat-item"><span class="label">系统总内存</span><span class="value">{{ stats.system_total_mb >= 1024 ? (stats.system_total_mb / 1024).toFixed(1) + ' GB' : stats.system_total_mb + ' MB' }}</span></div>
           <div class="stat-item"><span class="label">CPU 核心</span><span class="value">{{ stats.num_cpu }}</span></div>
           <div class="stat-item"><span class="label">Go 版本</span><span class="value" style="font-size:16px">{{ stats.go_version }}</span></div>
+        </div>
+        <div class="page-card">
+          <h3>可信 IP 列表 <span style="font-weight:400;color:#909399;font-size:12px">（通过验证码或次数晋升进入可信通道，TTL 内有效）</span>
+            <el-button size="small" type="primary" style="float:right" @click="loadTrustedIPs" :loading="trustedIPsLoading">刷新</el-button>
+          </h3>
+          <el-table :data="trustedIPs" size="small" style="margin-top:8px" max-height="400">
+            <el-table-column prop="ip" label="IP" width="180"></el-table-column>
+            <el-table-column label="进入途径" width="140">
+              <template #default="{ row }">{{ row.reason === 'captcha' ? '验证码通过' : (row.reason === 'visit-count' ? '次数晋升' : row.reason) }}</template>
+            </el-table-column>
+            <el-table-column label="信任时间">
+              <template #default="{ row }">{{ fmtTime(row.since) }}</template>
+            </el-table-column>
+          </el-table>
         </div>
         <div class="page-card">
           <h3>代理信息</h3>
@@ -327,17 +348,33 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
             </el-row>
             <el-row :gutter="20">
               <el-col :span="8">
-                <el-form-item label="新 IP QPS 上限">
+                <el-form-item label="未信任共享桶 QPS">
                   <el-input-number v-model="config.cc_defense.new_ip_qps_max" :min="1" :max="10000" >
 </el-input-number>
-                  <div class="field-help">未信任 IP 的每秒请求上限</div>
+                  <div class="field-help">全站未信任 IP 共享的每秒请求上限（溢出→挑战）</div>
                 </el-form-item>
               </el-col>
               <el-col :span="8">
-                <el-form-item label="新 IP 突发容量">
+                <el-form-item label="未信任共享桶突发">
                   <el-input-number v-model="config.cc_defense.new_ip_qps_burst" :min="1" :max="10000" >
 </el-input-number>
-                  <div class="field-help">未信任 IP 令牌桶突发容量</div>
+                  <div class="field-help">未信任共享令牌桶突发容量</div>
+                </el-form-item>
+              </el-col>
+            </el-row>
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <el-form-item label="未信任单IP QPS">
+                  <el-input-number v-model="config.cc_defense.untrusted_ip_qps_max" :min="1" :max="10000" >
+</el-input-number>
+                  <div class="field-help">单个未信任 IP 每秒请求上限，超过→验证码挑战</div>
+                </el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="未信任单IP 突发">
+                  <el-input-number v-model="config.cc_defense.untrusted_ip_burst" :min="1" :max="10000" >
+</el-input-number>
+                  <div class="field-help">单个未信任 IP 令牌桶突发容量</div>
                 </el-form-item>
               </el-col>
             </el-row>
@@ -389,6 +426,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
             </el-row>
             <el-row :gutter="20">
               <el-col :span="8">
+                <el-form-item label="新IP滑动窗口(秒)">
+                  <el-input-number v-model="config.cc_defense.flood_sliding_window_sec" :min="30" :max="86400" >
+</el-input-number>
+                  <div class="field-help">IP 在该时长内未出现即视为"新 IP"参与泛洪占比判定；默认 600（10 分钟）</div>
+                </el-form-item>
+              </el-col>
+            </el-row>
+            <el-row :gutter="20">
+              <el-col :span="8">
                 <el-form-item label="防火墙触发次数">
                   <el-input-number v-model="config.cc_defense.firewall_offender_limit" :min="1" :max="1000" >
 </el-input-number>
@@ -400,6 +446,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
                   <el-input-number v-model="config.cc_defense.offender_ttl_sec" :min="60" :max="2592000" >
 </el-input-number>
                   <div class="field-help">违规 IP 计数在内存中的保留时长，超时未活动即清除；默认 86400（24 小时）</div>
+                </el-form-item>
+              </el-col>
+              <el-col :span="8">
+                <el-form-item label="行为状态空闲重置(秒)">
+                  <el-input-number v-model="config.cc_defense.behavior_idle_reset_sec" :min="60" :max="86400" >
+</el-input-number>
+                  <div class="field-help">IP 空闲超过该时长即清空其行为检测状态（间隔/路径计数）；默认 600（10 分钟）</div>
                 </el-form-item>
               </el-col>
               <el-col :span="8">
@@ -801,7 +854,7 @@ function defaultConfig() {
     attack_log_retain_days: 90,
     block_requests: true,
     rate_limit: { enabled: true, hot_path_max: 30, hot_path_window_sec: 30, site_max_per_min: 300, subnet_max_per_min: 500, hot_path_patterns: [] },
-    cc_defense: { enabled: true, global_qps_max: 800, global_qps_burst: 200, trust_ip_min_visits: 5, trust_ip_window_sec: 600, trust_ip_ttl_sec: 86400, new_ip_qps_max: 50, new_ip_qps_burst: 20, new_ip_ratio_block: 80, new_ip_check_sec: 30, new_ip_check_min_reqs: 60, challenge_cookie_key: '', firewall_offender_limit: 10, offender_ttl_sec: 86400 },
+    cc_defense: { enabled: true, global_qps_max: 800, global_qps_burst: 200, trust_ip_min_visits: 5, trust_ip_window_sec: 600, trust_ip_ttl_sec: 86400, new_ip_qps_max: 50, new_ip_qps_burst: 20, new_ip_ratio_block: 80, new_ip_check_sec: 30, new_ip_check_min_reqs: 60, challenge_cookie_key: '', firewall_offender_limit: 10, offender_ttl_sec: 86400, behavior_idle_reset_sec: 600, flood_sliding_window_sec: 600, untrusted_ip_qps_max: 30, untrusted_ip_burst: 40 },
     waf_rules: { cc_paths: [], cc_no_referer_block: true, scanner_paths: [], scanner_uas: [], block_script_ua: true, custom_script_uas: [], custom_block_paths: [], custom_block_status: 403 },
     conn_limit: { max_conns_per_sec: 500, burst: 100 },
     firewall_block: { enabled: true, expire_min: 30, auto_block: true, whitelist_cidrs: [] },
@@ -821,9 +874,12 @@ const app = createApp({
   setup() {
     const config = reactive(defaultConfig())
     const stats = reactive({ uptime: '-', start_time: '-', go_version: '-', num_goroutine: 0, num_cpu: 0, memory_mb: 0, memory_sys_mb: 0, system_total_mb: 0, proxy_listen: '-', proxy_backend: '-', cc_defense_enabled: false, rate_limit_enabled: false, block_requests: false })
-    const metrics = reactive({ total_requests: 0, total_blocked: 0, waf_blocked: 0, cc_blocked: 0, rate_limit_blocked: 0, conn_limit_dropped: 0, ip_check_blocked: 0, firewall_blocked: 0, whitelist_pass: 0 })
+    const metrics = reactive({ total_requests: 0, total_blocked: 0, waf_blocked: 0, cc_blocked: 0, cc_challenged: 0, captcha_passed: 0, captcha_failed: 0, rate_limit_blocked: 0, conn_limit_dropped: 0, ip_check_blocked: 0, firewall_blocked: 0, whitelist_pass: 0 })
     const qps = ref(0)
     const blockRate = ref('0.00')
+    const captchaSuccessRate = ref('0.00')
+    const trustedIPs = ref([])
+    const trustedIPsLoading = ref(false)
     let prevReq = 0
     let prevTs = 0
     const currentRoute = ref('dashboard')
@@ -932,7 +988,24 @@ const app = createApp({
         prevTs = now
         Object.assign(metrics, data)
         blockRate.value = data.total_requests > 0 ? (data.total_blocked / data.total_requests * 100).toFixed(2) : '0.00'
+        // 挑战通过率 = 通过次数 ÷ 挑战次数（而非 通过/(通过+失败)，因为大多数挑战无人提交）
+        captchaSuccessRate.value = (data.cc_challenged || 0) > 0 ? ((data.captcha_passed || 0) / data.cc_challenged * 100).toFixed(2) : '0.00'
       } catch (e) { /* 静默失败 */ }
+    }
+
+    async function loadTrustedIPs() {
+      trustedIPsLoading.value = true
+      try {
+        const { data } = await api.get('/trusted_ips')
+        trustedIPs.value = data.ips || []
+      } catch (e) { /* 静默失败 */ }
+      trustedIPsLoading.value = false
+    }
+
+    function fmtTime(s) {
+      if (!s) return '-'
+      const d = new Date(s)
+      return isNaN(d.getTime()) ? s : d.toLocaleString()
     }
 
     async function saveConfig() {
@@ -1065,18 +1138,20 @@ const app = createApp({
       loadConfig()
       loadStats()
       loadMetrics()
+      loadTrustedIPs()
       setInterval(loadStats, 30000) // 每 30s 刷新统计
       setInterval(loadMetrics, 2000) // 每 2s 刷新拦截指标
       setInterval(loadAttackLogs, 3000) // 每 3s 刷新攻击日志
+      setInterval(loadTrustedIPs, 5000) // 每 5s 刷新可信 IP 列表
     })
 
     return {
-      config, stats, metrics, qps, blockRate, currentRoute, saving, restartNeeded, restarting, configLoaded, logsLoading, logLines, logFile,
+      config, stats, metrics, qps, blockRate, captchaSuccessRate, trustedIPs, trustedIPsLoading, currentRoute, saving, restartNeeded, restarting, configLoaded, logsLoading, logLines, logFile,
       hotPathsText, ccPathsText, scannerPathsText, scannerUAsText, customScriptUAsText, customBlockPathsText,
       whitelistCIDRsText, firewallWhitelistCIDRsText, blacklistCIDRsText, urlAllowlistText, urlBlocklistText, alertToText, emailTesting,
       pageTitle, blockType,
       navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, sendTestEmail, loadLogs, loadAttackLogs, clearAttackLogs, attackLogs,
-      categoryType, fmtDetail
+      categoryType, fmtDetail, loadTrustedIPs, fmtTime
     }
   }
 })

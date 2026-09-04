@@ -36,12 +36,18 @@ func isSearchBot(ua string) bool {
 // 未信任的 IP 用 mutex+map 计数，到阈值后迁移到 sync.Map
 
 type ipTrustTracker struct {
-	trustedMap sync.Map // ip -> time.Time（可信到期时间）
+	trustedMap sync.Map // ip -> trustEntry
 	mu         sync.Mutex
 	counters   map[string]*ipTrack
 	windowSec  int
 	minVisits  int
 	ttl        time.Duration
+}
+
+// trustEntry 可信 IP 记录：可信时间点与进入途径。
+type trustEntry struct {
+	since  time.Time
+	reason string // "captcha" 验证码通过 / "visit-count" 访问次数晋升
 }
 
 type ipTrack struct {
@@ -58,30 +64,31 @@ func newIPTrustTracker(windowSec, minVisits, ttlSec int) *ipTrustTracker {
 	}
 }
 
-// loadTrusted 返回 IP 是否可信且未过期；过期则删除并返回 false。
-func (t *ipTrustTracker) loadTrusted(ip string) bool {
+// loadTrusted 返回 IP 的可信记录与是否可信（未过期）；过期则删除并返回 false。
+func (t *ipTrustTracker) loadTrusted(ip string) (trustEntry, bool) {
 	v, ok := t.trustedMap.Load(ip)
 	if !ok {
-		return false
+		return trustEntry{}, false
 	}
-	ts, ok := v.(time.Time)
-	if !ok || (t.ttl > 0 && time.Since(ts) >= t.ttl) {
+	e, ok := v.(trustEntry)
+	if !ok || (t.ttl > 0 && time.Since(e.since) >= t.ttl) {
 		t.trustedMap.Delete(ip)
-		return false
+		return trustEntry{}, false
 	}
-	return true
+	return e, true
 }
 
 // isTrusted 只读判断 IP 是否已晋升可信（含 TTL 过期检查），不累计访问次数。
 func (t *ipTrustTracker) isTrusted(ip string) bool {
-	return t.loadTrusted(ip)
+	_, ok := t.loadTrusted(ip)
+	return ok
 }
 
 // recordVisit 累计一次访问；达到 minVisits 阈值时晋升为可信 IP 并返回 true。
 // 调用方只应在非泛洪期调用——泛洪期禁止按访问次数晋升，
 // 否则客户端仅靠反复请求凑够次数即可绕过验证码挑战。
 func (t *ipTrustTracker) recordVisit(ip string) bool {
-	if t.loadTrusted(ip) {
+	if _, ok := t.loadTrusted(ip); ok {
 		return true
 	}
 	t.mu.Lock()
@@ -93,7 +100,7 @@ func (t *ipTrustTracker) recordVisit(ip string) bool {
 	}
 	tr.count++
 	if tr.count >= t.minVisits {
-		t.trustedMap.Store(ip, time.Now())
+		t.trustedMap.Store(ip, trustEntry{since: time.Now(), reason: "visit-count"})
 		delete(t.counters, ip)
 		return true
 	}
@@ -105,7 +112,7 @@ func (t *ipTrustTracker) recordVisit(ip string) bool {
 }
 
 func (t *ipTrustTracker) setTrusted(ip string) {
-	t.trustedMap.Store(ip, time.Now())
+	t.trustedMap.Store(ip, trustEntry{since: time.Now(), reason: "captcha"})
 	t.mu.Lock()
 	delete(t.counters, ip)
 	t.mu.Unlock()
@@ -115,13 +122,40 @@ func (t *ipTrustTracker) setTrusted(ip string) {
 func (t *ipTrustTracker) sweepExpired() int {
 	n := 0
 	t.trustedMap.Range(func(k, v interface{}) bool {
-		if ts, ok := v.(time.Time); ok && t.ttl > 0 && time.Since(ts) >= t.ttl {
+		if e, ok := v.(trustEntry); ok && t.ttl > 0 && time.Since(e.since) >= t.ttl {
 			t.trustedMap.Delete(k)
 			n++
 		}
 		return true
 	})
 	return n
+}
+
+// TrustedIPInfo 可信 IP 快照（供管理后台展示）。
+type TrustedIPInfo struct {
+	IP     string    `json:"ip"`
+	Reason string    `json:"reason"`
+	Since  time.Time `json:"since"`
+}
+
+// listTrusted 返回当前所有可信 IP 的快照（含进入途径与可信时间）。
+func (t *ipTrustTracker) listTrusted() []TrustedIPInfo {
+	out := make([]TrustedIPInfo, 0)
+	t.trustedMap.Range(func(k, v interface{}) bool {
+		e, ok := v.(trustEntry)
+		if !ok {
+			return true
+		}
+		if t.ttl > 0 && time.Since(e.since) >= t.ttl {
+			t.trustedMap.Delete(k)
+			return true
+		}
+		if ip, ok := k.(string); ok {
+			out = append(out, TrustedIPInfo{IP: ip, Reason: e.reason, Since: e.since})
+		}
+		return true
+	})
+	return out
 }
 
 func (t *ipTrustTracker) gc() {
@@ -194,25 +228,78 @@ func newDualRateLimiter(globalQPS, globalBurst, newIPQPS, newIPBurst int) *dualR
 	}
 }
 
+// ---- 未信任 IP 每 IP 限速 ----
+
+type perIPBucket struct {
+	tb       *tokenBucket
+	lastSeen int64 // UnixNano
+}
+
+func (b *perIPBucket) allow() bool {
+	atomic.StoreInt64(&b.lastSeen, time.Now().UnixNano())
+	return b.tb.allow()
+}
+
+type perIPLimiter struct {
+	mu      sync.Mutex
+	buckets map[string]*perIPBucket
+	qps     int
+	burst   int
+}
+
+func newPerIPLimiter(qps, burst int) *perIPLimiter {
+	return &perIPLimiter{
+		buckets: make(map[string]*perIPBucket),
+		qps:     qps,
+		burst:   burst,
+	}
+}
+
+// allow 每个未信任 IP 消耗一个令牌；桶空返回 false（需挑战）。
+func (l *perIPLimiter) allow(ip string) bool {
+	l.mu.Lock()
+	b, ok := l.buckets[ip]
+	if !ok {
+		b = &perIPBucket{tb: newTokenBucket(l.qps, l.burst)}
+		l.buckets[ip] = b
+	}
+	l.mu.Unlock()
+	return b.allow()
+}
+
+// gc 清理空闲超过 idleTTL 的 IP 桶，避免内存无界增长。
+func (l *perIPLimiter) gc(idleTTL time.Duration) {
+	l.mu.Lock()
+	now := time.Now().UnixNano()
+	for ip, b := range l.buckets {
+		if now-atomic.LoadInt64(&b.lastSeen) > int64(idleTTL) {
+			delete(l.buckets, ip)
+		}
+	}
+	l.mu.Unlock()
+}
+
 // ---- 新 IP 泛洪检测 (仅用于未信任 IP) ----
 
 type newIPFloodDetector struct {
 	checkSec  int
 	ratioPct  int
 	minReqs   int
+	seenTTL   time.Duration
 	mu        sync.Mutex
-	seen      map[string]bool
+	seen      map[string]int64 // ip -> 最近出现时间(UnixNano)
 	recentNew int64
 	recentOld int64
 	windowAt  int64 // UnixNano
 }
 
-func newNewIPFloodDetector(checkSec, ratioPct, minReqs int) *newIPFloodDetector {
+func newNewIPFloodDetector(checkSec, ratioPct, minReqs, seenTTLSec int) *newIPFloodDetector {
 	return &newIPFloodDetector{
 		checkSec: checkSec,
 		ratioPct: ratioPct,
 		minReqs:  minReqs,
-		seen:     make(map[string]bool),
+		seenTTL:  time.Duration(seenTTLSec) * time.Second,
+		seen:     make(map[string]int64),
 		windowAt: time.Now().UnixNano(),
 	}
 }
@@ -230,17 +317,32 @@ func (d *newIPFloodDetector) isFlooding(ip string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	now := time.Now()
-	if now.UnixNano()-atomic.LoadInt64(&d.windowAt) > int64(d.checkSec)*1e9 {
+	nowNano := now.UnixNano()
+
+	// 统计窗口重置：顺带清理 seen 中超过 seenTTL 的过期条目，避免内存无界增长
+	if nowNano-atomic.LoadInt64(&d.windowAt) > int64(d.checkSec)*1e9 {
 		atomic.StoreInt64(&d.recentNew, 0)
 		atomic.StoreInt64(&d.recentOld, 0)
-		d.windowAt = now.UnixNano()
+		d.windowAt = nowNano
+		if d.seenTTL > 0 && len(d.seen) > 0 {
+			cutoff := nowNano - int64(d.seenTTL)
+			for k, v := range d.seen {
+				if v < cutoff {
+					delete(d.seen, k)
+				}
+			}
+		}
 	}
-	if d.seen[ip] {
+
+	// 新/老 IP 判定：在 seenTTL 滑动窗口内出现过 → 老 IP；否则 → 新 IP
+	if last, ok := d.seen[ip]; ok && nowNano-last < int64(d.seenTTL) {
 		atomic.AddInt64(&d.recentOld, 1)
+		d.seen[ip] = nowNano // 刷新活跃时间
 	} else {
-		d.seen[ip] = true
+		d.seen[ip] = nowNano
 		atomic.AddInt64(&d.recentNew, 1)
 	}
+
 	total := atomic.LoadInt64(&d.recentNew) + atomic.LoadInt64(&d.recentOld)
 	if total < int64(d.minReqs) {
 		return false
@@ -250,9 +352,6 @@ func (d *newIPFloodDetector) isFlooding(ip string) bool {
 		log.Printf("[cc_defense] new-ip flood: ratio=%d%% total=%d new=%d old=%d",
 			ratio, total, atomic.LoadInt64(&d.recentNew), atomic.LoadInt64(&d.recentOld))
 		return true
-	}
-	if len(d.seen) > 500000 {
-		d.seen = make(map[string]bool)
 	}
 	return false
 }
@@ -265,13 +364,15 @@ type ipBehaviorTracker struct {
 	lastSeen  map[string]time.Time      // 上次请求时间
 	intervals map[string][]int64        // 最近 5 次请求间隔(ms)
 	paths     map[string]map[string]int // IP → path → count
+	idleReset time.Duration             // 空闲超过该时长即清空该 IP 行为状态
 }
 
-func newIPBehaviorTracker() *ipBehaviorTracker {
+func newIPBehaviorTracker(idleSec int) *ipBehaviorTracker {
 	return &ipBehaviorTracker{
 		lastSeen:  make(map[string]time.Time),
 		intervals: make(map[string][]int64),
 		paths:     make(map[string]map[string]int),
+		idleReset: time.Duration(idleSec) * time.Second,
 	}
 }
 
@@ -284,6 +385,16 @@ func (bt *ipBehaviorTracker) isBotLike(ip, path string) bool {
 	defer bt.mu.Unlock()
 
 	now := time.Now()
+
+	// 空闲衰减：超过 idleReset 未访问的 IP，清空其行为状态，当作全新会话重新判定，
+	// 避免"路径单一"等累计指标被永久记住、导致真人长时间无法恢复。
+	if bt.idleReset > 0 {
+		if prev, ok := bt.lastSeen[ip]; ok && now.Sub(prev) >= bt.idleReset {
+			delete(bt.lastSeen, ip)
+			delete(bt.intervals, ip)
+			delete(bt.paths, ip)
+		}
+	}
 
 	// 1. 请求间隔检测
 	if prev, ok := bt.lastSeen[ip]; ok {
@@ -423,6 +534,7 @@ func (st *sessionTracker) record(sessionID, ip string) (anomaly bool, reason str
 
 type CCDefenseHandler struct {
 	dlimiter        *dualRateLimiter
+	perIP           *perIPLimiter
 	trust           *ipTrustTracker
 	flood           *newIPFloodDetector
 	fw              *FirewallBlocker
@@ -447,10 +559,11 @@ func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *Fi
 	cfg.Normalize()
 	h := &CCDefenseHandler{
 		dlimiter:     newDualRateLimiter(cfg.GlobalQPSMax, cfg.GlobalQPSBurst, cfg.NewIPQPSMax, cfg.NewIPQPSBurst),
+		perIP:        newPerIPLimiter(cfg.UntrustedIPQPSMax, cfg.UntrustedIPBurst),
 		trust:        newIPTrustTracker(cfg.TrustIPWindowSec, cfg.TrustIPMinVisits, cfg.TrustIPTTLSec),
-		flood:        newNewIPFloodDetector(cfg.NewIPCheckSec, cfg.NewIPRatioBlock, cfg.NewIPCheckMinReqs),
+		flood:        newNewIPFloodDetector(cfg.NewIPCheckSec, cfg.NewIPRatioBlock, cfg.NewIPCheckMinReqs, cfg.FloodSlidingWindowSec),
 		fw:           fw,
-		behavior:     newIPBehaviorTracker(),
+		behavior:     newIPBehaviorTracker(cfg.BehaviorIdleResetSec),
 		sessions:     newSessionTracker(),
 		ipChecker:    newIPRegionChecker(),
 		captcha:      newCaptchaStore(),
@@ -459,11 +572,16 @@ func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *Fi
 		cfg:          cfg,
 		next:         next,
 	}
-	log.Printf("[cc_defense] enabled trusted_ips=%d/%ds ttl=%ds global_qps=%d burst=%d new_ip_qps=%d burst=%d flood_ratio=%d%%",
+	log.Printf("[cc_defense] enabled trusted_ips=%d/%ds ttl=%ds global_qps=%d burst=%d new_ip_qps=%d burst=%d per_ip_qps=%d burst=%d flood_ratio=%d%%",
 		cfg.TrustIPMinVisits, cfg.TrustIPWindowSec, cfg.TrustIPTTLSec, cfg.GlobalQPSMax, cfg.GlobalQPSBurst,
-		cfg.NewIPQPSMax, cfg.NewIPQPSBurst, cfg.NewIPRatioBlock)
+		cfg.NewIPQPSMax, cfg.NewIPQPSBurst, cfg.UntrustedIPQPSMax, cfg.UntrustedIPBurst, cfg.NewIPRatioBlock)
 	go h.reaper()
 	return h
+}
+
+// TrustedIPs 返回当前可信 IP 快照（含进入途径与可信时间），供管理后台展示。
+func (h *CCDefenseHandler) TrustedIPs() []TrustedIPInfo {
+	return h.trust.listTrusted()
 }
 
 func (h *CCDefenseHandler) ReportOffender(ip string) {
@@ -509,6 +627,9 @@ func (h *CCDefenseHandler) reaper() {
 			}
 			return true
 		})
+
+		// 4) 每 IP 限速桶：删除空闲超过 10 分钟的 IP
+		h.perIP.gc(10 * time.Minute)
 	}
 }
 
@@ -547,6 +668,13 @@ func (h *CCDefenseHandler) handleCaptchaVerify(w http.ResponseWriter, r *http.Re
 	}
 	if h.captcha.verify(id, ip, clicks) {
 		log.Printf("[cc_defense] captcha passed ip=%s", ip)
+		metrics.CaptchaPassed.Inc()
+		// 通过验证码即视为可信：清除该 IP 的违规累计并解除防火墙拉黑，
+		// 避免真人在反复挑战过程中被累计触发拉黑。
+		h.offenders.Delete(ip)
+		if h.fw != nil {
+			h.fw.unblock(ip)
+		}
 		if sid != "" {
 			// 信任该会话（cookie），同 IP 的其他用户不受影响
 			h.trustedSessions.Store(sid, time.Now())
@@ -558,10 +686,36 @@ func (h *CCDefenseHandler) handleCaptchaVerify(w http.ResponseWriter, r *http.Re
 		return
 	}
 	log.Printf("[cc_defense] captcha failed ip=%s id=%s clicks=%v", ip, id, clicks)
+	metrics.CaptchaFailed.Inc()
 	if expIP, expPos, ok := h.captcha.peek(id); ok {
 		log.Printf("[cc_defense] captcha expected ip=%s pos=%v", expIP, expPos)
 	}
 	h.serveCaptcha(w, r, ip)
+}
+
+// blockIfBotLike 行为检测：请求间隔均匀或路径单一 → 返回验证码挑战。返回是否已处置。
+func (h *CCDefenseHandler) blockIfBotLike(w http.ResponseWriter, r *http.Request, ip string) bool {
+	if h.behavior.isBotLike(ip, r.URL.Path) {
+		log.Printf("[cc_defense] bot-like behavior ip=%s, serving captcha challenge", ip)
+		attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "bot-like")
+		metrics.CCChallenged.Inc()
+		h.serveCaptcha(w, r, ip)
+		return true
+	}
+	return false
+}
+
+// blockIfSessionAnomaly Session-IP 映射异常检测：命中即拦截并写响应。返回是否已拦截。
+func (h *CCDefenseHandler) blockIfSessionAnomaly(w http.ResponseWriter, r *http.Request, ip string) bool {
+	sid := extractSessionID(r.URL.Path)
+	if anom, reason := h.sessions.record(sid, ip); anom {
+		log.Printf("[cc_defense] session anomaly ip=%s reason=%s, closing connection", ip, reason)
+		attacklog.Record(ip, r.Host, r.URL.Path, "CC会话", reason)
+		metrics.CCBlocked.Inc()
+		util.CloseConnectionSilently(w)
+		return true
+	}
+	return false
 }
 
 func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -607,8 +761,15 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 快速路径：可信 IP → 无需 flooding 检测，几乎无锁
+	// 可信 IP：免泛洪挑战、免未信任慢车道限速，但仍需过行为/会话检测，
+	// 避免"毕业即免检"——攻击 IP 毕业后若行为像脚本仍会被拦截。
 	if h.trust.isTrusted(ip) {
+		if h.blockIfBotLike(w, r, ip) {
+			return
+		}
+		if h.blockIfSessionAnomaly(w, r, ip) {
+			return
+		}
 		if !h.dlimiter.trusted.allow() {
 			log.Printf("[cc_defense] trusted ip=%s rate limited, closing connection", ip)
 			attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "trusted ip")
@@ -624,22 +785,12 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.trust.gc()
 	flooding := h.flood.isFlooding(ip)
 
-	// 对所有非可信 IP 进行行为检测（不限于泛洪期）
-	// 请求间隔均匀或路径单一 → 直接拦截
-	if h.behavior.isBotLike(ip, r.URL.Path) {
-		log.Printf("[cc_defense] bot-like behavior ip=%s, closing connection", ip)
-		attacklog.Record(ip, r.Host, r.URL.Path, "CC行为", "bot-like")
-		metrics.CCBlocked.Inc()
-		util.CloseConnectionSilently(w)
+	// 对未可信 IP 进行行为检测（不限于泛洪期）
+	if h.blockIfBotLike(w, r, ip) {
 		return
 	}
 	// Session-IP 映射异常检测
-	sid := extractSessionID(r.URL.Path)
-	if anom, reason := h.sessions.record(sid, ip); anom {
-		log.Printf("[cc_defense] session anomaly ip=%s reason=%s, closing connection", ip, reason)
-		attacklog.Record(ip, r.Host, r.URL.Path, "CC会话", reason)
-		metrics.CCBlocked.Inc()
-		util.CloseConnectionSilently(w)
+	if h.blockIfSessionAnomaly(w, r, ip) {
 		return
 	}
 
@@ -658,8 +809,18 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		h.ReportOffender(ip)
-		metrics.CCBlocked.Inc()
+		metrics.CCChallenged.Inc()
 		attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "captcha")
+		h.serveCaptcha(w, r, ip)
+		return
+	}
+
+	// 未信任每 IP 限速：单 IP 超过 per_ip 阈值 → 验证码挑战。
+	// 放在次数晋升之前，避免高频 IP 靠反复请求"毕业"绕过限速。
+	if !h.perIP.allow(ip) {
+		log.Printf("[cc_defense] untrusted ip=%s per-ip rate limited, serving captcha challenge", ip)
+		attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "captcha")
+		metrics.CCChallenged.Inc()
 		h.serveCaptcha(w, r, ip)
 		return
 	}
@@ -694,7 +855,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("[cc_defense] untrusted ip=%s bucket exhausted, serving captcha challenge", ip)
 		attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "captcha")
-		metrics.CCBlocked.Inc()
+		metrics.CCChallenged.Inc()
 		h.serveCaptcha(w, r, ip)
 		return
 	}

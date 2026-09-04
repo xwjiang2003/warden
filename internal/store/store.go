@@ -27,6 +27,13 @@ func openDB(dbPath string) (*sql.DB, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
+	// 该 DB 文件与攻击日志等其它连接共用，设置 busy_timeout 避免并发写触发 SQLITE_BUSY
+	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		log.Printf("[store] 设置 busy_timeout 失败: %v", err)
+	}
+	if _, err := db.Exec(`PRAGMA journal_mode = WAL`); err != nil {
+		log.Printf("[store] 设置 WAL 失败: %v", err)
+	}
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS config (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		data TEXT NOT NULL,
@@ -88,21 +95,19 @@ func Load(jsonPath, dbPath string) (*config.Config, error) {
 	return &cfg, nil
 }
 
-// Save 将配置同时写入 SQLite 与 JSON 文件（JSON 作为兜底/兼容）
+// Save 将配置同时写入 SQLite 与 JSON 文件（JSON 作为兜底）。
+// 只要 JSON 写成功即视为保存成功；SQLite 失败仅告警，不阻断保存。
 func Save(jsonPath, dbPath string, cfg *config.Config) error {
 	if dbPath == "" {
 		dbPath = DefaultDBPath
 	}
-	var dbErr error
 	if db, err := openDB(dbPath); err == nil {
-		dbErr = saveDB(db, cfg)
+		if dbErr := saveDB(db, cfg); dbErr != nil {
+			log.Printf("[store] 写入 SQLite 失败(%v)，仅写 JSON", dbErr)
+		}
 		db.Close()
 	} else {
 		log.Printf("[store] 打开 SQLite 失败(%v)，仅写 JSON", err)
 	}
-	jsonErr := config.Save(jsonPath, cfg)
-	if jsonErr != nil {
-		return jsonErr
-	}
-	return dbErr
+	return config.Save(jsonPath, cfg)
 }

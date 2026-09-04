@@ -18,6 +18,7 @@ import (
 	"warden/internal/attacklog"
 	"warden/internal/config"
 	"warden/internal/metrics"
+	"warden/internal/proxy"
 	"warden/internal/restart"
 	"warden/internal/store"
 	"warden/internal/util"
@@ -25,12 +26,13 @@ import (
 
 // Server 管理后台服务
 type Server struct {
-	cfg       *config.Config
-	cfgPath   string
-	dbPath    string
-	adminCfg  config.AdminConfig
-	startTime time.Time
-	mux       *http.ServeMux
+	cfg        *config.Config
+	cfgPath    string
+	dbPath     string
+	adminCfg   config.AdminConfig
+	startTime  time.Time
+	mux        *http.ServeMux
+	trustedIPs func() []proxy.TrustedIPInfo
 }
 
 func NewServer(cfg *config.Config, cfgPath, dbPath string, adminCfg config.AdminConfig) *Server {
@@ -55,6 +57,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/logs", s.handleLogs)
 	s.mux.HandleFunc("GET /api/attack_logs", s.handleAttackLogs)
 	s.mux.HandleFunc("POST /api/attack_logs/clear", s.handleAttackLogsClear)
+	s.mux.HandleFunc("GET /api/trusted_ips", s.handleTrustedIPs)
 	s.mux.HandleFunc("GET /api/metrics", s.handleMetrics)
 	s.mux.HandleFunc("POST /api/restart", s.handleRestart)
 	s.mux.HandleFunc("POST /api/alert/test", s.handleAlertTest)
@@ -184,7 +187,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 
 	*s.cfg = newCfg
 
-	log.Printf("[admin] 配置已更新并保存到 %s / %s (部分更改需重启生效)", s.dbPath, s.cfgPath)
+	log.Printf("[admin] 配置已更新并保存 (部分更改需重启生效)")
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message":          "配置已保存",
 		"restart_required": true,
@@ -225,6 +228,19 @@ func (s *Server) handleAttackLogsClear(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message": "攻击日志已清空",
 	})
+}
+
+// SetTrustedIPsProvider 设置可信 IP 列表提供者（由 CC 防御注入）。
+func (s *Server) SetTrustedIPsProvider(f func() []proxy.TrustedIPInfo) {
+	s.trustedIPs = f
+}
+
+func (s *Server) handleTrustedIPs(w http.ResponseWriter, r *http.Request) {
+	if s.trustedIPs == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ips": []proxy.TrustedIPInfo{}})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ips": s.trustedIPs()})
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {

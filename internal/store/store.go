@@ -11,6 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"warden/internal/config"
+	"warden/internal/sqlutil"
 )
 
 // DefaultDBPath 默认 SQLite 数据库文件（相对可执行文件目录）
@@ -50,9 +51,11 @@ func saveDB(db *sql.DB, cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(`INSERT OR REPLACE INTO config (id, data, updated_at) VALUES (1, ?, ?)`,
-		string(data), time.Now().Format(time.RFC3339))
-	return err
+	return sqlutil.Retry(func() error {
+		_, err := db.Exec(`INSERT OR REPLACE INTO config (id, data, updated_at) VALUES (1, ?, ?)`,
+			string(data), time.Now().Format(time.RFC3339))
+		return err
+	})
 }
 
 // Load 优先从 SQLite 读取配置；数据库为空则从 JSON 文件读取并自动迁移入库。

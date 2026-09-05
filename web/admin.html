@@ -51,6 +51,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
       <el-menu-item index="ipprotection">🌐 IP 防护</el-menu-item>
       <el-menu-item index="alert">📧 告警通知</el-menu-item>
       <el-menu-item index="attacklogs">🛡️ 攻击日志</el-menu-item>
+      <el-menu-item index="trustedips">✅ 可信 IP</el-menu-item>
       <el-menu-item index="logs">📋 访问日志</el-menu-item>
     </el-menu>
   </el-aside>
@@ -63,6 +64,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
       </div>
     </el-header>
     <el-main>
+      <!-- 全局重启提示：保存配置后置顶显示，跨页面可见 -->
+      <div v-if="restartNeeded" class="restart-notice" style="margin-bottom:16px">
+        <span>⚠️ 配置已保存，部分更改需重启 WAF 服务才能生效</span>
+        <el-button type="danger" size="small" @click="restartService" :loading="restarting">立即重启</el-button>
+      </div>
       <!-- 仪表盘 -->
       <template v-if="currentRoute==='dashboard'">
         <div class="page-card" style="margin-bottom:16px">
@@ -90,7 +96,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
             <div class="stat-item"><span class="label">验证码通过</span><span class="value green">{{ metrics.captcha_passed }}</span></div>
             <div class="stat-item"><span class="label">验证码失败</span><span class="value orange">{{ metrics.captcha_failed }}</span></div>
             <div class="stat-item"><span class="label">挑战通过率</span><span class="value blue">{{ captchaSuccessRate }}%</span></div>
-            <div class="stat-item"><span class="label">可信 IP 数</span><span class="value blue">{{ trustedIPs.length }}</span></div>
           </div>
         </div>
         <div class="stats-row">
@@ -107,20 +112,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
           <div class="stat-item"><span class="label">Go 版本</span><span class="value" style="font-size:16px">{{ stats.go_version }}</span></div>
         </div>
         <div class="page-card">
-          <h3>可信 IP 列表 <span style="font-weight:400;color:#909399;font-size:12px">（通过验证码或次数晋升进入可信通道，TTL 内有效）</span>
-            <el-button size="small" type="primary" style="float:right" @click="loadTrustedIPs" :loading="trustedIPsLoading">刷新</el-button>
-          </h3>
-          <el-table :data="trustedIPs" size="small" style="margin-top:8px" max-height="400">
-            <el-table-column prop="ip" label="IP" width="180"></el-table-column>
-            <el-table-column label="进入途径" width="140">
-              <template #default="{ row }">{{ row.reason === 'captcha' ? '验证码通过' : (row.reason === 'visit-count' ? '次数晋升' : row.reason) }}</template>
-            </el-table-column>
-            <el-table-column label="信任时间">
-              <template #default="{ row }">{{ fmtTime(row.since) }}</template>
-            </el-table-column>
-          </el-table>
-        </div>
-        <div class="page-card">
           <h3>代理信息</h3>
           <el-descriptions :column="2" border size="small">
             <el-descriptions-item label="监听地址">{{ stats.proxy_listen }}</el-descriptions-item>
@@ -128,6 +119,36 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
             <el-descriptions-item label="启动时间">{{ stats.start_time }}</el-descriptions-item>
             <el-descriptions-item label="运行模式">{{ config.block_requests ? '拦截模式 (Block)' : '监控模式 (Log Only)' }}</el-descriptions-item>
           </el-descriptions>
+        </div>
+      </template>
+
+      <!-- 可信 IP -->
+      <template v-if="currentRoute==='trustedips'">
+        <div class="page-card">
+          <h3>可信 IP 列表 <span style="font-weight:400;color:#909399;font-size:12px">（通过验证码或次数晋升进入可信通道，TTL 内有效）</span>
+            <el-button size="small" type="primary" style="float:right" @click="loadTrustedIPs(1)" :loading="trustedIPsLoading">刷新</el-button>
+          </h3>
+          <el-table :data="trustedIPs" size="small" style="margin-top:8px">
+            <el-table-column prop="ip" label="IP" width="200"></el-table-column>
+            <el-table-column label="进入途径" width="140">
+              <template #default="{ row }">{{ row.reason === 'captcha' ? '验证码通过' : (row.reason === 'visit-count' ? '次数晋升' : row.reason) }}</template>
+            </el-table-column>
+            <el-table-column label="信任时间">
+              <template #default="{ row }">{{ fmtTime(row.since) }}</template>
+            </el-table-column>
+          </el-table>
+          <div style="text-align:right;margin-top:12px">
+            <el-pagination
+              background
+              layout="total, prev, pager, next, sizes"
+              :total="trustedIPsTotal"
+              :page-size="trustedIPsPageSize"
+              :current-page="trustedIPsPage"
+              :page-sizes="[20, 50, 100]"
+              @current-change="loadTrustedIPs"
+              @size-change="onTrustedPageSize"
+            />
+          </div>
         </div>
       </template>
 
@@ -261,7 +282,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         <div style="text-align:right;margin-top:8px">
           <el-button type="primary" @click="saveConfig" :loading="saving">保存配置</el-button>
         </div>
-        <div v-if="restartNeeded" class="restart-notice"><span>⚠️ 配置已保存，部分更改需重启 WAF 服务才能生效</span><el-button type="danger" size="small" @click="restartService" :loading="restarting">立即重启</el-button></div>
       </template>
 
       <!-- 频率限制 -->
@@ -317,7 +337,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         <div style="text-align:right;margin-top:8px">
           <el-button type="primary" @click="saveRateLimit" :loading="saving">保存配置</el-button>
         </div>
-        <div v-if="restartNeeded" class="restart-notice"><span>⚠️ 频率限制配置已保存，需重启 WAF 服务生效</span><el-button type="danger" size="small" @click="restartService" :loading="restarting">立即重启</el-button></div>
       </template>
 
       <!-- CC 防御 -->
@@ -468,7 +487,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         <div style="text-align:right;margin-top:8px">
           <el-button type="primary" @click="saveConfig" :loading="saving">保存配置</el-button>
         </div>
-        <div v-if="restartNeeded" class="restart-notice"><span>⚠️ CC 防御配置已保存，需重启 WAF 服务生效</span><el-button type="danger" size="small" @click="restartService" :loading="restarting">立即重启</el-button></div>
       </template>
 
       <!-- WAF 规则 -->
@@ -541,7 +559,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         <div style="text-align:right;margin-top:8px">
           <el-button type="primary" @click="saveWAFRules" :loading="saving">保存配置</el-button>
         </div>
-        <div v-if="restartNeeded" class="restart-notice"><span>⚠️ WAF 规则已保存，需重启 WAF 服务生效</span><el-button type="danger" size="small" @click="restartService" :loading="restarting">立即重启</el-button></div>
       </template>
 
       <!-- 连接限制 -->
@@ -600,7 +617,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         <div style="text-align:right;margin-top:8px">
           <el-button type="primary" @click="saveConfig" :loading="saving">保存配置</el-button>
         </div>
-        <div v-if="restartNeeded" class="restart-notice"><span>⚠️ 连接限制配置已保存，需重启 WAF 服务生效</span><el-button type="danger" size="small" @click="restartService" :loading="restarting">立即重启</el-button></div>
       </template>
 
       <!-- 代理站点 -->
@@ -641,7 +657,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         <div style="text-align:right;margin-top:8px">
           <el-button type="primary" @click="saveConfig" :loading="saving">保存配置</el-button>
         </div>
-        <div v-if="restartNeeded" class="restart-notice"><span>⚠️ 站点配置已保存，需重启 WAF 服务生效</span><el-button type="danger" size="small" @click="restartService" :loading="restarting">立即重启</el-button></div>
       </template>
 
       <!-- IP 防护 -->
@@ -693,7 +708,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         <div style="text-align:right;margin-top:8px">
           <el-button type="primary" @click="saveConfig" :loading="saving">保存配置</el-button>
         </div>
-        <div v-if="restartNeeded" class="restart-notice"><span>⚠️ IP 防护配置已保存，需重启 WAF 服务生效</span><el-button type="danger" size="small" @click="restartService" :loading="restarting">立即重启</el-button></div>
       </template>
 
       <!-- 告警通知 -->
@@ -777,7 +791,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
           <el-button @click="sendTestEmail" :loading="emailTesting" style="margin-right:8px">发送测试邮件</el-button>
           <el-button type="primary" @click="saveConfig" :loading="saving">保存配置</el-button>
         </div>
-        <div v-if="restartNeeded" class="restart-notice"><span>⚠️ 告警配置已保存，需重启 WAF 服务生效</span><el-button type="danger" size="small" @click="restartService" :loading="restarting">立即重启</el-button></div>
       </template>
 
       <!-- 攻击日志 -->
@@ -880,6 +893,9 @@ const app = createApp({
     const captchaSuccessRate = ref('0.00')
     const trustedIPs = ref([])
     const trustedIPsLoading = ref(false)
+    const trustedIPsTotal = ref(0)
+    const trustedIPsPage = ref(1)
+    const trustedIPsPageSize = ref(20)
     let prevReq = 0
     let prevTs = 0
     const currentRoute = ref('dashboard')
@@ -973,6 +989,8 @@ const app = createApp({
       try {
         const { data } = await api.get('/stats')
         Object.assign(stats, data)
+        // 后端记录"是否需要重启"：刷新/换浏览器都能正确显示
+        restartNeeded.value = data.restart_needed === true
       } catch (e) { /* 静默失败 */ }
     }
 
@@ -993,13 +1011,23 @@ const app = createApp({
       } catch (e) { /* 静默失败 */ }
     }
 
-    async function loadTrustedIPs() {
+    async function loadTrustedIPs(page) {
+      if (page != null) trustedIPsPage.value = page
       trustedIPsLoading.value = true
       try {
-        const { data } = await api.get('/trusted_ips')
-        trustedIPs.value = data.ips || []
+        const { data } = await api.get('/trusted_ips', {
+          params: { page: trustedIPsPage.value, page_size: trustedIPsPageSize.value }
+        })
+        trustedIPs.value = data.list || []
+        trustedIPsTotal.value = data.total || 0
       } catch (e) { /* 静默失败 */ }
       trustedIPsLoading.value = false
+    }
+
+    function onTrustedPageSize(size) {
+      trustedIPsPageSize.value = size
+      trustedIPsPage.value = 1
+      loadTrustedIPs(1)
     }
 
     function fmtTime(s) {
@@ -1050,6 +1078,7 @@ const app = createApp({
       try {
         const { data } = await api.post('/restart')
         ElementPlus.ElMessage.success(data.message || '重启中…')
+        restartNeeded.value = false
       } catch (e) {
         restarting.value = false
         ElementPlus.ElMessage.error('重启失败: ' + (e.response?.data?.error || e.message))
@@ -1129,29 +1158,27 @@ const app = createApp({
 
     function navigate(index) {
       currentRoute.value = index
-      restartNeeded.value = false
       if (index === 'logs') loadLogs()
       if (index === 'attacklogs') loadAttackLogs()
+      if (index === 'trustedips') loadTrustedIPs(1)
     }
 
     onMounted(() => {
       loadConfig()
       loadStats()
       loadMetrics()
-      loadTrustedIPs()
       setInterval(loadStats, 30000) // 每 30s 刷新统计
       setInterval(loadMetrics, 2000) // 每 2s 刷新拦截指标
       setInterval(loadAttackLogs, 3000) // 每 3s 刷新攻击日志
-      setInterval(loadTrustedIPs, 5000) // 每 5s 刷新可信 IP 列表
     })
 
     return {
-      config, stats, metrics, qps, blockRate, captchaSuccessRate, trustedIPs, trustedIPsLoading, currentRoute, saving, restartNeeded, restarting, configLoaded, logsLoading, logLines, logFile,
+      config, stats, metrics, qps, blockRate, captchaSuccessRate, trustedIPs, trustedIPsLoading, trustedIPsTotal, trustedIPsPage, trustedIPsPageSize, currentRoute, saving, restartNeeded, restarting, configLoaded, logsLoading, logLines, logFile,
       hotPathsText, ccPathsText, scannerPathsText, scannerUAsText, customScriptUAsText, customBlockPathsText,
       whitelistCIDRsText, firewallWhitelistCIDRsText, blacklistCIDRsText, urlAllowlistText, urlBlocklistText, alertToText, emailTesting,
       pageTitle, blockType,
       navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, sendTestEmail, loadLogs, loadAttackLogs, clearAttackLogs, attackLogs,
-      categoryType, fmtDetail, loadTrustedIPs, fmtTime
+      categoryType, fmtDetail, loadTrustedIPs, onTrustedPageSize, fmtTime
     }
   }
 })

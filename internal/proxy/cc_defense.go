@@ -10,6 +10,7 @@ import (
 	"warden/internal/attacklog"
 	"warden/internal/config"
 	"warden/internal/metrics"
+	"warden/internal/truststore"
 	"warden/internal/util"
 )
 
@@ -42,6 +43,7 @@ type ipTrustTracker struct {
 	windowSec  int
 	minVisits  int
 	ttl        time.Duration
+	store      *truststore.Store
 }
 
 // trustEntry 可信 IP 记录：可信时间点与进入途径。
@@ -55,12 +57,13 @@ type ipTrack struct {
 	first time.Time
 }
 
-func newIPTrustTracker(windowSec, minVisits, ttlSec int) *ipTrustTracker {
+func newIPTrustTracker(windowSec, minVisits, ttlSec int, store *truststore.Store) *ipTrustTracker {
 	return &ipTrustTracker{
 		counters:  make(map[string]*ipTrack),
 		windowSec: windowSec,
 		minVisits: minVisits,
 		ttl:       time.Duration(ttlSec) * time.Second,
+		store:     store,
 	}
 }
 
@@ -73,6 +76,9 @@ func (t *ipTrustTracker) loadTrusted(ip string) (trustEntry, bool) {
 	e, ok := v.(trustEntry)
 	if !ok || (t.ttl > 0 && time.Since(e.since) >= t.ttl) {
 		t.trustedMap.Delete(ip)
+		if t.store != nil {
+			t.store.Delete(ip)
+		}
 		return trustEntry{}, false
 	}
 	return e, true
@@ -100,8 +106,12 @@ func (t *ipTrustTracker) recordVisit(ip string) bool {
 	}
 	tr.count++
 	if tr.count >= t.minVisits {
-		t.trustedMap.Store(ip, trustEntry{since: time.Now(), reason: "visit-count"})
+		now := time.Now()
+		t.trustedMap.Store(ip, trustEntry{since: now, reason: "visit-count"})
 		delete(t.counters, ip)
+		if t.store != nil {
+			t.store.Upsert(ip, "visit-count", now)
+		}
 		return true
 	}
 	if time.Since(tr.first) > time.Duration(t.windowSec)*time.Second {
@@ -112,10 +122,14 @@ func (t *ipTrustTracker) recordVisit(ip string) bool {
 }
 
 func (t *ipTrustTracker) setTrusted(ip string) {
-	t.trustedMap.Store(ip, trustEntry{since: time.Now(), reason: "captcha"})
+	now := time.Now()
+	t.trustedMap.Store(ip, trustEntry{since: now, reason: "captcha"})
 	t.mu.Lock()
 	delete(t.counters, ip)
 	t.mu.Unlock()
+	if t.store != nil {
+		t.store.Upsert(ip, "captcha", now)
+	}
 }
 
 // sweepExpired 删除所有已过期的可信 IP，返回删除数量（供后台 reaper 定期调用）。
@@ -124,6 +138,9 @@ func (t *ipTrustTracker) sweepExpired() int {
 	t.trustedMap.Range(func(k, v interface{}) bool {
 		if e, ok := v.(trustEntry); ok && t.ttl > 0 && time.Since(e.since) >= t.ttl {
 			t.trustedMap.Delete(k)
+			if ip, ok := k.(string); ok && t.store != nil {
+				t.store.Delete(ip)
+			}
 			n++
 		}
 		return true
@@ -131,16 +148,30 @@ func (t *ipTrustTracker) sweepExpired() int {
 	return n
 }
 
-// TrustedIPInfo 可信 IP 快照（供管理后台展示）。
-type TrustedIPInfo struct {
-	IP     string    `json:"ip"`
-	Reason string    `json:"reason"`
-	Since  time.Time `json:"since"`
+// restore 启动时从数据库恢复可信 IP（仍有效的），并清理已过期的记录。
+func (t *ipTrustTracker) restore() {
+	if t.store == nil {
+		return
+	}
+	now := time.Now()
+	restored, cleaned := 0, 0
+	for _, e := range t.store.LoadAll() {
+		if t.ttl > 0 && now.Sub(e.Since) >= t.ttl {
+			t.store.Delete(e.IP)
+			cleaned++
+			continue
+		}
+		t.trustedMap.Store(e.IP, trustEntry{since: e.Since, reason: e.Reason})
+		restored++
+	}
+	if restored > 0 || cleaned > 0 {
+		log.Printf("[cc_defense] 启动恢复可信 IP: restored=%d cleaned=%d", restored, cleaned)
+	}
 }
 
-// listTrusted 返回当前所有可信 IP 的快照（含进入途径与可信时间）。
-func (t *ipTrustTracker) listTrusted() []TrustedIPInfo {
-	out := make([]TrustedIPInfo, 0)
+// listTrusted 返回当前所有可信 IP 的快照（含进入途径与可信时间，供测试）。
+func (t *ipTrustTracker) listTrusted() []truststore.Entry {
+	out := make([]truststore.Entry, 0)
 	t.trustedMap.Range(func(k, v interface{}) bool {
 		e, ok := v.(trustEntry)
 		if !ok {
@@ -151,7 +182,7 @@ func (t *ipTrustTracker) listTrusted() []TrustedIPInfo {
 			return true
 		}
 		if ip, ok := k.(string); ok {
-			out = append(out, TrustedIPInfo{IP: ip, Reason: e.reason, Since: e.since})
+			out = append(out, truststore.Entry{IP: ip, Reason: e.reason, Since: e.since})
 		}
 		return true
 	})
@@ -555,12 +586,12 @@ type offenderTrack struct {
 	lastSeen   int64
 }
 
-func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *FirewallBlocker, next http.Handler) *CCDefenseHandler {
+func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *FirewallBlocker, next http.Handler, trustStore *truststore.Store) *CCDefenseHandler {
 	cfg.Normalize()
 	h := &CCDefenseHandler{
 		dlimiter:     newDualRateLimiter(cfg.GlobalQPSMax, cfg.GlobalQPSBurst, cfg.NewIPQPSMax, cfg.NewIPQPSBurst),
 		perIP:        newPerIPLimiter(cfg.UntrustedIPQPSMax, cfg.UntrustedIPBurst),
-		trust:        newIPTrustTracker(cfg.TrustIPWindowSec, cfg.TrustIPMinVisits, cfg.TrustIPTTLSec),
+		trust:        newIPTrustTracker(cfg.TrustIPWindowSec, cfg.TrustIPMinVisits, cfg.TrustIPTTLSec, trustStore),
 		flood:        newNewIPFloodDetector(cfg.NewIPCheckSec, cfg.NewIPRatioBlock, cfg.NewIPCheckMinReqs, cfg.FloodSlidingWindowSec),
 		fw:           fw,
 		behavior:     newIPBehaviorTracker(cfg.BehaviorIdleResetSec),
@@ -572,16 +603,12 @@ func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *Fi
 		cfg:          cfg,
 		next:         next,
 	}
+	h.trust.restore()
 	log.Printf("[cc_defense] enabled trusted_ips=%d/%ds ttl=%ds global_qps=%d burst=%d new_ip_qps=%d burst=%d per_ip_qps=%d burst=%d flood_ratio=%d%%",
 		cfg.TrustIPMinVisits, cfg.TrustIPWindowSec, cfg.TrustIPTTLSec, cfg.GlobalQPSMax, cfg.GlobalQPSBurst,
 		cfg.NewIPQPSMax, cfg.NewIPQPSBurst, cfg.UntrustedIPQPSMax, cfg.UntrustedIPBurst, cfg.NewIPRatioBlock)
 	go h.reaper()
 	return h
-}
-
-// TrustedIPs 返回当前可信 IP 快照（含进入途径与可信时间），供管理后台展示。
-func (h *CCDefenseHandler) TrustedIPs() []TrustedIPInfo {
-	return h.trust.listTrusted()
 }
 
 func (h *CCDefenseHandler) ReportOffender(ip string) {

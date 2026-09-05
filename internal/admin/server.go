@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"warden"
@@ -18,21 +20,22 @@ import (
 	"warden/internal/attacklog"
 	"warden/internal/config"
 	"warden/internal/metrics"
-	"warden/internal/proxy"
 	"warden/internal/restart"
 	"warden/internal/store"
+	"warden/internal/truststore"
 	"warden/internal/util"
 )
 
 // Server 管理后台服务
 type Server struct {
-	cfg        *config.Config
-	cfgPath    string
-	dbPath     string
-	adminCfg   config.AdminConfig
-	startTime  time.Time
-	mux        *http.ServeMux
-	trustedIPs func() []proxy.TrustedIPInfo
+	cfg           *config.Config
+	cfgPath       string
+	dbPath        string
+	adminCfg      config.AdminConfig
+	startTime     time.Time
+	mux           *http.ServeMux
+	trustStore    *truststore.Store
+	restartNeeded atomic.Bool // 保存配置后置位，重启进程后清零
 }
 
 func NewServer(cfg *config.Config, cfgPath, dbPath string, adminCfg config.AdminConfig) *Server {
@@ -186,6 +189,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	*s.cfg = newCfg
+	s.restartNeeded.Store(true)
 
 	log.Printf("[admin] 配置已更新并保存 (部分更改需重启生效)")
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -230,17 +234,35 @@ func (s *Server) handleAttackLogsClear(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// SetTrustedIPsProvider 设置可信 IP 列表提供者（由 CC 防御注入）。
-func (s *Server) SetTrustedIPsProvider(f func() []proxy.TrustedIPInfo) {
-	s.trustedIPs = f
+// SetTrustStore 注入可信 IP 持久化存储（用于分页查询）。
+func (s *Server) SetTrustStore(store *truststore.Store) {
+	s.trustStore = store
 }
 
 func (s *Server) handleTrustedIPs(w http.ResponseWriter, r *http.Request) {
-	if s.trustedIPs == nil {
-		writeJSON(w, http.StatusOK, map[string]interface{}{"ips": []proxy.TrustedIPInfo{}})
+	page := 1
+	pageSize := 20
+	if v := r.URL.Query().Get("page"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			page = n
+		}
+	}
+	if v := r.URL.Query().Get("page_size"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 {
+			pageSize = n
+		}
+	}
+	if s.trustStore == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"list": []truststore.Entry{}, "total": 0, "page": page, "page_size": pageSize,
+		})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"ips": s.trustedIPs()})
+	offset := (page - 1) * pageSize
+	list, total := s.trustStore.List(offset, pageSize)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"list": list, "total": total, "page": page, "page_size": pageSize,
+	})
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
@@ -267,6 +289,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"cc_defense_enabled": s.cfg.CCDefense.Enabled,
 		"rate_limit_enabled": s.cfg.RateLimit.Enabled,
 		"block_requests":     s.cfg.BlockRequests,
+		"restart_needed":     s.restartNeeded.Load(),
 	}
 	writeJSON(w, http.StatusOK, stats)
 }

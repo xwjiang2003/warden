@@ -25,6 +25,7 @@ import (
 	"warden/internal/proxy"
 	"warden/internal/router"
 	"warden/internal/store"
+	"warden/internal/truststore"
 	"warden/internal/util"
 	"warden/internal/waf"
 )
@@ -100,6 +101,13 @@ func main() {
 	if fwStore != nil {
 		defer fwStore.Close()
 	}
+	trustStore, trustErr := truststore.Open(dbPath)
+	if trustErr != nil {
+		log.Printf("[truststore] 打开可信IP持久化失败(%v)，可信IP将不持久化", trustErr)
+	}
+	if trustStore != nil {
+		defer trustStore.Close()
+	}
 	fwBlocker := proxy.NewFirewallBlocker(cfg.FirewallBlock.Enabled && cfg.FirewallBlock.AutoBlock, cfg.FirewallBlock.ExpireMin, cfg.FirewallBlock.WhitelistCIDRs, fwStore)
 
 	inner := realIPMiddleware(txhttp.WrapHandler(wafEngine, siteRouter))
@@ -110,8 +118,8 @@ func main() {
 		}
 	})
 	handler := rl.Middleware(inner)
-	ccDef = proxy.NewCCDefense(cfg.CCDefense, cfg.IPCheck, fwBlocker, handler)
-	adminSrv.SetTrustedIPsProvider(ccDef.TrustedIPs)
+	ccDef = proxy.NewCCDefense(cfg.CCDefense, cfg.IPCheck, fwBlocker, handler, trustStore)
+	adminSrv.SetTrustStore(trustStore)
 	whitelist := proxy.NewIPWhitelist(cfg.IPWhitelist.CIDRs)
 	blocklist := proxy.NewIPWhitelist(cfg.IPBlacklist.CIDRs)
 	mux.Handle("/", proxy.BlocklistMiddleware(blocklist, cfg.IPBlacklist.Enabled,

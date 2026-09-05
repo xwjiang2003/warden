@@ -94,37 +94,41 @@ func TestParseClicks(t *testing.T) {
 // TestCaptchaThrottle 验证泛洪时节流：超过每秒上限后拒绝生成，防止 OOM
 func TestCaptchaThrottle(t *testing.T) {
 	s := newCaptchaStore()
+	// 用空 sid（跳过复用）以便每次都真正生成，从而消耗节流额度
 	for i := 0; i < captchaGenMaxPerSec; i++ {
-		if _, _, err := s.generate("sid", "1.2.3.4"); err != nil {
+		if _, _, err := s.generate("", "1.2.3.4"); err != nil {
 			t.Fatalf("第 %d 次生成不应被节流: %v", i+1, err)
 		}
 	}
-	if _, _, err := s.generate("sid", "1.2.3.4"); err != errCaptchaThrottled {
+	if _, _, err := s.generate("", "1.2.3.4"); err != errCaptchaThrottled {
 		t.Fatalf("超出限速应返回 errCaptchaThrottled，实际 %v", err)
 	}
 }
 
-// TestCaptchaSessionKeying 验证：同会话刷新换新图并删旧图；不同会话同 IP 互不影响
+// TestCaptchaSessionKeying 验证：
+//   - 同会话同 IP 在 TTL 内复用同一验证码（反复挑战不作废）；
+//   - 同会话不同 IP 生成新验证码；
+//   - 不同会话同 IP 生成不同验证码。
 func TestCaptchaSessionKeying(t *testing.T) {
 	s := newCaptchaStore()
 
-	// 同会话刷新：新 id，旧图删除
-	id1, _, err := s.generate("sidA", "1.2.3.4")
+	// 同会话同 IP：复用
+	id1, img1, err := s.generate("sidA", "1.2.3.4")
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	id2, _, _ := s.generate("sidA", "1.2.3.4")
-	if id1 == id2 {
-		t.Fatalf("同会话每次生成应产生新验证码")
-	}
-	s.mu.Lock()
-	_, exists := s.m[id1]
-	s.mu.Unlock()
-	if exists {
-		t.Fatalf("同会话旧验证码 %s 应被删除", id1)
+	id2, img2, _ := s.generate("sidA", "1.2.3.4")
+	if id1 != id2 || img1 != img2 {
+		t.Fatalf("同会话同 IP 应复用同一验证码")
 	}
 
-	// 不同会话同 IP：互不影响，两个验证码应同时存在
+	// 同会话不同 IP：换新
+	id3, _, _ := s.generate("sidA", "5.6.7.8")
+	if id3 == id1 {
+		t.Fatalf("同会话不同 IP 应生成新验证码")
+	}
+
+	// 不同会话同 IP：换新，且两者同时存在
 	idA, _, _ := s.generate("sidA", "1.2.3.4")
 	idB, _, _ := s.generate("sidB", "1.2.3.4")
 	if idA == idB {
@@ -157,7 +161,7 @@ func TestUntrustedOverflowServesCaptcha(t *testing.T) {
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			atomic.AddInt32(&backendHits, 1)
 			w.Write([]byte("OK"))
-		}))
+		}), nil)
 
 	do := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, "http://www.zzfls.com.cn/pub/newsList/110", nil)
@@ -205,7 +209,7 @@ func TestUntrustedOverflowSearchBotKeepsRateLimit(t *testing.T) {
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			atomic.AddInt32(&backendHits, 1)
 			w.Write([]byte("OK"))
-		}))
+		}), nil)
 
 	newReq := func() *http.Request {
 		req := httptest.NewRequest(http.MethodGet, "http://www.zzfls.com.cn/pub/newsList/110", nil)
@@ -259,7 +263,7 @@ func TestFloodDoesNotPromoteTrust(t *testing.T) {
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			atomic.AddInt32(&hits, 1)
 			w.Write([]byte("OK"))
-		}))
+		}), nil)
 
 	const ip = "203.0.113.77"
 	do := func(path string) *httptest.ResponseRecorder {
@@ -318,7 +322,7 @@ func TestFloodDoesNotPromoteTrust(t *testing.T) {
 
 // TestTrustedIPTTL 验证：可信 IP 状态有 TTL，过期后失效并被清理，重新累计。
 func TestTrustedIPTTL(t *testing.T) {
-	tr := newIPTrustTracker(600, 5, 86400)
+	tr := newIPTrustTracker(600, 5, 86400, nil)
 
 	tr.setTrusted("1.2.3.4")
 	if !tr.isTrusted("1.2.3.4") {
@@ -342,7 +346,7 @@ func TestTrustedIPTTL(t *testing.T) {
 
 // TestTrustedIPTTLPromotion 验证：recordVisit 达到阈值晋升可信，且 TTL 内持续可信。
 func TestTrustedIPTTLPromotion(t *testing.T) {
-	tr := newIPTrustTracker(600, 2, 86400)
+	tr := newIPTrustTracker(600, 2, 86400, nil)
 	if tr.recordVisit("5.6.7.8") {
 		t.Fatalf("第 1 次访问不应晋升")
 	}
@@ -356,7 +360,7 @@ func TestTrustedIPTTLPromotion(t *testing.T) {
 
 // TestTrustedIPSweepExpired 验证：sweepExpired 清理过期可信 IP，保留未过期项。
 func TestTrustedIPSweepExpired(t *testing.T) {
-	tr := newIPTrustTracker(600, 5, 86400)
+	tr := newIPTrustTracker(600, 5, 86400, nil)
 	tr.setTrusted("1.2.3.4")
 	tr.setTrusted("5.6.7.8")
 
@@ -418,7 +422,7 @@ func TestTrustedIPStillBehaviorChecked(t *testing.T) {
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			atomic.AddInt32(&hits, 1)
 			w.Write([]byte("OK"))
-		}))
+		}), nil)
 
 	const ip = "203.0.113.88"
 	h.trust.setTrusted(ip) // 直接设为可信 IP
@@ -469,7 +473,7 @@ func TestFloodSeenSlidingWindow(t *testing.T) {
 
 // TestTrustEntryReason 验证：可信 IP 记录进入途径（验证码 / 次数晋升）。
 func TestTrustEntryReason(t *testing.T) {
-	tr := newIPTrustTracker(600, 2, 86400)
+	tr := newIPTrustTracker(600, 2, 86400, nil)
 
 	tr.setTrusted("1.2.3.4")       // 验证码进入
 	if tr.recordVisit("5.6.7.8") { // 第 1 次
@@ -513,7 +517,7 @@ func TestUntrustedPerIPRateLimit(t *testing.T) {
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			atomic.AddInt32(&hits, 1)
 			w.Write([]byte("OK"))
-		}))
+		}), nil)
 
 	do := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, "http://www.zzfls.com.cn/pub/newsList/110", nil)

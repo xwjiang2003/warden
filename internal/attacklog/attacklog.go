@@ -112,15 +112,68 @@ func List(limit int) []Event {
 	return out
 }
 
+// writer 批量缓冲写入攻击日志：攒够一批或每 500ms 落库一次，
+// 用单事务批量 INSERT，减少写锁竞争（泛洪时避免与其它连接抢 SQLite 写锁）。
 func writer() {
-	for e := range ch {
-		if db == nil {
-			continue
+	const (
+		batchSize    = 200
+		flushTimeout = 500 * time.Millisecond
+	)
+	buf := make([]Event, 0, batchSize)
+	ticker := time.NewTicker(flushTimeout)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(buf) == 0 {
+			return
 		}
-		if _, err := db.Exec(`INSERT INTO attack_log (time, ip, host, path, category, detail) VALUES (?,?,?,?,?,?)`,
-			e.Time, e.IP, e.Host, e.Path, e.Category, e.Detail); err != nil {
-			log.Printf("[attacklog] 写入失败: %v", err)
+		events := buf
+		buf = buf[:0]
+		writeBatch(events)
+	}
+
+	for {
+		select {
+		case e, ok := <-ch:
+			if !ok {
+				flush()
+				return
+			}
+			buf = append(buf, e)
+			if len(buf) >= batchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
 		}
+	}
+}
+
+// writeBatch 在一个事务里批量插入攻击日志，减少写事务/锁次数。
+func writeBatch(events []Event) {
+	if db == nil || len(events) == 0 {
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("[attacklog] 开启事务失败: %v", err)
+		return
+	}
+	stmt, err := tx.Prepare(`INSERT INTO attack_log (time, ip, host, path, category, detail) VALUES (?,?,?,?,?,?)`)
+	if err != nil {
+		tx.Rollback()
+		log.Printf("[attacklog] 准备语句失败: %v", err)
+		return
+	}
+	for _, e := range events {
+		if _, err := stmt.Exec(e.Time, e.IP, e.Host, e.Path, e.Category, e.Detail); err != nil {
+			log.Printf("[attacklog] 批量写入单条失败: %v", err)
+		}
+	}
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		log.Printf("[attacklog] 提交事务失败: %v", err)
+		tx.Rollback()
 	}
 }
 

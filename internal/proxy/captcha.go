@@ -59,6 +59,7 @@ type captchaItem struct {
 	ip        string
 	expiresAt time.Time
 	attempts  int
+	imgB64    string // 用于复用同一会话的验证码，避免反复挑战作废旧验证码
 }
 
 type captchaStore struct {
@@ -81,11 +82,24 @@ func newCaptchaStore() *captchaStore {
 
 // generate 生成一张验证码，返回 token id 与 base64 PNG。
 // sid 用于区分同 IP 下的不同用户，各会话独立持有验证码。
+// 同一会话已有未过期、且 IP 一致的验证码时直接复用，避免泛洪期反复挑战
+// 不断生成新验证码、把用户正在作答的那张作废。
 func (s *captchaStore) generate(sid, ip string) (id, imgB64 string, err error) {
-	// 节流：泛洪时海量并发生成验证码（PNG 编码）会吃满内存导致 OOM，
-	// 这里限制每秒生成数，超出则直接返回错误由上层丢弃连接。
 	s.mu.Lock()
 	now := time.Now()
+
+	// 复用：同会话已有未过期、且 IP 一致的验证码
+	if sid != "" {
+		if oldID, ok := s.bySID[sid]; ok {
+			if it, ok := s.m[oldID]; ok && it.ip == ip && now.Before(it.expiresAt) {
+				s.mu.Unlock()
+				return oldID, it.imgB64, nil
+			}
+		}
+	}
+
+	// 节流：泛洪时海量并发生成验证码（PNG 编码）会吃满内存导致 OOM，
+	// 这里限制每秒生成数，超出则直接返回错误由上层丢弃连接。
 	if now.Sub(s.genWindowStart) >= time.Second {
 		s.genWindowStart = now
 		s.genCount = 0
@@ -141,7 +155,7 @@ func (s *captchaStore) generate(sid, ip string) (id, imgB64 string, err error) {
 	if oldID, ok := s.bySID[sid]; ok && oldID != id {
 		delete(s.m, oldID)
 	}
-	s.m[id] = &captchaItem{id: id, pos: pos, sid: sid, ip: ip, expiresAt: time.Now().Add(captchaTTL)}
+	s.m[id] = &captchaItem{id: id, pos: pos, sid: sid, ip: ip, expiresAt: time.Now().Add(captchaTTL), imgB64: imgB64}
 	s.bySID[sid] = id
 	s.mu.Unlock()
 

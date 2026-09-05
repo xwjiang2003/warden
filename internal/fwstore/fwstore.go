@@ -10,6 +10,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"warden/internal/sqlutil"
 )
 
 // Block 一条防火墙拉黑记录。
@@ -61,8 +63,12 @@ func (s *Store) Save(ip, reason string, blockedAt time.Time) {
 	if s == nil || s.db == nil {
 		return
 	}
-	if _, err := s.db.Exec(`INSERT OR REPLACE INTO firewall_block (ip, reason, blocked_at) VALUES (?,?,?)`,
-		ip, reason, blockedAt.Format(time.RFC3339)); err != nil {
+	err := sqlutil.Retry(func() error {
+		_, err := s.db.Exec(`INSERT OR REPLACE INTO firewall_block (ip, reason, blocked_at) VALUES (?,?,?)`,
+			ip, reason, blockedAt.Format(time.RFC3339))
+		return err
+	})
+	if err != nil {
 		log.Printf("[fwstore] 保存拉黑失败 %s: %v", ip, err)
 	}
 }
@@ -72,7 +78,11 @@ func (s *Store) Delete(ip string) {
 	if s == nil || s.db == nil {
 		return
 	}
-	if _, err := s.db.Exec(`DELETE FROM firewall_block WHERE ip = ?`, ip); err != nil {
+	err := sqlutil.Retry(func() error {
+		_, err := s.db.Exec(`DELETE FROM firewall_block WHERE ip = ?`, ip)
+		return err
+	})
+	if err != nil {
 		log.Printf("[fwstore] 删除拉黑失败 %s: %v", ip, err)
 	}
 }

@@ -199,22 +199,24 @@ func (fb *FirewallBlocker) cleanOrphans() {
 	}
 	seen := map[string]bool{}
 	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "Rule Name:") {
+		// 表头是本地化的（中文系统为"规则名称:"），不能依赖 "Rule Name:"，
+		// 直接按规则名前缀 "warden-block-" 扫描提取 IP。
+		idx := strings.Index(line, firewallRulePrefix)
+		if idx < 0 {
 			continue
 		}
-		name := strings.TrimSpace(strings.TrimPrefix(line, "Rule Name:"))
-		if !strings.HasPrefix(name, firewallRulePrefix) {
+		fields := strings.Fields(line[idx+len(firewallRulePrefix):])
+		if len(fields) == 0 {
 			continue
 		}
-		ip := strings.TrimPrefix(name, firewallRulePrefix)
+		ip := fields[0]
 		if seen[ip] {
 			continue
 		}
 		seen[ip] = true
 		if _, exists := fb.blockedIPs[ip]; !exists {
 			fb.removeRule(ip)
-			log.Printf("[firewall] 清理孤儿规则 name=%s", name)
+			log.Printf("[firewall] 清理孤儿规则 name=%s%s", firewallRulePrefix, ip)
 		}
 	}
 }
@@ -285,11 +287,16 @@ func (fb *FirewallBlocker) removeRule(ip string) {
 	}
 	ruleName := firewallRulePrefix + ip
 	for _, dir := range []string{"in", "out"} {
+		// 规则可能已被之前的清理删除，先确认存在再删，避免"无匹配规则"误报
+		showOut, _ := exec.Command("netsh", "advfirewall", "firewall", "show", "rule",
+			"name="+ruleName, "dir="+dir).CombinedOutput()
+		if !strings.Contains(string(showOut), ruleName) {
+			continue
+		}
 		cmd := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule",
 			"name="+ruleName, "dir="+dir)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			log.Printf("[firewall] 删除规则失败 name=%s dir=%s: %v (输出: %s)", ruleName, dir, err, strings.TrimSpace(string(out)))
+		if _, err := cmd.CombinedOutput(); err != nil {
+			log.Printf("[firewall] 删除规则失败 name=%s dir=%s: %v", ruleName, dir, err)
 		}
 	}
 }

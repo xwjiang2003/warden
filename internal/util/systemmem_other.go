@@ -6,3 +6,8 @@ package util
 func SystemMemoryMB() uint64 {
 	return 0
 }
+
+// SystemMemoryUsedPercent 返回整机内存使用率（0-100），当前平台未实现
+func SystemMemoryUsedPercent() float64 {
+	return 0
+}

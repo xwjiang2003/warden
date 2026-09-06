@@ -11,6 +11,7 @@ func TestVendorAssetsEmbedded(t *testing.T) {
 		"web/vendor/element-plus.full.min.js",
 		"web/vendor/element-plus.index.css",
 		"web/vendor/axios.min.js",
+		"web/vendor/echarts.min.js",
 	} {
 		if _, err := WebFS.Open(f); err != nil {
 			t.Fatalf("缺少嵌入资源 %s: %v", f, err)

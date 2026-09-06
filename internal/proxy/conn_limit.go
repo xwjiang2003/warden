@@ -93,7 +93,6 @@ type FirewallBlocker struct {
 	mu          sync.Mutex
 	blockedIPs  map[string]time.Time
 	whitelist   []*net.IPNet
-	whitelistIP map[string]bool
 	expireAfter time.Duration
 	enabled     bool
 	blockCount  int64
@@ -103,7 +102,6 @@ type FirewallBlocker struct {
 func NewFirewallBlocker(enabled bool, expireMin int, whitelistCIDRs []string, store *fwstore.Store) *FirewallBlocker {
 	fb := &FirewallBlocker{
 		blockedIPs:  make(map[string]time.Time),
-		whitelistIP: make(map[string]bool),
 		expireAfter: time.Duration(expireMin) * time.Minute,
 		enabled:     enabled && runtime.GOOS == "windows",
 		store:       store,
@@ -127,7 +125,7 @@ func NewFirewallBlocker(enabled bool, expireMin int, whitelistCIDRs []string, st
 		fb.whitelist = append(fb.whitelist, netw)
 	}
 	if fb.enabled {
-		fb.restore()
+		go fb.restore() // 异步恢复拉黑/清理孤儿规则，不阻塞启动
 		log.Printf("[firewall] enabled, auto-expire=%v whitelist=%d ranges", fb.expireAfter, len(fb.whitelist))
 		go fb.reaper()
 	}
@@ -135,23 +133,19 @@ func NewFirewallBlocker(enabled bool, expireMin int, whitelistCIDRs []string, st
 }
 
 func (fb *FirewallBlocker) isWhitelisted(ip string) bool {
-	if fb.whitelistIP[ip] {
-		return true
-	}
 	pip := net.ParseIP(ip)
 	if pip == nil {
 		return true
 	}
 	for _, n := range fb.whitelist {
 		if n.Contains(pip) {
-			fb.whitelistIP[ip] = true
 			return true
 		}
 	}
 	return false
 }
 
-// restore 启动时从数据库恢复拉黑列表：
+// restore 启动时从数据库恢复拉黑列表（异步执行）：
 //   - 仍在有效期内：恢复到内存并补回防火墙规则；
 //   - 已过期：清理孤儿防火墙规则并删除记录；
 //   - 并清理防火墙中不属于当前拉黑列表的孤儿 warden-block-* 规则（旧版本遗留）。
@@ -159,28 +153,37 @@ func (fb *FirewallBlocker) restore() {
 	if fb.store != nil {
 		blocks := fb.store.LoadAll()
 		now := time.Now()
-		restored, cleaned := 0, 0
+		var restoreIPs, removeIPs []string
+		restoreAt := make(map[string]time.Time, len(blocks))
 		for _, b := range blocks {
-			if fb.isWhitelisted(b.IP) {
+			if fb.isWhitelisted(b.IP) || now.Sub(b.BlockedAt) > fb.expireAfter {
+				removeIPs = append(removeIPs, b.IP)
 				fb.store.Delete(b.IP)
-				fb.removeRule(b.IP)
 				continue
 			}
-			if now.Sub(b.BlockedAt) > fb.expireAfter {
-				fb.removeRule(b.IP)
-				fb.store.Delete(b.IP)
-				cleaned++
-				continue
-			}
-			fb.blockedIPs[b.IP] = b.BlockedAt
-			fb.blockCount++
-			ruleName := firewallRulePrefix + b.IP
-			addRule("in", ruleName, b.IP)
-			addRule("out", ruleName, b.IP)
-			restored++
+			restoreIPs = append(restoreIPs, b.IP)
+			restoreAt[b.IP] = b.BlockedAt
 		}
-		if restored > 0 || cleaned > 0 {
-			log.Printf("[firewall] 启动恢复拉黑: restored=%d cleaned=%d", restored, cleaned)
+
+		// 恢复有效拉黑到内存（加锁，与 block/unblock/reaper 并发安全）
+		fb.mu.Lock()
+		for _, ip := range restoreIPs {
+			fb.blockedIPs[ip] = restoreAt[ip]
+			fb.blockCount++
+		}
+		fb.mu.Unlock()
+
+		// 补回防火墙规则 / 删除过期规则（netsh 慢，放在锁外）
+		for _, ip := range restoreIPs {
+			ruleName := firewallRulePrefix + ip
+			addRule("in", ruleName, ip)
+			addRule("out", ruleName, ip)
+		}
+		for _, ip := range removeIPs {
+			fb.removeRule(ip)
+		}
+		if len(restoreIPs) > 0 || len(removeIPs) > 0 {
+			log.Printf("[firewall] 启动恢复拉黑: restored=%d cleaned=%d", len(restoreIPs), len(removeIPs))
 		}
 	}
 	fb.cleanOrphans()
@@ -214,7 +217,10 @@ func (fb *FirewallBlocker) cleanOrphans() {
 			continue
 		}
 		seen[ip] = true
-		if _, exists := fb.blockedIPs[ip]; !exists {
+		fb.mu.Lock()
+		_, exists := fb.blockedIPs[ip]
+		fb.mu.Unlock()
+		if !exists {
 			fb.removeRule(ip)
 			log.Printf("[firewall] 清理孤儿规则 name=%s%s", firewallRulePrefix, ip)
 		}

@@ -34,3 +34,14 @@ func SystemMemoryMB() uint64 {
 	}
 	return m.TotalPhys / 1024 / 1024
 }
+
+// SystemMemoryUsedPercent 返回整机内存使用率（0-100）
+func SystemMemoryUsedPercent() float64 {
+	var m memoryStatusEx
+	m.Length = uint32(unsafe.Sizeof(m))
+	r, _, _ := procGlobalMemoryStatusEx.Call(uintptr(unsafe.Pointer(&m)))
+	if r == 0 {
+		return 0
+	}
+	return float64(m.MemoryLoad)
+}

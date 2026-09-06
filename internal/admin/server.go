@@ -276,20 +276,22 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	runtime.ReadMemStats(&mem)
 
 	stats := map[string]interface{}{
-		"uptime":             formatUptime(time.Since(s.startTime)),
-		"start_time":         s.startTime.Format(time.RFC3339),
-		"go_version":         runtime.Version(),
-		"num_goroutine":      runtime.NumGoroutine(),
-		"num_cpu":            runtime.NumCPU(),
-		"memory_mb":          roundMB(mem.Alloc),
-		"memory_sys_mb":      roundMB(mem.Sys),
-		"system_total_mb":    util.SystemMemoryMB(),
-		"proxy_listen":       s.cfg.Listen,
-		"proxy_backend":      s.cfg.Backend,
-		"cc_defense_enabled": s.cfg.CCDefense.Enabled,
-		"rate_limit_enabled": s.cfg.RateLimit.Enabled,
-		"block_requests":     s.cfg.BlockRequests,
-		"restart_needed":     s.restartNeeded.Load(),
+		"uptime":              formatUptime(time.Since(s.startTime)),
+		"start_time":          s.startTime.Format(time.RFC3339),
+		"go_version":          runtime.Version(),
+		"num_goroutine":       runtime.NumGoroutine(),
+		"num_cpu":             runtime.NumCPU(),
+		"memory_mb":           roundMB(mem.Alloc),
+		"memory_sys_mb":       roundMB(mem.Sys),
+		"system_total_mb":     util.SystemMemoryMB(),
+		"memory_used_percent": util.SystemMemoryUsedPercent(),
+		"cpu_percent":         util.SystemCPUUsagePercent(),
+		"proxy_listen":        s.cfg.Listen,
+		"proxy_backend":       s.cfg.Backend,
+		"cc_defense_enabled":  s.cfg.CCDefense.Enabled,
+		"rate_limit_enabled":  s.cfg.RateLimit.Enabled,
+		"block_requests":      s.cfg.BlockRequests,
+		"restart_needed":      s.restartNeeded.Load(),
 	}
 	writeJSON(w, http.StatusOK, stats)
 }

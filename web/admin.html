@@ -26,6 +26,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .stat-item .value.green{color:#67c23a}
 .stat-item .value.orange{color:#e6a23c}
 .stat-item .value.blue{color:#409eff}
+.cat-list{border:1px solid #ebeef5;border-radius:8px;overflow:hidden}
+.cat-row{display:flex;justify-content:space-between;align-items:center;padding:9px 14px;font-size:13px;color:#606266;border-bottom:1px solid #f2f4f7}
+.cat-row:last-child{border-bottom:none}
+.cat-row b{font-weight:600;color:#303133;font-size:14px}
+.cat-row b.green{color:#67c23a}
+.cat-row b.orange{color:#e6a23c}
 .el-form-item__label{font-weight:500}
 .field-help{font-size:12px;color:#909399;line-height:1.5;margin-top:4px;flex-basis:100%}
 .log-viewer{background:#1e1e1e;color:#d4d4d4;border-radius:6px;padding:16px;font-family:"Cascadia Code","Fira Code",monospace;font-size:12px;line-height:1.7;max-height:500px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
@@ -73,43 +79,68 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
       <template v-if="currentRoute==='dashboard'">
         <div class="page-card" style="margin-bottom:16px">
           <h3>实时拦截监控 <span style="font-weight:400;color:#909399;font-size:12px">（每 2 秒自动刷新）</span></h3>
-          <div class="stats-row">
-            <div class="stat-item"><span class="label">总请求数</span><span class="value blue">{{ metrics.total_requests }}</span></div>
-            <div class="stat-item"><span class="label">拦截总数</span><span class="value orange">{{ metrics.total_blocked }}</span></div>
-            <div class="stat-item"><span class="label">拦截率</span><span class="value orange">{{ blockRate }}%</span></div>
-            <div class="stat-item"><span class="label">实时 QPS</span><span class="value blue">{{ qps }}</span></div>
+          <div class="stats-row" style="margin-bottom:16px">
+            <div class="stat-item"><span class="label">总请求数</span><span class="value blue" style="font-size:30px">{{ metrics.total_requests }}</span></div>
+            <div class="stat-item"><span class="label">拦截总数</span><span class="value orange" style="font-size:30px">{{ metrics.total_blocked }}</span></div>
+            <div class="stat-item"><span class="label">拦截率</span><span class="value orange" style="font-size:30px">{{ blockRate }}%</span></div>
+            <div class="stat-item"><span class="label">实时 QPS</span><span class="value blue" style="font-size:30px">{{ qps }}</span></div>
           </div>
-          <div class="stats-row" style="margin-bottom:0">
-            <div class="stat-item"><span class="label">WAF 规则拦截</span><span class="value">{{ metrics.waf_blocked }}</span></div>
-            <div class="stat-item"><span class="label">CC 防御拦截</span><span class="value">{{ metrics.cc_blocked }}</span></div>
-            <div class="stat-item"><span class="label">验证码挑战</span><span class="value">{{ metrics.cc_challenged }}</span></div>
-            <div class="stat-item"><span class="label">频率限制(429)</span><span class="value">{{ metrics.rate_limit_blocked }}</span></div>
-            <div class="stat-item"><span class="label">IP 归属拦截</span><span class="value">{{ metrics.ip_check_blocked }}</span></div>
-          </div>
-          <div class="stats-row" style="margin-bottom:0">
-            <div class="stat-item"><span class="label">防火墙拉黑</span><span class="value">{{ metrics.firewall_blocked }}</span></div>
-            <div class="stat-item"><span class="label">连接限制丢弃</span><span class="value">{{ metrics.conn_limit_dropped }}</span></div>
-            <div class="stat-item"><span class="label">白名单放行</span><span class="value green">{{ metrics.whitelist_pass }}</span></div>
-            <div class="stat-item"><span class="label">监控模式</span><span class="value" :class="config.block_requests?'orange':'green'">{{ config.block_requests ? '拦截' : '仅记录' }}</span></div>
-          </div>
-          <div class="stats-row" style="margin-bottom:0">
-            <div class="stat-item"><span class="label">验证码通过</span><span class="value green">{{ metrics.captcha_passed }}</span></div>
-            <div class="stat-item"><span class="label">验证码失败</span><span class="value orange">{{ metrics.captcha_failed }}</span></div>
-            <div class="stat-item"><span class="label">挑战通过率</span><span class="value blue">{{ captchaSuccessRate }}%</span></div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start">
+            <div>
+              <div style="font-size:13px;color:#606266;font-weight:600;margin-bottom:8px">拦截分类占比</div>
+              <div id="block-pie" style="height:230px"></div>
+            </div>
+            <div>
+              <div style="font-size:13px;color:#606266;font-weight:600;margin-bottom:8px">分类明细</div>
+              <div class="cat-list">
+                <div class="cat-row"><span>WAF 规则拦截</span><b>{{ metrics.waf_blocked }}</b></div>
+                <div class="cat-row"><span>CC 防御拦截</span><b>{{ metrics.cc_blocked }}</b></div>
+                <div class="cat-row"><span>验证码挑战</span><b>{{ metrics.cc_challenged }}</b></div>
+                <div class="cat-row"><span>频率限制</span><b>{{ metrics.rate_limit_blocked }}</b></div>
+                <div class="cat-row"><span>IP 归属拦截</span><b>{{ metrics.ip_check_blocked }}</b></div>
+                <div class="cat-row"><span>防火墙拉黑</span><b>{{ metrics.firewall_blocked }}</b></div>
+                <div class="cat-row"><span>连接限制丢弃</span><b>{{ metrics.conn_limit_dropped }}</b></div>
+                <div class="cat-row"><span>白名单放行</span><b class="green">{{ metrics.whitelist_pass }}</b></div>
+                <div class="cat-row"><span>验证码通过 / 失败</span><b><span class="green">{{ metrics.captcha_passed }}</span> / <span class="orange">{{ metrics.captcha_failed }}</span></b></div>
+                <div class="cat-row"><span>挑战通过率</span><b>{{ captchaSuccessRate }}%</b></div>
+                <div class="cat-row"><span>监控模式</span><b :class="config.block_requests?'orange':'green'">{{ config.block_requests ? '拦截' : '仅记录' }}</b></div>
+              </div>
+            </div>
           </div>
         </div>
-        <div class="stats-row">
-          <div class="stat-item"><span class="label">运行时间</span><span class="value blue" style="font-size:18px">{{ stats.uptime }}</span></div>
-          <div class="stat-item"><span class="label">CC 防御</span><span class="value" :class="stats.cc_defense_enabled?'green':'orange'">{{ stats.cc_defense_enabled ? '已开启' : '已关闭' }}</span></div>
-          <div class="stat-item"><span class="label">频率限制</span><span class="value" :class="stats.rate_limit_enabled?'green':'orange'">{{ stats.rate_limit_enabled ? '已开启' : '已关闭' }}</span></div>
-          <div class="stat-item"><span class="label">协程数</span><span class="value blue">{{ stats.num_goroutine }}</span></div>
+        <div class="page-card" style="margin-bottom:16px">
+          <h3>流量趋势 <span style="font-weight:400;color:#909399;font-size:12px">（QPS 与拦截率，最近 2 分钟）</span></h3>
+          <div id="trend-chart" style="height:260px"></div>
         </div>
-        <div class="stats-row">
-          <div class="stat-item"><span class="label">堆内存(使用)</span><span class="value">{{ stats.memory_mb.toFixed(1) }} MB</span></div>
-          <div class="stat-item"><span class="label">进程占用(OS)</span><span class="value">{{ stats.memory_sys_mb.toFixed(1) }} MB</span></div>
-          <div class="stat-item"><span class="label">系统总内存</span><span class="value">{{ stats.system_total_mb >= 1024 ? (stats.system_total_mb / 1024).toFixed(1) + ' GB' : stats.system_total_mb + ' MB' }}</span></div>
-          <div class="stat-item"><span class="label">CPU 核心</span><span class="value">{{ stats.num_cpu }}</span></div>
-          <div class="stat-item"><span class="label">Go 版本</span><span class="value" style="font-size:16px">{{ stats.go_version }}</span></div>
+        <div class="page-card" style="margin-bottom:16px">
+          <h3>系统状态</h3>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 48px">
+            <div>
+              <div style="display:flex;justify-content:space-between;font-size:13px;color:#606266;margin-bottom:4px">
+                <span>CPU 使用率</span><span style="font-weight:600">{{ cpuPercent }}%</span>
+              </div>
+              <el-progress :percentage="cpuPercent" :stroke-width="12" :color="cpuColor" :show-text="false" />
+            </div>
+            <div>
+              <div style="display:flex;justify-content:space-between;font-size:13px;color:#606266;margin-bottom:4px">
+                <span>内存使用率</span><span style="font-weight:600">{{ memPercent }}%</span>
+              </div>
+              <el-progress :percentage="memPercent" :stroke-width="12" :color="memColor" :show-text="false" />
+            </div>
+          </div>
+          <div class="stats-row" style="margin-top:16px">
+            <div class="stat-item"><span class="label">运行时间</span><span class="value blue" style="font-size:16px">{{ stats.uptime }}</span></div>
+            <div class="stat-item"><span class="label">协程数</span><span class="value blue">{{ stats.num_goroutine }}</span></div>
+            <div class="stat-item"><span class="label">Go 版本</span><span class="value" style="font-size:15px">{{ stats.go_version }}</span></div>
+            <div class="stat-item"><span class="label">CPU 核心</span><span class="value">{{ stats.num_cpu }}</span></div>
+          </div>
+          <div class="stats-row" style="margin-top:12px">
+            <div class="stat-item"><span class="label">堆内存(使用)</span><span class="value">{{ stats.memory_mb.toFixed(1) }} MB</span></div>
+            <div class="stat-item"><span class="label">进程占用(OS)</span><span class="value">{{ stats.memory_sys_mb.toFixed(1) }} MB</span></div>
+            <div class="stat-item"><span class="label">系统总内存</span><span class="value">{{ stats.system_total_mb >= 1024 ? (stats.system_total_mb / 1024).toFixed(1) + ' GB' : stats.system_total_mb + ' MB' }}</span></div>
+            <div class="stat-item"><span class="label">CC 防御</span><span class="value" :class="stats.cc_defense_enabled?'green':'orange'">{{ stats.cc_defense_enabled ? '已开启' : '已关闭' }}</span></div>
+            <div class="stat-item"><span class="label">频率限制</span><span class="value" :class="stats.rate_limit_enabled?'green':'orange'">{{ stats.rate_limit_enabled ? '已开启' : '已关闭' }}</span></div>
+          </div>
         </div>
         <div class="page-card">
           <h3>代理信息</h3>
@@ -850,6 +881,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 <script src="vendor/vue-router.global.prod.js"></script>
 <script src="vendor/element-plus.full.min.js"></script>
 <script src="vendor/axios.min.js"></script>
+<script src="vendor/echarts.min.js"></script>
 <script>
 const { createApp, ref, reactive, computed, onMounted } = Vue
 const { createRouter, createWebHashHistory } = VueRouter
@@ -886,7 +918,7 @@ function defaultConfig() {
 const app = createApp({
   setup() {
     const config = reactive(defaultConfig())
-    const stats = reactive({ uptime: '-', start_time: '-', go_version: '-', num_goroutine: 0, num_cpu: 0, memory_mb: 0, memory_sys_mb: 0, system_total_mb: 0, proxy_listen: '-', proxy_backend: '-', cc_defense_enabled: false, rate_limit_enabled: false, block_requests: false })
+    const stats = reactive({ uptime: '-', start_time: '-', go_version: '-', num_goroutine: 0, num_cpu: 0, memory_mb: 0, memory_sys_mb: 0, system_total_mb: 0, memory_used_percent: 0, cpu_percent: 0, proxy_listen: '-', proxy_backend: '-', cc_defense_enabled: false, rate_limit_enabled: false, block_requests: false })
     const metrics = reactive({ total_requests: 0, total_blocked: 0, waf_blocked: 0, cc_blocked: 0, cc_challenged: 0, captcha_passed: 0, captcha_failed: 0, rate_limit_blocked: 0, conn_limit_dropped: 0, ip_check_blocked: 0, firewall_blocked: 0, whitelist_pass: 0 })
     const qps = ref(0)
     const blockRate = ref('0.00')
@@ -928,6 +960,78 @@ const app = createApp({
       return m[currentRoute.value] || '管理后台'
     })
     const blockType = computed(() => config.block_requests ? 'danger' : 'success')
+    const cpuPercent = computed(() => Math.round(Number(stats.cpu_percent || 0) * 10) / 10)
+    const memPercent = computed(() => Math.round(Number(stats.memory_used_percent || 0) * 10) / 10)
+    const cpuColor = computed(() => {
+      const v = cpuPercent.value
+      return v >= 85 ? '#f56c6c' : (v >= 60 ? '#e6a23c' : '#67c23a')
+    })
+    const memColor = computed(() => {
+      const v = memPercent.value
+      return v >= 85 ? '#f56c6c' : (v >= 60 ? '#e6a23c' : '#67c23a')
+    })
+    const trend = ref([])
+    const MAX_TREND = 60
+    let trendChart = null
+    function renderTrend() {
+      const el = document.getElementById('trend-chart')
+      if (!el) {
+        if (trendChart) { trendChart.dispose(); trendChart = null }
+        return
+      }
+      if (!window.echarts) return
+      if (!trendChart) trendChart = echarts.init(el)
+      trendChart.setOption({
+        tooltip: { trigger: 'axis' },
+        legend: { data: ['QPS', '拦截率%'] },
+        grid: { left: 48, right: 48, top: 36, bottom: 28 },
+        xAxis: { type: 'category', boundaryGap: false, data: trend.value.map(p => p.t) },
+        yAxis: [
+          { type: 'value', name: 'QPS', minInterval: 1 },
+          { type: 'value', name: '拦截率', max: 100 }
+        ],
+        series: [
+          { name: 'QPS', type: 'line', smooth: true, showSymbol: false, areaStyle: { opacity: 0.12 }, data: trend.value.map(p => p.qps) },
+          { name: '拦截率%', type: 'line', smooth: true, showSymbol: false, yAxisIndex: 1, data: trend.value.map(p => p.blockRate) }
+        ]
+      })
+    }
+
+    // 拦截分类占比（饼图）
+    let blockPie = null
+    function blockCategories() {
+      return [
+        { name: 'WAF 规则', value: metrics.waf_blocked || 0 },
+        { name: 'CC 防御', value: metrics.cc_blocked || 0 },
+        { name: '验证码挑战', value: metrics.cc_challenged || 0 },
+        { name: '频率限制', value: metrics.rate_limit_blocked || 0 },
+        { name: 'IP 归属', value: metrics.ip_check_blocked || 0 },
+        { name: '防火墙拉黑', value: metrics.firewall_blocked || 0 },
+        { name: '连接限制', value: metrics.conn_limit_dropped || 0 },
+      ]
+    }
+    function renderBlockPie() {
+      const el = document.getElementById('block-pie')
+      if (!el) {
+        if (blockPie) { blockPie.dispose(); blockPie = null }
+        return
+      }
+      if (!window.echarts) return
+      if (!blockPie) blockPie = echarts.init(el)
+      const data = blockCategories().filter(c => c.value > 0)
+      blockPie.setOption({
+        tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
+        legend: { orient: 'vertical', right: 0, top: 'middle', textStyle: { fontSize: 12 } },
+        series: [{
+          type: 'pie',
+          radius: ['42%', '70%'],
+          center: ['38%', '50%'],
+          avoidLabelOverlap: false,
+          label: { show: false },
+          data: data.length ? data : [{ name: '无拦截', value: 1, itemStyle: { color: '#e4e7ed' } }]
+        }]
+      })
+    }
 
     // 数组文本 ↔ config 同步
     function arrToText(arr) { return (arr || []).join('\n') }
@@ -1008,6 +1112,11 @@ const app = createApp({
         blockRate.value = data.total_requests > 0 ? (data.total_blocked / data.total_requests * 100).toFixed(2) : '0.00'
         // 挑战通过率 = 通过次数 ÷ 挑战次数（而非 通过/(通过+失败)，因为大多数挑战无人提交）
         captchaSuccessRate.value = (data.cc_challenged || 0) > 0 ? ((data.captcha_passed || 0) / data.cc_challenged * 100).toFixed(2) : '0.00'
+        // 采集趋势数据并刷新图表
+        trend.value.push({ t: new Date().toLocaleTimeString(), qps: qps.value, blockRate: Number(blockRate.value) })
+        if (trend.value.length > MAX_TREND) trend.value.shift()
+        renderTrend()
+        renderBlockPie()
       } catch (e) { /* 静默失败 */ }
     }
 
@@ -1156,10 +1265,17 @@ const app = createApp({
       } finally { logsLoading.value = false }
     }
 
+    let attackLogsTimer = null
     function navigate(index) {
       currentRoute.value = index
+      // 攻击日志仅在进入该页时轮询，离开即停止，避免全局空刷 /api/attack_logs
+      if (index === 'attacklogs') {
+        loadAttackLogs()
+        if (!attackLogsTimer) attackLogsTimer = setInterval(loadAttackLogs, 3000)
+      } else {
+        if (attackLogsTimer) { clearInterval(attackLogsTimer); attackLogsTimer = null }
+      }
       if (index === 'logs') loadLogs()
-      if (index === 'attacklogs') loadAttackLogs()
       if (index === 'trustedips') loadTrustedIPs(1)
     }
 
@@ -1167,16 +1283,15 @@ const app = createApp({
       loadConfig()
       loadStats()
       loadMetrics()
-      setInterval(loadStats, 30000) // 每 30s 刷新统计
-      setInterval(loadMetrics, 2000) // 每 2s 刷新拦截指标
-      setInterval(loadAttackLogs, 3000) // 每 3s 刷新攻击日志
+      setInterval(loadStats, 30000) // 每 30s 刷新统计（系统状态/重启标志）
+      setInterval(loadMetrics, 2000) // 每 2s 刷新拦截指标（仪表盘/趋势图）
     })
 
     return {
       config, stats, metrics, qps, blockRate, captchaSuccessRate, trustedIPs, trustedIPsLoading, trustedIPsTotal, trustedIPsPage, trustedIPsPageSize, currentRoute, saving, restartNeeded, restarting, configLoaded, logsLoading, logLines, logFile,
       hotPathsText, ccPathsText, scannerPathsText, scannerUAsText, customScriptUAsText, customBlockPathsText,
       whitelistCIDRsText, firewallWhitelistCIDRsText, blacklistCIDRsText, urlAllowlistText, urlBlocklistText, alertToText, emailTesting,
-      pageTitle, blockType,
+      pageTitle, blockType, cpuColor, memColor, cpuPercent, memPercent,
       navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, sendTestEmail, loadLogs, loadAttackLogs, clearAttackLogs, attackLogs,
       categoryType, fmtDetail, loadTrustedIPs, onTrustedPageSize, fmtTime
     }

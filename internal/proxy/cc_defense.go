@@ -32,6 +32,30 @@ func isSearchBot(ua string) bool {
 	return false
 }
 
+// staticExts 静态资源扩展名：一篇文章会并发加载大量图片/样式/脚本，
+// 属正常浏览器行为，不应进入 CC 行为检测/限速/挑战。
+var staticExts = []string{
+	".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp",
+	".css", ".js", ".map", ".woff", ".woff2", ".ttf", ".eot", ".otf",
+	".mp3", ".mp4", ".webm", ".pdf", ".zip", ".gz", ".tar",
+}
+
+// isStaticResource 判断路径是否为静态资源（按扩展名或常见静态目录前缀）。
+func isStaticResource(path string) bool {
+	lower := strings.ToLower(path)
+	for _, ext := range staticExts {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	for _, p := range []string{"/static", "/assets", "/upload", "/images", "/img", "/js", "/css", "/fonts"} {
+		if strings.HasPrefix(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // ---- IP 信任追踪器 (sync.Map 无锁版本) ----
 // 已信任的 IP 用 sync.Map 做 O(1) 无锁查找
 // 未信任的 IP 用 mutex+map 计数，到阈值后迁移到 sync.Map
@@ -603,7 +627,7 @@ func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *Fi
 		cfg:          cfg,
 		next:         next,
 	}
-	h.trust.restore()
+	go h.trust.restore() // 异步恢复可信 IP，不阻塞启动
 	log.Printf("[cc_defense] enabled trusted_ips=%d/%ds ttl=%ds global_qps=%d burst=%d new_ip_qps=%d burst=%d per_ip_qps=%d burst=%d flood_ratio=%d%%",
 		cfg.TrustIPMinVisits, cfg.TrustIPWindowSec, cfg.TrustIPTTLSec, cfg.GlobalQPSMax, cfg.GlobalQPSBurst,
 		cfg.NewIPQPSMax, cfg.NewIPQPSBurst, cfg.UntrustedIPQPSMax, cfg.UntrustedIPBurst, cfg.NewIPRatioBlock)
@@ -768,6 +792,13 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			util.CloseConnectionSilently(w)
 			return
 		}
+	}
+
+	// 静态资源直接放行：一篇文章会并发加载大量图片/样式/脚本，
+	// 属正常浏览器行为，不做行为检测/每IP限速/挑战，避免误伤。
+	if isStaticResource(r.URL.Path) {
+		h.next.ServeHTTP(w, r)
+		return
 	}
 
 	// 快速路径：可信会话（cookie，区分同 IP 多用户）→ 直接放行

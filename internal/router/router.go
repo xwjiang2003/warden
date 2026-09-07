@@ -19,7 +19,10 @@ import (
 var sharedTransport = &http.Transport{
 	MaxIdleConns:          200,
 	MaxIdleConnsPerHost:   100,
-	IdleConnTimeout:       90 * time.Second,
+	// 空闲连接回收要早于上游( Tomcat )的 connectionTimeout，否则 WAF 会复用
+	// 已被 Tomcat 关闭的连接，触发 "connection reset" → 502/重试 → 连接抖动。
+	// Tomcat 建议 connectionTimeout=20s，这里取 15s（始终早于上游回收）。
+	IdleConnTimeout:       15 * time.Second,
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 1 * time.Second,
 	ResponseHeaderTimeout: 60 * time.Second,

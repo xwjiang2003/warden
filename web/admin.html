@@ -893,7 +893,7 @@ const api = axios.create({ baseURL: '/api', timeout: 10000 })
 function defaultConfig() {
   return {
     listen: ':80', backend: 'http://127.0.0.1:81', rules_file: 'rules/coraza.conf',
-    read_timeout_sec: 60, write_timeout_sec: 60, idle_timeout_sec: 120,
+    read_timeout_sec: 60, write_timeout_sec: 60, idle_timeout_sec: 60,
     access_log: 'logs/access.log',
     access_log_rotate: { mode: 'daily', max_size_mb: 100 },
     attack_log_retain_days: 90,

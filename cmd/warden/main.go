@@ -128,13 +128,14 @@ func main() {
 
 	readTO := util.DurationSec(cfg.ReadTimeoutSec, 60)
 	writeTO := util.DurationSec(cfg.WriteTimeoutSec, 60)
-	idleTO := util.DurationSec(cfg.IdleTimeoutSec, 120)
+	idleTO := util.DurationSec(cfg.IdleTimeoutSec, 60)
 
 	srv := &http.Server{
-		Handler:      metricsMiddleware(mux),
-		ReadTimeout:  readTO,
-		WriteTimeout: writeTO,
-		IdleTimeout:  idleTO,
+		Handler:           metricsMiddleware(mux),
+		ReadTimeout:       readTO,
+		ReadHeaderTimeout: 10 * time.Second, // 慢速攻击防护：限制读取请求头的最长时间
+		WriteTimeout:      writeTO,
+		IdleTimeout:       idleTO,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			proxy.ConnTimeoutTuning(c)
 			return context.WithValue(ctx, "conn", c)

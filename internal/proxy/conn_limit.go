@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"log"
 	"math/rand"
 	"net"
@@ -176,8 +177,13 @@ func (fb *FirewallBlocker) restore() {
 		// 补回防火墙规则 / 删除过期规则（netsh 慢，放在锁外）
 		for _, ip := range restoreIPs {
 			ruleName := firewallRulePrefix + ip
-			addRule("in", ruleName, ip)
-			addRule("out", ruleName, ip)
+			// 规则可能已存在（进程重启但防火墙规则仍在），避免重复添加
+			if !ruleExists(ruleName, "in", ip) {
+				addRule("in", ruleName, ip)
+			}
+			if !ruleExists(ruleName, "out", ip) {
+				addRule("out", ruleName, ip)
+			}
 		}
 		for _, ip := range removeIPs {
 			fb.removeRule(ip)
@@ -201,6 +207,7 @@ func (fb *FirewallBlocker) cleanOrphans() {
 		return
 	}
 	seen := map[string]bool{}
+	var orphans []string
 	for _, line := range strings.Split(string(out), "\n") {
 		// 表头是本地化的（中文系统为"规则名称:"），不能依赖 "Rule Name:"，
 		// 直接按规则名前缀 "warden-block-" 扫描提取 IP。
@@ -221,9 +228,14 @@ func (fb *FirewallBlocker) cleanOrphans() {
 		_, exists := fb.blockedIPs[ip]
 		fb.mu.Unlock()
 		if !exists {
-			fb.removeRule(ip)
-			log.Printf("[firewall] 清理孤儿规则 name=%s%s", firewallRulePrefix, ip)
+			orphans = append(orphans, ip)
 		}
+	}
+	for _, ip := range orphans {
+		fb.removeRule(ip)
+	}
+	if len(orphans) > 0 {
+		log.Printf("[firewall] 清理孤儿规则 %d 条", len(orphans))
 	}
 }
 
@@ -253,12 +265,14 @@ func (fb *FirewallBlocker) block(ip, reason string) {
 // unblock 解除一个 IP 的防火墙拉黑（验证码通过时调用）。
 func (fb *FirewallBlocker) unblock(ip string) {
 	fb.mu.Lock()
-	defer fb.mu.Unlock()
 	if _, exists := fb.blockedIPs[ip]; !exists {
+		fb.mu.Unlock()
 		return
 	}
 	delete(fb.blockedIPs, ip)
 	fb.blockCount--
+	fb.mu.Unlock()
+	// netsh 较慢，放在锁外执行，避免阻塞 block()/reaper
 	fb.removeRule(ip)
 	if fb.store != nil {
 		fb.store.Delete(ip)
@@ -270,21 +284,26 @@ func addRule(dir, name, ip string) {
 	if runtime.GOOS != "windows" {
 		return
 	}
-	cmd := exec.Command("netsh", "advfirewall", "firewall", "add", "rule",
+	// 同步执行 + 5 秒超时：避免攻击期间大量拉黑时用 go cmd.Wait() 堆积协程、
+	// 或 netsh 挂起导致协程/句柄泄漏。
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "netsh", "advfirewall", "firewall", "add", "rule",
 		"name="+name,
 		"dir="+dir,
 		"action=block",
 		"remoteip="+ip,
 		"enable=yes")
-	if err := cmd.Start(); err != nil {
-		log.Printf("[firewall] add rule %s: %v", name, err)
-		return
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("[firewall] 添加规则失败 name=%s dir=%s: %v (输出: %s)", name, dir, err, strings.TrimSpace(string(out)))
 	}
-	go func() {
-		if err := cmd.Wait(); err != nil {
-			log.Printf("[firewall] 添加规则失败 name=%s dir=%s: %v", name, dir, err)
-		}
-	}()
+}
+
+// ruleExists 判断指定方向/远端 IP 的防火墙规则是否已存在，供启动恢复时避免重复添加。
+func ruleExists(name, dir, ip string) bool {
+	out, err := exec.Command("netsh", "advfirewall", "firewall", "show", "rule",
+		"name="+name, "dir="+dir, "remoteip="+ip).CombinedOutput()
+	return err == nil && strings.Contains(string(out), name)
 }
 
 func (fb *FirewallBlocker) removeRule(ip string) {
@@ -293,16 +312,18 @@ func (fb *FirewallBlocker) removeRule(ip string) {
 	}
 	ruleName := firewallRulePrefix + ip
 	for _, dir := range []string{"in", "out"} {
-		// 规则可能已被之前的清理删除，先确认存在再删，避免"无匹配规则"误报
+		// 用 remoteip= 精确限定目标规则：netsh 的 name= 是前缀匹配，
+		// "warden-block-1.2.3.4" 会同时命中 "warden-block-1.2.3.40" 等，导致删错或漏删；
+		// 加上 remoteip= 后仅命中本 IP 的规则。
 		showOut, _ := exec.Command("netsh", "advfirewall", "firewall", "show", "rule",
-			"name="+ruleName, "dir="+dir).CombinedOutput()
+			"name="+ruleName, "dir="+dir, "remoteip="+ip).CombinedOutput()
 		if !strings.Contains(string(showOut), ruleName) {
 			continue
 		}
 		cmd := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule",
-			"name="+ruleName, "dir="+dir)
-		if _, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("[firewall] 删除规则失败 name=%s dir=%s: %v", ruleName, dir, err)
+			"name="+ruleName, "dir="+dir, "remoteip="+ip)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			log.Printf("[firewall] 删除规则失败 name=%s dir=%s: %v (输出: %s)", ruleName, dir, err, strings.TrimSpace(string(out)))
 		}
 	}
 }
@@ -310,27 +331,44 @@ func (fb *FirewallBlocker) removeRule(ip string) {
 func (fb *FirewallBlocker) reaper() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		fb.mu.Lock()
-		now := time.Now()
-		var expired []string
-		for ip, blockedAt := range fb.blockedIPs {
-			if now.Sub(blockedAt) > fb.expireAfter {
-				expired = append(expired, ip)
-			}
+	orphanTicker := time.NewTicker(30 * time.Minute)
+	defer orphanTicker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			fb.reapExpired()
+		case <-orphanTicker.C:
+			// 定期全量清扫孤儿规则，自愈运行期删除失败/崩溃遗留的规则
+			fb.cleanOrphans()
 		}
-		for _, ip := range expired {
-			delete(fb.blockedIPs, ip)
-			fb.removeRule(ip)
-			if fb.store != nil {
-				fb.store.Delete(ip)
-			}
+	}
+}
+
+func (fb *FirewallBlocker) reapExpired() {
+	fb.mu.Lock()
+	now := time.Now()
+	var expired []string
+	for ip, blockedAt := range fb.blockedIPs {
+		if now.Sub(blockedAt) > fb.expireAfter {
+			expired = append(expired, ip)
 		}
-		n := len(expired)
-		fb.mu.Unlock()
-		if n > 0 {
-			log.Printf("[firewall] unblocked %d expired IPs, active=%d", n, fb.blockCount-int64(n))
+	}
+	for _, ip := range expired {
+		delete(fb.blockedIPs, ip)
+	}
+	n := len(expired)
+	fb.blockCount -= int64(n)
+	active := fb.blockCount
+	fb.mu.Unlock()
+	// netsh 较慢，放在锁外执行，避免阻塞 block()/unblock()
+	for _, ip := range expired {
+		fb.removeRule(ip)
+		if fb.store != nil {
+			fb.store.Delete(ip)
 		}
+	}
+	if n > 0 {
+		log.Printf("[firewall] unblocked %d expired IPs, active=%d", n, active)
 	}
 }
 

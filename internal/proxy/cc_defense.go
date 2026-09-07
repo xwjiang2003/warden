@@ -346,6 +346,7 @@ type newIPFloodDetector struct {
 	recentNew int64
 	recentOld int64
 	windowAt  int64 // UnixNano
+	lastLog   int64 // 上次打印 flood 日志时间(UnixNano)，限频用
 }
 
 func newNewIPFloodDetector(checkSec, ratioPct, minReqs, seenTTLSec int) *newIPFloodDetector {
@@ -404,8 +405,12 @@ func (d *newIPFloodDetector) isFlooding(ip string) bool {
 	}
 	ratio := int(atomic.LoadInt64(&d.recentNew) * 100 / total)
 	if ratio >= d.ratioPct {
-		log.Printf("[cc_defense] new-ip flood: ratio=%d%% total=%d new=%d old=%d",
-			ratio, total, atomic.LoadInt64(&d.recentNew), atomic.LoadInt64(&d.recentOld))
+		// 限频打印：最多每 10 秒一条，避免大流量下每条请求都写日志拖垮 CPU
+		if nowNano-d.lastLog >= int64(10*time.Second) {
+			d.lastLog = nowNano
+			log.Printf("[cc_defense] new-ip flood: ratio=%d%% total=%d new=%d old=%d",
+				ratio, total, atomic.LoadInt64(&d.recentNew), atomic.LoadInt64(&d.recentOld))
+		}
 		return true
 	}
 	return false
@@ -585,6 +590,46 @@ func (st *sessionTracker) record(sessionID, ip string) (anomaly bool, reason str
 	return false, ""
 }
 
+// ---- 高频日志限频 ----
+// 大流量攻击下每个请求都写日志会显著拖累 CPU 与磁盘 IO；
+// 对热点日志按 key 限频（同一 key 默认 10 秒最多一条）。
+
+const ccLogThrottleInterval = 10 * time.Second
+
+type logThrottler struct {
+	mu       sync.Mutex
+	last     map[string]int64
+	interval time.Duration
+}
+
+func newLogThrottler(interval time.Duration) *logThrottler {
+	return &logThrottler{last: make(map[string]int64), interval: interval}
+}
+
+// allow 判断 key 距上次打印是否已超过 interval；是则记录并返回 true。
+func (t *logThrottler) allow(key string) bool {
+	now := time.Now().UnixNano()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if now-t.last[key] >= int64(t.interval) {
+		t.last[key] = now
+		return true
+	}
+	return false
+}
+
+// gc 清理超过 5 倍 interval 未活动的 key，避免攻击期 IP 轮换导致 map 无界增长。
+func (t *logThrottler) gc() {
+	cutoff := time.Now().UnixNano() - int64(t.interval)*5
+	t.mu.Lock()
+	for k, v := range t.last {
+		if v < cutoff {
+			delete(t.last, k)
+		}
+	}
+	t.mu.Unlock()
+}
+
 // ---- 主处理器 ----
 
 type CCDefenseHandler struct {
@@ -601,6 +646,7 @@ type CCDefenseHandler struct {
 	trustedSessions sync.Map // sid -> time.Time，验证码通过后的可信会话
 	blockForeign    bool
 	blockCloud      bool
+	throttle        *logThrottler
 	cfg             config.CCDefenseConfig
 	next            http.Handler
 }
@@ -624,6 +670,7 @@ func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *Fi
 		captcha:      newCaptchaStore(),
 		blockForeign: ipCfg.BlockForeignEnabled(),
 		blockCloud:   ipCfg.BlockCloudEnabled(),
+		throttle:     newLogThrottler(ccLogThrottleInterval),
 		cfg:          cfg,
 		next:         next,
 	}
@@ -681,6 +728,9 @@ func (h *CCDefenseHandler) reaper() {
 
 		// 4) 每 IP 限速桶：删除空闲超过 10 分钟的 IP
 		h.perIP.gc(10 * time.Minute)
+
+		// 5) 日志限频 key：清理长期未活动的 key，避免无界增长
+		h.throttle.gc()
 	}
 }
 
@@ -747,7 +797,9 @@ func (h *CCDefenseHandler) handleCaptchaVerify(w http.ResponseWriter, r *http.Re
 // blockIfBotLike 行为检测：请求间隔均匀或路径单一 → 返回验证码挑战。返回是否已处置。
 func (h *CCDefenseHandler) blockIfBotLike(w http.ResponseWriter, r *http.Request, ip string) bool {
 	if h.behavior.isBotLike(ip, r.URL.Path) {
-		log.Printf("[cc_defense] bot-like behavior ip=%s, serving captcha challenge", ip)
+		if h.throttle.allow("bot:" + ip) {
+			log.Printf("[cc_defense] bot-like behavior ip=%s, serving captcha challenge", ip)
+		}
 		attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "bot-like")
 		metrics.CCChallenged.Inc()
 		h.serveCaptcha(w, r, ip)
@@ -760,7 +812,9 @@ func (h *CCDefenseHandler) blockIfBotLike(w http.ResponseWriter, r *http.Request
 func (h *CCDefenseHandler) blockIfSessionAnomaly(w http.ResponseWriter, r *http.Request, ip string) bool {
 	sid := extractSessionID(r.URL.Path)
 	if anom, reason := h.sessions.record(sid, ip); anom {
-		log.Printf("[cc_defense] session anomaly ip=%s reason=%s, closing connection", ip, reason)
+		if h.throttle.allow("anom:" + ip) {
+			log.Printf("[cc_defense] session anomaly ip=%s reason=%s, closing connection", ip, reason)
+		}
 		attacklog.Record(ip, r.Host, r.URL.Path, "CC会话", reason)
 		metrics.CCBlocked.Inc()
 		util.CloseConnectionSilently(w)
@@ -786,7 +840,9 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// IP 归属检测：按开关分别拦截国外 / 云厂商 IP
 	if h.ipChecker != nil && (h.blockForeign || h.blockCloud) {
 		if blocked, reason := h.ipChecker.isBlockedBy(ip, h.blockForeign, h.blockCloud); blocked {
-			log.Printf("[cc_defense] IP blocked ip=%s reason=%s", ip, reason)
+			if h.throttle.allow("geo:" + ip) {
+				log.Printf("[cc_defense] IP blocked ip=%s reason=%s", ip, reason)
+			}
 			attacklog.Record(ip, r.Host, r.URL.Path, "IP归属", reason)
 			metrics.IPCheckBlocked.Inc()
 			util.CloseConnectionSilently(w)
@@ -806,7 +862,9 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if v, ok := h.trustedSessions.Load(sid); ok {
 			if t, ok := v.(time.Time); ok && time.Since(t) < 24*time.Hour {
 				if !h.dlimiter.trusted.allow() {
-					log.Printf("[cc_defense] trusted session rate limited, closing connection")
+					if h.throttle.allow("tsess") {
+						log.Printf("[cc_defense] trusted session rate limited, closing connection")
+					}
 					attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "trusted session")
 					metrics.CCBlocked.Inc()
 					util.CloseConnectionSilently(w)
@@ -829,7 +887,9 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !h.dlimiter.trusted.allow() {
-			log.Printf("[cc_defense] trusted ip=%s rate limited, closing connection", ip)
+			if h.throttle.allow("tip:" + ip) {
+				log.Printf("[cc_defense] trusted ip=%s rate limited, closing connection", ip)
+			}
 			attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "trusted ip")
 			metrics.CCBlocked.Inc()
 			util.CloseConnectionSilently(w)
@@ -856,7 +916,9 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// 搜索引擎爬虫白名单 — 不挑战，限速后放行
 		if isSearchBot(r.Header.Get("User-Agent")) {
 			if !h.dlimiter.untrusted.allow() {
-				log.Printf("[cc_defense] search bot ip=%s rate limited, closing connection", ip)
+				if h.throttle.allow("sbot:" + ip) {
+					log.Printf("[cc_defense] search bot ip=%s rate limited, closing connection", ip)
+				}
 				attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "search bot")
 				metrics.CCBlocked.Inc()
 				util.CloseConnectionSilently(w)
@@ -876,7 +938,9 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 未信任每 IP 限速：单 IP 超过 per_ip 阈值 → 验证码挑战。
 	// 放在次数晋升之前，避免高频 IP 靠反复请求"毕业"绕过限速。
 	if !h.perIP.allow(ip) {
-		log.Printf("[cc_defense] untrusted ip=%s per-ip rate limited, serving captcha challenge", ip)
+		if h.throttle.allow("perip:" + ip) {
+			log.Printf("[cc_defense] untrusted ip=%s per-ip rate limited, serving captcha challenge", ip)
+		}
 		attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "captcha")
 		metrics.CCChallenged.Inc()
 		h.serveCaptcha(w, r, ip)
@@ -888,7 +952,9 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 无法在泛洪期间绕过验证码挑战。
 	if h.trust.recordVisit(ip) {
 		if !h.dlimiter.trusted.allow() {
-			log.Printf("[cc_defense] trusted ip=%s rate limited, closing connection", ip)
+			if h.throttle.allow("tip:" + ip) {
+				log.Printf("[cc_defense] trusted ip=%s rate limited, closing connection", ip)
+			}
 			attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "trusted ip")
 			metrics.CCBlocked.Inc()
 			util.CloseConnectionSilently(w)
@@ -905,13 +971,17 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// 避免把验证码页喂给爬虫。serveCaptcha 内部有 captchaGenMaxPerSec(30 张/秒)
 		// 的生成节流，极端洪峰超限时自动退回断连，防止 OOM。
 		if isSearchBot(r.Header.Get("User-Agent")) {
-			log.Printf("[cc_defense] search bot ip=%s rate limited, closing connection", ip)
+			if h.throttle.allow("sbot:" + ip) {
+				log.Printf("[cc_defense] search bot ip=%s rate limited, closing connection", ip)
+			}
 			attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "search bot")
 			metrics.CCBlocked.Inc()
 			util.CloseConnectionSilently(w)
 			return
 		}
-		log.Printf("[cc_defense] untrusted ip=%s bucket exhausted, serving captcha challenge", ip)
+		if h.throttle.allow("bucket:" + ip) {
+			log.Printf("[cc_defense] untrusted ip=%s bucket exhausted, serving captcha challenge", ip)
+		}
 		attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "captcha")
 		metrics.CCChallenged.Inc()
 		h.serveCaptcha(w, r, ip)

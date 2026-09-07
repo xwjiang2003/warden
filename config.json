@@ -1,10 +1,10 @@
 {
   "listen": ":81",
-  "backend": "http://127.0.0.1:8001",
+  "backend": "http://127.0.0.1:8002",
   "rules_file": "rules/coraza.conf",
   "read_timeout_sec": 60,
   "write_timeout_sec": 60,
-  "idle_timeout_sec": 180,
+  "idle_timeout_sec": 60,
   "access_log": "logs/access.log",
   "access_log_rotate": {
     "mode": "daily",
@@ -37,7 +37,8 @@
     "new_ip_check_sec": 30,
     "new_ip_check_min_reqs": 60,
     "challenge_cookie_key": "",
-    "offender_ttl_sec": 86400,
+    "firewall_offender_limit": 20,
+    "offender_ttl_sec": 1800,
     "behavior_idle_reset_sec": 600,
     "flood_sliding_window_sec": 600,
     "untrusted_ip_qps_max": 30,
@@ -94,8 +95,8 @@
     "custom_block_status": 403
   },
   "conn_limit": {
-    "max_conns_per_sec": 500,
-    "burst": 100
+    "max_conns_per_sec": 300,
+    "burst": 80
   },
   "firewall_block": {
     "enabled": true,

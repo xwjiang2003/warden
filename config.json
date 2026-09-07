@@ -39,6 +39,7 @@
     "challenge_cookie_key": "",
     "firewall_offender_limit": 20,
     "offender_ttl_sec": 1800,
+    "offender_persist_sec": 60,
     "behavior_idle_reset_sec": 600,
     "flood_sliding_window_sec": 600,
     "untrusted_ip_qps_max": 30,

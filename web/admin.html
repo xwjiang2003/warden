@@ -499,6 +499,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
                 </el-form-item>
               </el-col>
               <el-col :span="8">
+                <el-form-item label="持续违规时长(秒)">
+                  <el-input-number v-model="config.cc_defense.offender_persist_sec" :min="10" :max="3600" >
+</el-input-number>
+                  <div class="field-help">违规次数达标后，还需持续违规达到该时长才真正加入 Windows 防火墙；默认 60</div>
+                </el-form-item>
+              </el-col>
+              <el-col :span="8">
                 <el-form-item label="行为状态空闲重置(秒)">
                   <el-input-number v-model="config.cc_defense.behavior_idle_reset_sec" :min="60" :max="86400" >
 </el-input-number>
@@ -899,7 +906,7 @@ function defaultConfig() {
     attack_log_retain_days: 90,
     block_requests: true,
     rate_limit: { enabled: true, hot_path_max: 30, hot_path_window_sec: 30, site_max_per_min: 300, subnet_max_per_min: 500, hot_path_patterns: [] },
-    cc_defense: { enabled: true, global_qps_max: 800, global_qps_burst: 200, trust_ip_min_visits: 5, trust_ip_window_sec: 600, trust_ip_ttl_sec: 86400, new_ip_qps_max: 50, new_ip_qps_burst: 20, new_ip_ratio_block: 80, new_ip_check_sec: 30, new_ip_check_min_reqs: 60, challenge_cookie_key: '', firewall_offender_limit: 10, offender_ttl_sec: 86400, behavior_idle_reset_sec: 600, flood_sliding_window_sec: 600, untrusted_ip_qps_max: 30, untrusted_ip_burst: 40 },
+    cc_defense: { enabled: true, global_qps_max: 800, global_qps_burst: 200, trust_ip_min_visits: 5, trust_ip_window_sec: 600, trust_ip_ttl_sec: 86400, new_ip_qps_max: 50, new_ip_qps_burst: 20, new_ip_ratio_block: 80, new_ip_check_sec: 30, new_ip_check_min_reqs: 60, challenge_cookie_key: '', firewall_offender_limit: 10, offender_ttl_sec: 86400, offender_persist_sec: 60, behavior_idle_reset_sec: 600, flood_sliding_window_sec: 600, untrusted_ip_qps_max: 30, untrusted_ip_burst: 40 },
     waf_rules: { cc_paths: [], cc_no_referer_block: true, scanner_paths: [], scanner_uas: [], block_script_ua: true, custom_script_uas: [], custom_block_paths: [], custom_block_status: 403 },
     conn_limit: { max_conns_per_sec: 500, burst: 100 },
     firewall_block: { enabled: true, expire_min: 30, auto_block: true, whitelist_cidrs: [] },

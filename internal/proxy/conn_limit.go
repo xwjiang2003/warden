@@ -197,45 +197,59 @@ func (fb *FirewallBlocker) restore() {
 
 // cleanOrphans 清理 Windows 防火墙中不属于当前拉黑列表的 warden-block-* 规则。
 // 这些规则来自旧版本（无持久化）遗留、或进程崩溃前未及删除。
+//
+// 用单条 PowerShell 命令按"活跃列表"过滤删除孤儿：只删孤儿、不动活跃规则（无空窗），
+// 比 netsh 逐条快几个数量级。PowerShell 的退出码不可靠（无匹配/权限等非致命错误也返回非零），
+// 因此忽略退出码，改以删除后重列的剩余数为准。
 func (fb *FirewallBlocker) cleanOrphans() {
 	if runtime.GOOS != "windows" {
 		return
 	}
-	out, err := exec.Command("netsh", "advfirewall", "firewall", "show", "rule", "name=all").Output()
+	// 快照当前应保留的活跃拉黑 IP
+	fb.mu.Lock()
+	active := make(map[string]bool, len(fb.blockedIPs))
+	for ip := range fb.blockedIPs {
+		active[ip] = true
+	}
+	fb.mu.Unlock()
+
+	keep := make([]string, 0, len(active))
+	for ip := range active {
+		keep = append(keep, "'"+ip+"'")
+	}
+	// 单条命令：列出所有 warden-block-* 规则，删除去掉前缀后不在活跃列表里的孤儿。
+	// 用 -replace 去掉前缀（"warden-block-" 无正则特殊字符，字面匹配即可）。
+	ps := "Get-NetFirewallRule -DisplayName '" + firewallRulePrefix + "*' -ErrorAction SilentlyContinue | " +
+		"Where-Object { ($_.DisplayName -replace '^" + firewallRulePrefix + "','') -notin @(" + strings.Join(keep, ",") + ") } | " +
+		"Remove-NetFirewallRule -ErrorAction SilentlyContinue"
+	exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps).Run()
+
+	// 重列验证剩余孤儿数（若有剩余，说明部分删除失败，留待下次周期重试）
+	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"Get-NetFirewallRule -DisplayName '" + firewallRulePrefix + "*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DisplayName").Output()
 	if err != nil {
-		log.Printf("[firewall] 查询防火墙规则失败: %v", err)
 		return
 	}
 	seen := map[string]bool{}
-	var orphans []string
+	remaining := 0
 	for _, line := range strings.Split(string(out), "\n") {
-		// 表头是本地化的（中文系统为"规则名称:"），不能依赖 "Rule Name:"，
-		// 直接按规则名前缀 "warden-block-" 扫描提取 IP。
-		idx := strings.Index(line, firewallRulePrefix)
-		if idx < 0 {
+		name := strings.TrimSpace(line)
+		if !strings.HasPrefix(name, firewallRulePrefix) {
 			continue
 		}
-		fields := strings.Fields(line[idx+len(firewallRulePrefix):])
-		if len(fields) == 0 {
-			continue
-		}
-		ip := fields[0]
+		ip := name[len(firewallRulePrefix):]
 		if seen[ip] {
 			continue
 		}
 		seen[ip] = true
-		fb.mu.Lock()
-		_, exists := fb.blockedIPs[ip]
-		fb.mu.Unlock()
-		if !exists {
-			orphans = append(orphans, ip)
+		if !active[ip] {
+			remaining++
 		}
 	}
-	for _, ip := range orphans {
-		fb.removeRule(ip)
-	}
-	if len(orphans) > 0 {
-		log.Printf("[firewall] 清理孤儿规则 %d 条", len(orphans))
+	if remaining > 0 {
+		log.Printf("[firewall] 清理后仍剩余孤儿规则 %d 条（下次周期重试）", remaining)
+	} else {
+		log.Printf("[firewall] 防火墙规则已对齐拉黑列表: 活跃=%d", len(active))
 	}
 }
 

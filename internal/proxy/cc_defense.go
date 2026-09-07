@@ -653,6 +653,7 @@ type CCDefenseHandler struct {
 
 type offenderTrack struct {
 	blockCount int32
+	firstSeen  int64 // 首次违规时间(UnixNano)，用于"持续性"判定
 	lastSeen   int64
 }
 
@@ -686,11 +687,18 @@ func (h *CCDefenseHandler) ReportOffender(ip string) {
 	if h.fw == nil {
 		return
 	}
-	val, _ := h.offenders.LoadOrStore(ip, &offenderTrack{})
+	now := time.Now().UnixNano()
+	val, _ := h.offenders.LoadOrStore(ip, &offenderTrack{firstSeen: now})
 	tr := val.(*offenderTrack)
 	cnt := atomic.AddInt32(&tr.blockCount, 1)
-	atomic.StoreInt64(&tr.lastSeen, time.Now().UnixNano())
-	if int(cnt) >= h.cfg.FirewallOffenderLimit {
+	atomic.StoreInt64(&tr.lastSeen, now)
+	// 升级到 Windows 防火墙需同时满足两个条件：
+	//   1) 违规次数达到 firewall_offender_limit；
+	//   2) 从首次违规至今已持续 offender_persist_sec（仍在不间断地打）。
+	// 短暂爆发只留在内存计数 + 验证码挑战，避免"一次性 IP"也建防火墙规则导致规则膨胀。
+	persist := time.Duration(h.cfg.OffenderPersistSec) * time.Second
+	if int(cnt) >= h.cfg.FirewallOffenderLimit &&
+		now-atomic.LoadInt64(&tr.firstSeen) >= int64(persist) {
 		log.Printf("[cc_defense] firewall-block candidate ip=%s offenses=%d", ip, cnt)
 		h.fw.block(ip, "repeat-offender-cc")
 	}

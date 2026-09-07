@@ -9,6 +9,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"warden/internal/sqlutil"
 )
 
 // Event 一条攻击日志
@@ -150,30 +152,32 @@ func writer() {
 }
 
 // writeBatch 在一个事务里批量插入攻击日志，减少写事务/锁次数。
+// 用 sqlutil.Retry 包裹整批写入：与配置表/防火墙库共用同一 SQLite 文件，
+// 高峰期多连接抢写锁时会偶发 SQLITE_BUSY，重试可大幅降低整批丢失概率。
 func writeBatch(events []Event) {
 	if db == nil || len(events) == 0 {
 		return
 	}
-	tx, err := db.Begin()
-	if err != nil {
-		log.Printf("[attacklog] 开启事务失败: %v", err)
-		return
-	}
-	stmt, err := tx.Prepare(`INSERT INTO attack_log (time, ip, host, path, category, detail) VALUES (?,?,?,?,?,?)`)
-	if err != nil {
-		tx.Rollback()
-		log.Printf("[attacklog] 准备语句失败: %v", err)
-		return
-	}
-	for _, e := range events {
-		if _, err := stmt.Exec(e.Time, e.IP, e.Host, e.Path, e.Category, e.Detail); err != nil {
-			log.Printf("[attacklog] 批量写入单条失败: %v", err)
+	err := sqlutil.Retry(func() error {
+		tx, err := db.Begin()
+		if err != nil {
+			return err
 		}
-	}
-	stmt.Close()
-	if err := tx.Commit(); err != nil {
-		log.Printf("[attacklog] 提交事务失败: %v", err)
-		tx.Rollback()
+		defer tx.Rollback()
+		stmt, err := tx.Prepare(`INSERT INTO attack_log (time, ip, host, path, category, detail) VALUES (?,?,?,?,?,?)`)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		for _, e := range events {
+			if _, err := stmt.Exec(e.Time, e.IP, e.Host, e.Path, e.Category, e.Detail); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	})
+	if err != nil {
+		log.Printf("[attacklog] 批量写入失败(已重试): %v", err)
 	}
 }
 

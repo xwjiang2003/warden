@@ -162,6 +162,7 @@ type CCDefenseConfig struct {
 	ChallengeCookieKey    string `json:"challenge_cookie_key"`
 	FirewallOffenderLimit int    `json:"firewall_offender_limit"`
 	OffenderTTLSec        int    `json:"offender_ttl_sec"`
+	OffenderPersistSec    int    `json:"offender_persist_sec"`
 	BehaviorIdleResetSec  int    `json:"behavior_idle_reset_sec"`
 	FloodSlidingWindowSec int    `json:"flood_sliding_window_sec"`
 	UntrustedIPQPSMax     int    `json:"untrusted_ip_qps_max"`
@@ -207,6 +208,9 @@ func (c *CCDefenseConfig) Normalize() {
 	}
 	if c.OffenderTTLSec <= 0 {
 		c.OffenderTTLSec = 86400
+	}
+	if c.OffenderPersistSec <= 0 {
+		c.OffenderPersistSec = 60
 	}
 	if c.BehaviorIdleResetSec <= 0 {
 		c.BehaviorIdleResetSec = 600

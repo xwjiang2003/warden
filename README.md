@@ -490,6 +490,18 @@ systemctl daemon-reload && systemctl enable --now warden
 
 默认地址 `http://127.0.0.1:9090`（可在 `admin.listen` 修改）。
 
+### 界面预览
+
+**仪表盘** —— 实时拦截指标、QPS / 拦截率趋势图、拦截分类占比、系统状态与代理信息
+
+<img src="docs/images/admin-dashboard.png" width="820" alt="沃盾管理后台 - 仪表盘">
+
+**WAF 规则** —— 脚本 UA、扫描器路径 / UA、自定义拦截路径与返回状态码
+
+<img src="docs/images/admin-waf-rules.png" width="820" alt="沃盾管理后台 - WAF 规则">
+
+### 功能菜单
+
 | 菜单 | 功能 |
 |---|---|
 | 📊 仪表盘 | 实时指标、QPS/拦截率趋势图、拦截分类饼图、CPU/内存、代理信息 |

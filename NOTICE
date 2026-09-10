@@ -41,6 +41,10 @@ components are provided under their respective licenses.
       Copyright (c) Valllabh
       https://github.com/valllabh/ocsf-schema-golang
 
+  * ip2region 离线 IP 归属数据库（数据文件 data/ip2region.xdb）
+      Copyright (c) The ip2region Authors
+      https://github.com/lionsoul2014/ip2region
+
 【MIT License】
 
   * go-humanize (github.com/dustin/go-humanize)

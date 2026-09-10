@@ -1,0 +1,41 @@
+# 换行符统一策略：仓库内一律以 LF 存储，避免跨平台出现"整个文件都变了"的噪音 diff。
+# 说明：eol=lf/crlf 只影响检出到工作区时的换行符，仓库内始终存 LF。
+* text=auto
+
+# ---------- 源码与文档：统一 LF ----------
+*.go           text eol=lf
+*.md           text eol=lf
+*.json         text eol=lf
+*.html         text eol=lf
+*.css          text eol=lf
+*.js           text eol=lf
+*.conf         text eol=lf
+*.txt          text eol=lf
+*.yml          text eol=lf
+*.yaml         text eol=lf
+LICENSE        text eol=lf
+NOTICE         text eol=lf
+.gitignore     text eol=lf
+.gitattributes text eol=lf
+
+# ---------- Windows 脚本：检出为 CRLF（cmd / PowerShell 习惯） ----------
+*.bat          text eol=crlf
+*.cmd          text eol=crlf
+*.ps1          text eol=crlf
+
+# ---------- 二进制：禁止任何换行转换 ----------
+*.xdb          binary
+*.exe          binary
+*.dll          binary
+*.db           binary
+*.png          binary
+*.jpg          binary
+*.jpeg         binary
+*.gif          binary
+*.ico          binary
+*.woff         binary
+*.woff2        binary
+*.zip          binary
+
+# ---------- GitHub 语言统计：前端依赖是第三方产物，不计入本项目代码 ----------
+web/vendor/*   linguist-vendored

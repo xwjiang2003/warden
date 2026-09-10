@@ -11,3 +11,8 @@ var WebFS embed.FS
 //
 //go:embed web/admin.html
 var AdminHTML []byte
+
+// LegalFS 嵌入开源许可与第三方声明文件，供管理后台页脚在线查看
+//
+//go:embed LICENSE NOTICE
+var LegalFS embed.FS

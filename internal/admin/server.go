@@ -24,6 +24,7 @@ import (
 	"warden/internal/store"
 	"warden/internal/truststore"
 	"warden/internal/util"
+	"warden/internal/version"
 )
 
 // Server 管理后台服务
@@ -64,6 +65,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/metrics", s.handleMetrics)
 	s.mux.HandleFunc("POST /api/restart", s.handleRestart)
 	s.mux.HandleFunc("POST /api/alert/test", s.handleAlertTest)
+	s.mux.HandleFunc("GET /api/license", s.handleLegal("LICENSE"))
+	s.mux.HandleFunc("GET /api/notice", s.handleLegal("NOTICE"))
 	s.mux.HandleFunc("GET /", s.handleStatic)
 }
 
@@ -126,8 +129,22 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":  "ok",
 		"uptime":  formatUptime(time.Since(s.startTime)),
-		"version": "1.0.0",
+		"version": version.Version,
+		"license": version.License,
 	})
+}
+
+// handleLegal 返回嵌入二进制内的开源许可 / 第三方声明文本，供管理后台页脚查看。
+func (s *Server) handleLegal(name string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		data, err := fs.ReadFile(assets.LegalFS, name)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write(data)
+	}
 }
 
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
@@ -292,6 +309,8 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"rate_limit_enabled":  s.cfg.RateLimit.Enabled,
 		"block_requests":      s.cfg.BlockRequests,
 		"restart_needed":      s.restartNeeded.Load(),
+		"version":             version.Version,
+		"license":             version.License,
 	}
 	writeJSON(w, http.StatusOK, stats)
 }

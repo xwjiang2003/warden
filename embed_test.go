@@ -18,3 +18,13 @@ func TestVendorAssetsEmbedded(t *testing.T) {
 		}
 	}
 }
+
+// TestLegalFilesEmbedded 保证开源许可与第三方声明被嵌入，
+// 管理后台页脚才能在线查看（Apache-2.0 要求分发时随附许可与声明）。
+func TestLegalFilesEmbedded(t *testing.T) {
+	for _, f := range []string{"LICENSE", "NOTICE"} {
+		if _, err := LegalFS.Open(f); err != nil {
+			t.Fatalf("缺少嵌入文件 %s: %v", f, err)
+		}
+	}
+}

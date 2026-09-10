@@ -100,9 +100,9 @@
     "burst": 80
   },
   "firewall_block": {
-    "enabled": true,
+    "enabled": false,
     "expire_min": 30,
-    "auto_block": true
+    "auto_block": false
   },
   "ip_whitelist": {
     "enabled": false,

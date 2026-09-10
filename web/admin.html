@@ -909,7 +909,7 @@ function defaultConfig() {
     cc_defense: { enabled: true, global_qps_max: 800, global_qps_burst: 200, trust_ip_min_visits: 5, trust_ip_window_sec: 600, trust_ip_ttl_sec: 86400, new_ip_qps_max: 50, new_ip_qps_burst: 20, new_ip_ratio_block: 80, new_ip_check_sec: 30, new_ip_check_min_reqs: 60, challenge_cookie_key: '', firewall_offender_limit: 10, offender_ttl_sec: 86400, offender_persist_sec: 60, behavior_idle_reset_sec: 600, flood_sliding_window_sec: 600, untrusted_ip_qps_max: 30, untrusted_ip_burst: 40 },
     waf_rules: { cc_paths: [], cc_no_referer_block: true, scanner_paths: [], scanner_uas: [], block_script_ua: true, custom_script_uas: [], custom_block_paths: [], custom_block_status: 403 },
     conn_limit: { max_conns_per_sec: 500, burst: 100 },
-    firewall_block: { enabled: true, expire_min: 30, auto_block: true, whitelist_cidrs: [] },
+    firewall_block: { enabled: false, expire_min: 30, auto_block: false, whitelist_cidrs: [] },
     ip_whitelist: { enabled: false, cidrs: [] },
     ip_blacklist: { enabled: false, cidrs: [] },
     url_allowlist: [],
@@ -1273,6 +1273,7 @@ const app = createApp({
     }
 
     let attackLogsTimer = null
+    let metricsTimer = null
     function navigate(index) {
       currentRoute.value = index
       // 攻击日志仅在进入该页时轮询，离开即停止，避免全局空刷 /api/attack_logs
@@ -1282,6 +1283,13 @@ const app = createApp({
       } else {
         if (attackLogsTimer) { clearInterval(attackLogsTimer); attackLogsTimer = null }
       }
+      // 仪表盘指标/趋势图仅在仪表盘页轮询，离开即停止，避免在其它页面空刷 /api/metrics
+      if (index === 'dashboard') {
+        loadMetrics()
+        if (!metricsTimer) metricsTimer = setInterval(loadMetrics, 2000)
+      } else {
+        if (metricsTimer) { clearInterval(metricsTimer); metricsTimer = null }
+      }
       if (index === 'logs') loadLogs()
       if (index === 'trustedips') loadTrustedIPs(1)
     }
@@ -1289,9 +1297,10 @@ const app = createApp({
     onMounted(() => {
       loadConfig()
       loadStats()
+      setInterval(loadStats, 30000) // 每 30s 刷新统计（重启标志等全局信息，各页面都需要）
+      // 默认路由是仪表盘：启动即开始轮询拦截指标/趋势图
       loadMetrics()
-      setInterval(loadStats, 30000) // 每 30s 刷新统计（系统状态/重启标志）
-      setInterval(loadMetrics, 2000) // 每 2s 刷新拦截指标（仪表盘/趋势图）
+      metricsTimer = setInterval(loadMetrics, 2000)
     })
 
     return {

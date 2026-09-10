@@ -1,0 +1,110 @@
+沃盾（warden）
+Copyright 2026 The warden Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+================================================================================
+第三方组件声明 / Third-Party Component Notices
+================================================================================
+
+本产品（下称"本软件"）包含或链接了以下第三方开源组件。这些组件的版权归其各自
+所有者所有，并按各自的许可协议分发。下方列出组件名称、许可协议及版权归属。
+
+This product includes software developed by third parties. The following
+components are provided under their respective licenses.
+
+--------------------------------------------------------------------------------
+一、后端依赖（Go modules，见 go.mod）
+--------------------------------------------------------------------------------
+
+【Apache License 2.0】
+
+  * OWASP Coraza WAF (github.com/corazawaf/coraza/v3)
+      Copyright (c) The Coraza Authors
+      https://github.com/corazawaf/coraza
+
+  * magefile/mage (github.com/magefile/mage)
+      Copyright (c) Magefile Authors
+      https://github.com/magefile/mage
+
+  * ocsf-schema-golang (github.com/valllabh/ocsf-schema-golang)
+      Copyright (c) Valllabh
+      https://github.com/valllabh/ocsf-schema-golang
+
+【MIT License】
+
+  * go-humanize (github.com/dustin/go-humanize)
+      Copyright (c) Dustin Sallings
+  * go-isatty (github.com/mattn/go-isatty)
+      Copyright (c) Yasuhiro Matsumoto
+  * go-strftime (github.com/ncruces/go-strftime)
+      Copyright (c) Nuno Cruces
+  * aho-corasick (github.com/petar-dambovaliev/aho-corasick)
+      Copyright (c) Petar Dambovaliev
+  * gjson (github.com/tidwall/gjson)
+      Copyright (c) Josh Baker
+  * match (github.com/tidwall/match)
+      Copyright (c) Josh Baker
+  * pretty (github.com/tidwall/pretty)
+      Copyright (c) Josh Baker
+
+【BSD 3-Clause License】
+
+  * libinjection-go (github.com/corazawaf/libinjection-go)
+      Copyright (c) The Coraza Authors
+  * google/uuid (github.com/google/uuid)
+      Copyright (c) Google Inc.
+  * bigfft (github.com/remyoudompheng/bigfft)
+      Copyright (c) Rémy Oudompheng
+  * golang.org/x/net, golang.org/x/sync, golang.org/x/sys
+      Copyright (c) The Go Authors
+  * google.golang.org/protobuf
+      Copyright (c) The Go Authors
+  * modernc.org/libc / mathutil / memory / sqlite
+      Copyright (c) The ModernC Authors
+  * rsc.io/binaryregexp
+      Copyright (c) The Go Authors
+
+--------------------------------------------------------------------------------
+二、前端依赖（Web 管理后台，见 web/vendor/）
+--------------------------------------------------------------------------------
+
+【Apache License 2.0】
+
+  * Apache ECharts (web/vendor/echarts.min.js)
+      Copyright (c) The Apache Software Foundation
+      https://echarts.apache.org
+
+【MIT License】
+
+  * Vue.js 3.x (web/vendor/vue.global.prod.js)
+      Copyright (c) 2018-present, Yuxi (Evan) You and Vue contributors
+      https://vuejs.org
+  * Vue Router 4.x (web/vendor/vue-router.global.prod.js)
+      Copyright (c) 2014-present, Eduardo San Martin Morote
+      https://router.vuejs.org
+  * Element Plus 2.x (web/vendor/element-plus.full.min.js, element-plus.index.css)
+      Copyright (c) Element Plus
+      https://element-plus.org
+  * axios (web/vendor/axios.min.js)
+      Copyright (c) 2014-present, Matt Zabriskie & other contributors
+      https://axios-http.com
+
+--------------------------------------------------------------------------------
+三、许可文本获取方式
+--------------------------------------------------------------------------------
+
+* Apache License 2.0 全文见本仓库根目录 LICENSE 文件；
+* 其余许可（MIT / BSD-3-Clause）的完整文本，可在上述各组件对应的源码仓库中查看，
+  或通过 `go mod download` 后查阅模块缓存内各目录下的 LICENSE 文件；
+* 前端组件的许可声明亦保留在 web/vendor/ 下各文件的头部注释中。

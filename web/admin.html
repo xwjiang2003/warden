@@ -118,7 +118,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
           <div id="trend-chart" style="height:260px"></div>
         </div>
         <div class="page-card" style="margin-bottom:16px">
-          <h3>系统状态</h3>
+          <h3>系统状态 <span style="font-weight:400;color:#909399;font-size:12px">（每 3 秒自动刷新）</span></h3>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 48px">
             <div>
               <div style="display:flex;justify-content:space-between;font-size:13px;color:#606266;margin-bottom:4px">
@@ -1132,6 +1132,10 @@ const app = createApp({
       }
     }
 
+    // 状态轮询间隔（毫秒）。仪表盘取完整系统状态，其它页面只取极轻量的重启标志
+    const STATUS_INTERVAL = 3000
+    let statusTimer = null
+
     async function loadStats() {
       try {
         const { data } = await api.get('/stats')
@@ -1139,6 +1143,24 @@ const app = createApp({
         // 后端记录"是否需要重启"：刷新/换浏览器都能正确显示
         restartNeeded.value = data.restart_needed === true
       } catch (e) { /* 静默失败 */ }
+    }
+
+    // 轻量状态：非仪表盘页只轮询这个，避免为了一个重启横幅去采集 CPU/内存
+    async function loadState() {
+      try {
+        const { data } = await api.get('/state')
+        restartNeeded.value = data.restart_needed === true
+        // 页脚在所有页面都可见，版本信息随轻量接口一起取
+        if (data.version) stats.version = data.version
+        if (data.license) stats.license = data.license
+        if (data.go_version) stats.go_version = data.go_version
+      } catch (e) { /* 静默失败 */ }
+    }
+
+    // 按当前所在页面决定轮询哪个接口
+    function pollStatus() {
+      if (currentRoute.value === 'dashboard') loadStats()
+      else loadState()
     }
 
     async function loadMetrics() {
@@ -1319,12 +1341,14 @@ const app = createApp({
       } else {
         if (attackLogsTimer) { clearInterval(attackLogsTimer); attackLogsTimer = null }
       }
-      // 仪表盘指标/趋势图仅在仪表盘页轮询，离开即停止，避免在其它页面空刷 /api/metrics
+      // 仪表盘：立即刷新一次系统状态，并启动指标/趋势图轮询；离开即停止
       if (index === 'dashboard') {
+        loadStats()
         loadMetrics()
         if (!metricsTimer) metricsTimer = setInterval(loadMetrics, 2000)
       } else {
         if (metricsTimer) { clearInterval(metricsTimer); metricsTimer = null }
+        loadState() // 非仪表盘页：只刷轻量状态（重启横幅 + 页脚版本）
       }
       if (index === 'logs') loadLogs()
       if (index === 'trustedips') loadTrustedIPs(1)
@@ -1332,8 +1356,9 @@ const app = createApp({
 
     onMounted(() => {
       loadConfig()
-      loadStats()
-      setInterval(loadStats, 30000) // 每 30s 刷新统计（重启标志等全局信息，各页面都需要）
+      // 每 3s 刷新状态：仪表盘走完整 /api/stats，其它页面走轻量 /api/state
+      pollStatus()
+      statusTimer = setInterval(pollStatus, STATUS_INTERVAL)
       // 默认路由是仪表盘：启动即开始轮询拦截指标/趋势图
       loadMetrics()
       metricsTimer = setInterval(loadMetrics, 2000)

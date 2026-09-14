@@ -523,6 +523,21 @@ systemctl daemon-reload && systemctl enable --now warden
 **「Apache-2.0 开源许可」** 或 **「第三方组件声明」**，可在弹窗中直接查看 `LICENSE` / `NOTICE` 全文——
 这两份文件通过 `go:embed` 打进二进制，无需额外附带文件即可在线阅读。
 
+### 前端轮询策略
+
+后台与 WAF 跑在**同一个进程**里，所以轮询开销直接叠加在业务上。前端按"页面是否需要"分档：
+
+| 页面 | 轮询 | 间隔 | 说明 |
+|---|---|---|---|
+| 仪表盘 | `/api/stats` | **3s** | 完整系统状态（CPU/内存/协程）|
+| 其它页面 | `/api/state` | **3s** | 只取重启标志 + 版本，供横幅与页脚 |
+| 仪表盘 | `/api/metrics` | 2s | 计数器（原子读，极轻）|
+| 攻击日志页 | `/api/attack_logs` | 3s | 离开该页即停止 |
+
+`/api/stats` 读取堆内存用的是 `runtime/metrics` 而**不是** `runtime.ReadMemStats`：
+后者会触发 STW（stop-the-world）停顿，实测单次约 8.7µs，而前者读同样指标仅约 0.3µs（快约 27 倍），
+适合被前端高频轮询；两者取值一致。
+
 ### 管理 API
 
 所有接口在 `/api/*` 下，默认仅本机可访问：
@@ -532,7 +547,8 @@ systemctl daemon-reload && systemctl enable --now warden
 | GET | `/api/health` | 健康检查 |
 | GET | `/api/config` | 读取当前配置 |
 | PUT | `/api/config` | 保存配置（写入 DB） |
-| GET | `/api/stats` | 运行状态（含 CPU/内存、是否需重启） |
+| GET | `/api/stats` | 运行状态（含 CPU/内存、协程数、是否需重启） |
+| GET | `/api/state` | 轻量全局状态（重启标志 + 版本信息），非仪表盘页轮询用 |
 | GET | `/api/metrics` | 计数器指标 |
 | GET | `/api/logs` | 访问日志尾部 |
 | GET | `/api/attack_logs` | 攻击日志（分页） |

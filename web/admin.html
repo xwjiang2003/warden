@@ -121,12 +121,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
           <h3>系统状态 <span style="font-weight:400;color:#909399;font-size:12px">（每 3 秒自动刷新）</span></h3>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 48px">
             <div>
-              <div style="display:flex;justify-content:space-between;font-size:13px;color:#606266;margin-bottom:4px">
-                <span>CPU 使用率</span><span style="font-weight:600">{{ cpuPercent }}%</span>
+              <div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;color:#606266;margin-bottom:2px">
+                <span>CPU 使用率 <span style="color:#c0c4cc;font-size:12px">（最近 3 分钟）</span></span>
+                <span style="display:flex;align-items:center;gap:4px">
+                  <b :style="{fontWeight:600, color:cpuColor}">{{ cpuPercent }}%</b>
+                  <el-button link size="small" title="全屏查看" @click="openCpuFullscreen">⛶</el-button>
+                </span>
               </div>
-              <el-progress :percentage="cpuPercent" :stroke-width="12" :color="cpuColor" :show-text="false" />
+              <div id="cpu-chart" style="height:72px"></div>
             </div>
-            <div>
+            <div style="display:flex;flex-direction:column;justify-content:center">
               <div style="display:flex;justify-content:space-between;font-size:13px;color:#606266;margin-bottom:4px">
                 <span>内存使用率</span><span style="font-weight:600">{{ memPercent }}%</span>
               </div>
@@ -902,6 +906,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 <el-dialog v-model="legalVisible" :title="legalTitle" width="860px" top="6vh" append-to-body>
   <pre class="legal-text">{{ legalText }}</pre>
 </el-dialog>
+
+<!-- CPU 使用率趋势：全屏查看 -->
+<el-dialog v-model="cpuFullscreen" title="CPU 使用率趋势（最近 3 分钟）" fullscreen destroy-on-close
+           @opened="renderCpuChartFull" @closed="onCpuFullscreenClosed">
+  <div id="cpu-chart-full" style="height:calc(100vh - 150px)"></div>
+</el-dialog>
 </div>
 
 <script src="vendor/vue.global.prod.js"></script>
@@ -1015,7 +1025,11 @@ const app = createApp({
     })
     const trend = ref([])
     const MAX_TREND = 60
+    const cpuTrend = ref([])      // CPU 使用率趋势：/api/stats 每 3 秒给一个点
+    const cpuFullscreen = ref(false)
     let trendChart = null
+    let cpuChart = null           // 系统状态卡片内的紧凑折线图
+    let cpuChartFull = null       // 全屏弹窗内的大图
     function renderTrend() {
       const el = document.getElementById('trend-chart')
       if (!el) {
@@ -1074,6 +1088,67 @@ const app = createApp({
           data: data.length ? data : [{ name: '无拦截', value: 1, itemStyle: { color: '#e4e7ed' } }]
         }]
       })
+    }
+
+    // ---- CPU 使用率趋势：卡片内紧凑折线 + 全屏大图 ----
+    // full=false：隐藏坐标轴、贴边留白，做成"迷你趋势图"（占高小、不抢版面）；
+    // full=true ：显示坐标轴与网格，并画一条 90% 参考线。
+    function cpuChartOption(full) {
+      return {
+        tooltip: { trigger: 'axis', formatter: p => `${p[0].axisValue}<br/>CPU: ${p[0].data}%` },
+        grid: full
+          ? { left: 64, right: 40, top: 40, bottom: 48 }
+          : { left: 2, right: 2, top: 2, bottom: 2 },
+        xAxis: {
+          type: 'category', boundaryGap: false, show: full,
+          data: cpuTrend.value.map(p => p.t),
+          axisLabel: { fontSize: 11, color: '#909399' }
+        },
+        yAxis: {
+          type: 'value', min: 0, max: 100, show: full,
+          axisLabel: { fontSize: 11, color: '#909399', formatter: '{value}%' },
+          splitLine: { lineStyle: { color: '#f0f2f5' } }
+        },
+        series: [{
+          type: 'line', smooth: true, showSymbol: false,
+          lineStyle: { width: full ? 2 : 1.4, color: '#409eff' },
+          itemStyle: { color: '#409eff' },
+          areaStyle: { opacity: full ? 0.15 : 0.2 },
+          data: cpuTrend.value.map(p => p.cpu),
+          markLine: full ? {
+            silent: true, symbol: 'none',
+            data: [{ yAxis: 90, lineStyle: { color: '#f56c6c', type: 'dashed' }, label: { formatter: '90%', color: '#f56c6c' } }]
+          } : undefined
+        }]
+      }
+    }
+
+    function renderCpuChart() {
+      const el = document.getElementById('cpu-chart')
+      if (!el) {
+        if (cpuChart) { cpuChart.dispose(); cpuChart = null }
+        return
+      }
+      if (!window.echarts) return
+      if (!cpuChart) cpuChart = echarts.init(el)
+      cpuChart.setOption(cpuChartOption(false), true)
+    }
+
+    function renderCpuChartFull() {
+      const el = document.getElementById('cpu-chart-full')
+      if (!el) {
+        if (cpuChartFull) { cpuChartFull.dispose(); cpuChartFull = null }
+        return
+      }
+      if (!window.echarts) return
+      if (!cpuChartFull) cpuChartFull = echarts.init(el)
+      cpuChartFull.setOption(cpuChartOption(true), true)
+    }
+
+    function openCpuFullscreen() { cpuFullscreen.value = true }
+
+    function onCpuFullscreenClosed() {
+      if (cpuChartFull) { cpuChartFull.dispose(); cpuChartFull = null }
     }
 
     // 数组文本 ↔ config 同步
@@ -1142,6 +1217,11 @@ const app = createApp({
         Object.assign(stats, data)
         // 后端记录"是否需要重启"：刷新/换浏览器都能正确显示
         restartNeeded.value = data.restart_needed === true
+        // 采集 CPU 趋势点：3 秒一个点，60 点 = 最近 3 分钟
+        cpuTrend.value.push({ t: new Date().toLocaleTimeString(), cpu: Math.round(Number(data.cpu_percent || 0) * 10) / 10 })
+        if (cpuTrend.value.length > MAX_TREND) cpuTrend.value.shift()
+        renderCpuChart()
+        if (cpuFullscreen.value) renderCpuChartFull()
       } catch (e) { /* 静默失败 */ }
     }
 
@@ -1362,10 +1442,17 @@ const app = createApp({
       // 默认路由是仪表盘：启动即开始轮询拦截指标/趋势图
       loadMetrics()
       metricsTimer = setInterval(loadMetrics, 2000)
+      // 窗口尺寸变化时重绘各图表（全屏 CPU 图尤其需要）
+      window.addEventListener('resize', () => {
+        if (trendChart) trendChart.resize()
+        if (blockPie) blockPie.resize()
+        if (cpuChart) cpuChart.resize()
+        if (cpuChartFull) cpuChartFull.resize()
+      })
     })
 
     return {
-      config, stats, metrics, qps, blockRate, captchaSuccessRate, trustedIPs, trustedIPsLoading, trustedIPsTotal, trustedIPsPage, trustedIPsPageSize, currentRoute, saving, restartNeeded, restarting, configLoaded, logsLoading, logLines, logFile, legalVisible, legalTitle, legalText, showLegal,
+      config, stats, metrics, qps, blockRate, captchaSuccessRate, trustedIPs, trustedIPsLoading, trustedIPsTotal, trustedIPsPage, trustedIPsPageSize, currentRoute, saving, restartNeeded, restarting, configLoaded, logsLoading, logLines, logFile, legalVisible, legalTitle, legalText, showLegal, cpuFullscreen, openCpuFullscreen, renderCpuChartFull, onCpuFullscreenClosed,
       hotPathsText, ccPathsText, scannerPathsText, scannerUAsText, customScriptUAsText, customBlockPathsText,
       whitelistCIDRsText, firewallWhitelistCIDRsText, blacklistCIDRsText, urlAllowlistText, urlBlocklistText, alertToText, emailTesting,
       pageTitle, blockType, cpuColor, memColor, cpuPercent, memPercent,

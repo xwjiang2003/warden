@@ -55,16 +55,32 @@ func TrimHost(listen string) string {
 	return listen
 }
 
-// CloseConnectionSilently 直接关闭底层 TCP 连接，不发送 HTTP 响应（类似 nginx 444）。
-// 仅 HTTP/1.1 支持 hijack；HTTP/2 或 hijack 不可用时 fallback 为最小 503 响应。
-func CloseConnectionSilently(w http.ResponseWriter) {
-	if hj, ok := w.(http.Hijacker); ok {
-		conn, _, err := hj.Hijack()
-		if err == nil {
-			conn.Close()
-			return
-		}
+// DenyConnection 返回一个最小的 HTTP 拒绝响应。
+//
+// 为什么不再"静默掐断 TCP 连接"（原 CloseConnectionSilently 的行为）：
+// 静默断连（hijack + conn.Close）不产生任何 HTTP 响应，前置的反向代理（如 nginx）
+// 只能按"上游故障"处理——记为 upstream prematurely closed connection，丢弃该连接
+// 并重开新的一条。在被大量拦截的攻击场景下，这会造成连接重建风暴，把代理的
+// 连接槽/临时端口吃光，甚至触发代理解析失败（如 Windows nginx 的 WSAPoll 缺陷）导致假死。
+// 明确返回 HTTP 状态码可让代理走正常的错误处理路径，代价仅是几十字节响应体。
+//
+// 这里刻意**不**发 Connection: close：让代理（nginx）与本进程之间保持长连接复用，
+// 避免每个被拦截的请求都重建一条上游连接——churn 才是真正拖垮代理的东西。
+// 空闲连接的回收交给 http.Server 的 IdleTimeout 统一管理。
+//
+// 调用方按语义选择状态码：拦截 → 403，限速 → 429，过载/兜底 → 503。
+func DenyConnection(w http.ResponseWriter, status int, msg string) {
+	if status < 100 || status > 599 {
+		status = http.StatusForbidden
 	}
-	w.Header().Set("Connection", "close")
-	w.WriteHeader(http.StatusServiceUnavailable)
+	h := w.Header()
+	h.Set("Cache-Control", "no-store")
+	h.Set("Content-Type", "text/plain; charset=utf-8")
+	if status == http.StatusTooManyRequests {
+		h.Set("Retry-After", "60")
+	}
+	w.WriteHeader(status)
+	if msg != "" {
+		_, _ = w.Write([]byte(msg))
+	}
 }

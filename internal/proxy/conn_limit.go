@@ -48,9 +48,10 @@ func (l *ConnLimitListener) Accept() (net.Conn, error) {
 		if l.allow() {
 			return conn, nil
 		}
-		if tcp, ok := conn.(*net.TCPConn); ok {
-			tcp.SetLinger(0)
-		}
+		// 不要用 SetLinger(0) 强行发 RST：RST 会让前置代理（nginx）把这次连接
+		// 判成 "actively refused"(10061)，而 Windows 版 nginx 的 poll 模式存在
+		// WSAPoll 不上报连接失败的已知缺陷，会把连接槽一直占住直到 connect 超时，
+		// 累积后导致 nginx 假死。改为优雅关闭（FIN），让代理解析为普通连接结束。
 		conn.Close()
 		n := atomic.AddInt64(&discardCount, 1)
 		metrics.ConnLimitDropped.Inc()

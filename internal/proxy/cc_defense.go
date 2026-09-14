@@ -747,8 +747,8 @@ func (h *CCDefenseHandler) serveCaptcha(w http.ResponseWriter, r *http.Request, 
 	sid := getOrSetSessionID(w, r)
 	id, imgB64, err := h.captcha.generate(sid, ip)
 	if err != nil {
-		// 兜底节流或生成失败：直接丢弃连接，避免泛洪时海量 PNG 编码导致 OOM
-		util.CloseConnectionSilently(w)
+		// 兜底节流或生成失败：返回 503（不要静默掐连接——前置代理会当成上游故障并疯狂重建连接）
+		util.DenyConnection(w, http.StatusServiceUnavailable, "503 服务繁忙，请稍后重试\n")
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -825,7 +825,7 @@ func (h *CCDefenseHandler) blockIfSessionAnomaly(w http.ResponseWriter, r *http.
 		}
 		attacklog.Record(ip, r.Host, r.URL.Path, "CC会话", reason)
 		metrics.CCBlocked.Inc()
-		util.CloseConnectionSilently(w)
+		util.DenyConnection(w, http.StatusForbidden, "403 会话异常\n")
 		return true
 	}
 	return false
@@ -853,7 +853,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			attacklog.Record(ip, r.Host, r.URL.Path, "IP归属", reason)
 			metrics.IPCheckBlocked.Inc()
-			util.CloseConnectionSilently(w)
+			util.DenyConnection(w, http.StatusForbidden, "403 IP 归属受限\n")
 			return
 		}
 	}
@@ -875,7 +875,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					}
 					attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "trusted session")
 					metrics.CCBlocked.Inc()
-					util.CloseConnectionSilently(w)
+					util.DenyConnection(w, http.StatusTooManyRequests, "429 请求过于频繁，请稍后重试\n")
 					return
 				}
 				h.next.ServeHTTP(w, r)
@@ -900,7 +900,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "trusted ip")
 			metrics.CCBlocked.Inc()
-			util.CloseConnectionSilently(w)
+			util.DenyConnection(w, http.StatusTooManyRequests, "429 请求过于频繁，请稍后重试\n")
 			return
 		}
 		h.next.ServeHTTP(w, r)
@@ -929,7 +929,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "search bot")
 				metrics.CCBlocked.Inc()
-				util.CloseConnectionSilently(w)
+				util.DenyConnection(w, http.StatusTooManyRequests, "429 请求过于频繁，请稍后重试\n")
 				return
 			}
 			h.next.ServeHTTP(w, r)
@@ -965,7 +965,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "trusted ip")
 			metrics.CCBlocked.Inc()
-			util.CloseConnectionSilently(w)
+			util.DenyConnection(w, http.StatusTooManyRequests, "429 请求过于频繁，请稍后重试\n")
 			return
 		}
 		h.next.ServeHTTP(w, r)
@@ -984,7 +984,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "search bot")
 			metrics.CCBlocked.Inc()
-			util.CloseConnectionSilently(w)
+			util.DenyConnection(w, http.StatusTooManyRequests, "429 请求过于频繁，请稍后重试\n")
 			return
 		}
 		if h.throttle.allow("bucket:" + ip) {

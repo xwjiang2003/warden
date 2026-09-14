@@ -216,7 +216,7 @@ warden/
 │   ├── alert/             # 邮件 / Webhook / 钉钉 / 企业微信 / 飞书告警
 │   ├── blockpage/         # 自定义拦截页面
 │   ├── restart/           # 服务重启
-│   └── util/              # 通用工具（真实 IP、静默断连、系统 CPU/内存）
+│   └── util/              # 通用工具（真实 IP、拒绝响应、系统 CPU/内存）
 ├── web/                   # 管理后台前端（go:embed 打包）
 │   ├── admin.html         #   单文件 Vue3 应用
 │   └── vendor/            #   Vue / Element Plus / ECharts（本地化，不依赖 CDN）
@@ -555,7 +555,7 @@ systemctl daemon-reload && systemctl enable --now warden
 |---|---|
 | `total_requests` | 总请求数 |
 | `waf_blocked` | WAF 规则拦截 |
-| `cc_blocked` | CC 硬拦截（断连类） |
+| `cc_blocked` | CC 硬拦截（返回 403/429） |
 | `cc_challenged` | 验证码挑战次数 |
 | `captcha_passed` / `captcha_failed` | 验证码通过 / 失败 |
 | `rate_limit_blocked` | 频率限制（429） |

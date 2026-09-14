@@ -4,7 +4,7 @@ package version
 // Version 为当前版本号。构建时可通过 -ldflags 覆盖：
 //
 //	go build -ldflags "-X warden/internal/version.Version=1.2.3" ./cmd/warden
-var Version = "1.0.0"
+var Version = "1.0.1"
 
 // License 为本项目采用的开放源代码许可协议（SPDX 标识）。
 const License = "Apache-2.0"

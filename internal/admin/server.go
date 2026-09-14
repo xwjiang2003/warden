@@ -108,6 +108,10 @@ func (s *Server) Start() {
 		return
 	}
 
+	// 常驻采样整机 CPU（"预热"）：CPU 使用率是区间差值，若不常驻采样，
+	// 离开仪表盘再回来时第一次读数会覆盖整段空档（可能是几分钟的平均值）。
+	util.StartCPUSampler(util.CPUSampleInterval)
+
 	srv := &http.Server{
 		Addr:         s.adminCfg.Listen,
 		Handler:      s.handler(),
@@ -328,7 +332,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"memory_sys_mb":       roundMB(sys),
 		"system_total_mb":     util.SystemMemoryMB(),
 		"memory_used_percent": util.SystemMemoryUsedPercent(),
-		"cpu_percent":         util.SystemCPUUsagePercent(),
+		"cpu_percent":         util.SystemCPUPercent(),
 		"proxy_listen":        s.cfg.Listen,
 		"proxy_backend":       s.cfg.Backend,
 		"cc_defense_enabled":  s.cfg.CCDefense.Enabled,

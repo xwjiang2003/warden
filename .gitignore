@@ -1,5 +1,6 @@
 # === Binary / Build ===
 /warden
+/warden-linux-arm64
 *.exe
 *.exe~
 *.dll

@@ -225,10 +225,11 @@ warden/
 ├── data/                  # SQLite 数据库（运行时生成，已 gitignore）
 ├── logs/                  # 访问/审计日志（运行时生成，已 gitignore）
 ├── config.json            # 默认配置
-├── install.bat            # Windows：拉依赖 + 编译
+├── install.bat            # Windows：拉依赖 + 编译（双击即可）
 ├── run.bat                # Windows：启动
-├── build.ps1              # PowerShell 编译
-└── package.ps1            # 打包成可分发 zip
+├── run.sh                 # Linux：启动（自动识别 amd64 / arm64）
+├── build.ps1              # 交叉编译：Windows/amd64 + Linux/amd64 + Linux/arm64
+└── package.ps1            # 打包成可分发 zip（单包内含全部平台产物）
 ```
 
 ---
@@ -240,6 +241,32 @@ warden/
 - **Go 1.23+**（`go.mod` 声明 `go 1.23.0`）
 - Windows 10/11 或 Windows Server 2016+，或任意 Linux 发行版
 - 无需 cgo / 无需数据库服务（SQLite 为纯 Go 实现，随程序内置）
+
+### 使用发布包（无需编译）
+
+Release 里的 `warden-v<版本>.zip` **一个包同时含 Windows 与 Linux 产物**，全部平铺在根目录，
+在任何系统上解压即用：
+
+| 文件 | 平台 | 说明 |
+|---|---|---|
+| `warden.exe` | Windows / amd64 | Windows 可执行文件 |
+| `warden` | Linux / amd64 | x86_64 服务器 |
+| `warden-linux-arm64` | Linux / arm64 | ARM 云主机、国产化平台、软路由等 |
+| `run.bat` | Windows | 双击启动（自动用 `warden.exe`） |
+| `run.sh` | Linux | 按 `uname -m` 自动挑选对应二进制并启动 |
+| `config.json` | 通用 | 默认配置 |
+| `rules/coraza.conf` | 通用 | WAF 规则 |
+| `data/ip2region.xdb` | 通用 | IP 归属库（国外 / 云厂商拦截依赖） |
+| `LICENSE` / `NOTICE` | 通用 | Apache-2.0 许可与第三方声明 |
+
+Linux 下 zip 不保留可执行位，首次启动先赋权：
+
+```bash
+mkdir -p /opt/warden && cd /opt/warden
+unzip ~/warden-v1.0.1.zip      # 文件平铺在包内根目录，建议先建好目录再解压
+chmod +x run.sh warden warden-linux-arm64
+./run.sh
+```
 
 ### Windows
 
@@ -263,8 +290,13 @@ go build -o warden.exe ./cmd/warden
 export GOPROXY=https://goproxy.cn,https://goproxy.io,direct
 go mod tidy
 go build -o warden ./cmd/warden
+mkdir -p logs
 ./warden -config config.json
 ```
+
+> SQLite 是纯 Go 实现，**不需要 cgo**，所以在 Windows 上可以直接交叉编译出 Linux 版本：
+> `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o warden ./cmd/warden`
+> 或在 PowerShell 里执行 `.\build.ps1` 一次性产出全部平台。
 
 ### 验证
 

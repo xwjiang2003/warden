@@ -4,8 +4,6 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
-
 ## [1.0.2] - 2026-09-26
 
 安全修复版。**包含一项行为变更**，升级前请先阅读「升级注意」。
@@ -43,7 +41,7 @@
 
 - **修复管理后台切换菜单后仪表盘图表空白**：图表容器由 `v-if` 卸载重建，而 ECharts
   实例仍绑定在已脱离文档的旧节点上，后续渲染全部画到废弃节点。
-  现在每次渲染前校验实例绑定的节点是否仍是当前页面的那个（[`web/admin.html`]）；
+  现在每次渲染前校验实例绑定的节点是否仍是当前页面的那个（`web/admin.html`）；
   离开仪表盘时主动 dispose，切回时重建；
 - 转发给业务后端的 `X-Forwarded-For` / `X-Real-IP` 改为按解析结果**覆盖**，
   不再把客户端自带的伪造链透传下去（原先会把漏洞传播到后端）；
@@ -75,6 +73,5 @@
 
 1.0.2 之前的版本，变更未逐条记录。
 
-[未发布]: https://github.com/xwjiang2003/warden/compare/v1.0.2...HEAD
 [1.0.2]: https://github.com/xwjiang2003/warden/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/xwjiang2003/warden/releases/tag/v1.0.1

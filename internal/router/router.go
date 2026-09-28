@@ -84,15 +84,30 @@ func hostOnly(host string) string {
 func newReverseProxy(target *url.URL, al *accesslog.Logger) http.Handler {
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = sharedTransport
-	origDirector := proxy.Director
-	proxy.Director = func(r *http.Request) {
-		origDirector(r)
-		clientIP := util.ClientIPFromRequest(r)
-		r.Header.Set("X-Real-IP", clientIP)
-		if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
-			r.Header.Set("X-Forwarded-For", prior+", "+clientIP)
+	// 用 Rewrite 而不是 Director：Director 路径下 httputil.ReverseProxy 会
+	// 在回调之后**无条件**用自己的 req.RemoteAddr 覆盖 X-Forwarded-For，
+	// 我们在回调里设的值会被冲掉。Rewrite 由我们完全控制转发头，
+	// 且代理会先剥离客户端自带的 Forwarded/X-Forwarded-*（见 Go 源码
+	// reverseproxy.go 的 Rewrite 分支），适合用来阻断 XFF 伪造传播。
+	// 注意：二者互斥，必须清掉 NewSingleHostReverseProxy 预设的 Director。
+	proxy.Director = nil
+	proxy.Rewrite = func(pr *httputil.ProxyRequest) {
+		out, in := pr.Out, pr.In
+		// 与 NewSingleHostReverseProxy 的默认 Director 保持一致：
+		// target 作为路径前缀拼接进站内路径，Host 头保留客户端原始值
+		// （后端 Tomcat 按 Host 区分虚拟主机，改写会导致 404/串站）。
+		pr.SetURL(target)
+		out.Host = in.Host
+
+		// 用解析后的真实客户端 IP 覆盖转发头，而不是把客户端自带的 XFF
+		// 原样往下传：否则链首的伪造值会被后端继续当成真实 IP 使用，
+		// 把漏洞从 warden 传播到业务侧。
+		clientIP := util.ClientIP(in)
+		out.Header.Set("X-Real-IP", clientIP)
+		if clientIP == "" {
+			out.Header.Del("X-Forwarded-For")
 		} else {
-			r.Header.Set("X-Forwarded-For", clientIP)
+			out.Header.Set("X-Forwarded-For", clientIP)
 		}
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {

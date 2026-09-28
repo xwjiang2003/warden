@@ -117,5 +117,7 @@
     "listen": "127.0.0.1:9090",
     "username": "admin",
     "password": ""
-  }
+  },
+  "trusted_proxies": [],
+  "trust_local_proxy": true
 }

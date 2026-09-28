@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"warden/internal/config"
+	"warden/internal/store"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -85,5 +88,88 @@ func TestReadRuntimeStats(t *testing.T) {
 	}
 	if g < 1 {
 		t.Fatalf("协程数应 >= 1，实际 %d", g)
+	}
+}
+
+// TestValidateTrustedProxies 可信代理配置的前置校验：
+// 写错的条目必须报错而不是静默忽略——否则用户只能去翻启动日志。
+func TestValidateTrustedProxies(t *testing.T) {
+	cases := []struct {
+		name    string
+		list    []string
+		wantBad bool
+	}{
+		{"空列表合法", nil, false},
+		{"单个 IP", []string{"10.0.1.5"}, false},
+		{"IPv4 网段", []string{"127.0.0.1/32", "10.0.0.0/8"}, false},
+		{"IPv6 与本机回环", []string{"::1", "2001:db8::/32"}, false},
+		{"两侧空白允许", []string{"  10.0.1.5  "}, false},
+		{"非法 IP", []string{"not-an-ip"}, true},
+		{"非法前缀", []string{"10.0.0.0/99"}, true},
+		{"IPv4 前缀超范围", []string{"10.0.0.0/33"}, true},
+		{"空行", []string{""}, true},
+		{"只有空白", []string{"   "}, true},
+		{"全网段必须拒绝", []string{"0.0.0.0/0"}, true},
+		{"IPv6 全网段必须拒绝", []string{"::/0"}, true},
+		{"混合：有错即报错", []string{"10.0.1.5", "0.0.0.0/0"}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := validateTrustedProxies(c.list)
+			if c.wantBad && len(got) == 0 {
+				t.Fatalf("期望报错，实际通过: %v", c.list)
+			}
+			if !c.wantBad && len(got) != 0 {
+				t.Fatalf("期望通过，实际报错: %v", got)
+			}
+		})
+	}
+}
+
+// TestPutConfigRejectsBadTrustedProxies 保存接口必须对写错的可信代理返回 400，
+// 且不落库（避免把"IP 可被伪造"的配置静默写进去）。
+func TestPutConfigRejectsBadTrustedProxies(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	dbPath := filepath.Join(dir, "warden.db")
+
+	cfg := &config.Config{Listen: ":81", Backend: "http://127.0.0.1:8002"}
+	if err := store.Save(cfgPath, dbPath, cfg); err != nil {
+		t.Fatalf("预置配置失败: %v", err)
+	}
+	s := NewServer(cfg, cfgPath, dbPath, config.AdminConfig{})
+
+	body := `{"listen":":81","backend":"http://127.0.0.1:8002","trusted_proxies":["0.0.0.0/0"]}`
+	rec := httptest.NewRecorder()
+	s.handlePutConfig(rec, httptest.NewRequest(http.MethodPut, "/api/config", strings.NewReader(body)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("全网段可信代理应返回 400，实际 %d，body=%s", rec.Code, rec.Body.String())
+	}
+	if s.restartNeeded.Load() {
+		t.Fatal("校验失败时不应置位重启标志")
+	}
+
+	// 合法配置应能保存成功
+	body = `{"listen":":81","backend":"http://127.0.0.1:8002","trusted_proxies":["127.0.0.1/32","10.0.0.0/8"]}`
+	rec = httptest.NewRecorder()
+	s.handlePutConfig(rec, httptest.NewRequest(http.MethodPut, "/api/config", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("合法可信代理应保存成功，实际 %d，body=%s", rec.Code, rec.Body.String())
+	}
+	if len(s.cfg.TrustedProxies) != 2 || s.cfg.TrustedProxies[0] != "127.0.0.1/32" {
+		t.Fatalf("配置未生效: %#v", s.cfg.TrustedProxies)
+	}
+
+	// 重新加载 DB，确认确实持久化了（而不是只改了内存）
+	reloaded, err := store.Load(cfgPath, dbPath)
+	if err != nil {
+		t.Fatalf("重新加载配置失败: %v", err)
+	}
+	if len(reloaded.TrustedProxies) != 2 {
+		t.Fatalf("trusted_proxies 未持久化: %#v", reloaded.TrustedProxies)
+	}
+	if !reloaded.TrustLocalProxyEnabled() {
+		t.Fatal("trust_local_proxy 缺省应为 true")
 	}
 }

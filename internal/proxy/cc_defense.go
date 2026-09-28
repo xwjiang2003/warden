@@ -762,7 +762,7 @@ func (h *CCDefenseHandler) handleCaptchaVerify(w http.ResponseWriter, r *http.Re
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	ip := util.ClientIPFromRequest(r)
+	ip := util.ClientIP(r)
 	sid := getSessionID(r)
 	target := r.FormValue("url")
 	// 防开放重定向：仅允许站内相对路径
@@ -843,7 +843,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := util.ClientIPFromRequest(r)
+	ip := util.ClientIP(r)
 
 	// IP 归属检测：按开关分别拦截国外 / 云厂商 IP
 	if h.ipChecker != nil && (h.blockForeign || h.blockCloud) {

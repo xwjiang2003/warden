@@ -32,6 +32,20 @@ type Config struct {
 	URLAllowlist        []string              `json:"url_allowlist"`
 	URLBlocklist        []string              `json:"url_blocklist"`
 	BlockPage           string                `json:"block_page"` // 自定义拦截页面 HTML
+	// TrustedProxies 可信反向代理地址（CIDR 或单个 IP）。
+	// 只有来自这些地址的请求，其 X-Forwarded-For / X-Real-IP 才会被采信。
+	TrustedProxies []string `json:"trusted_proxies"`
+	// TrustLocalProxy 是否额外信任来自本机回环（127.0.0.0/8、::1/128）的转发头，
+	// 缺省 true：对应 nginx/Tomcat 与本进程同机这一最常见部署，开箱即可取到
+	// 真实客户端 IP，等价于 Tomcat RemoteIpValve 的 internalProxies 默认值。
+	// 若服务跑在容器里（docker-proxy 会把远端连接的对端地址改写成 127.0.0.1），
+	// 请显式设为 false，否则容器内的对端地址会来自被改写的回环地址而失真。
+	TrustLocalProxy *bool `json:"trust_local_proxy"`
+}
+
+// TrustLocalProxyEnabled 返回是否信任本机回环转发，缺省 true。
+func (c *Config) TrustLocalProxyEnabled() bool {
+	return c.TrustLocalProxy == nil || *c.TrustLocalProxy
 }
 
 // IPBlacklistConfig IP 黑名单配置

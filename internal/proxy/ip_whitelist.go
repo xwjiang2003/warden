@@ -70,7 +70,7 @@ func WhitelistMiddleware(w *IPWhitelist, enabled bool, inner, next http.Handler)
 		return next
 	}
 	return http.HandlerFunc(func(wr http.ResponseWriter, r *http.Request) {
-		ip := util.ClientIPFromRequest(r)
+		ip := util.ClientIP(r)
 		if w.contains(ip) {
 			if _, ok := w.logged.LoadOrStore(ip, true); !ok {
 				log.Printf("[whitelist] bypass ip=%s (首次命中)", ip)

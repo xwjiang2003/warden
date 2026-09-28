@@ -87,7 +87,7 @@ func (rl *IPRateLimiter) Middleware(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := util.ClientIPFromRequest(r)
+		ip := util.ClientIP(r)
 		hot := rl.isHotPath(r.URL.Path)
 		reason, over := rl.check(ip, hot)
 		if over {

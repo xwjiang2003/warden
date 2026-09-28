@@ -1,7 +1,6 @@
 package util
 
 import (
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,24 +15,6 @@ func ExecutableDir() (string, error) {
 		return "", err
 	}
 	return filepath.Dir(exe), nil
-}
-
-// ClientIPFromRequest 从请求中提取客户端真实 IP（优先 X-Forwarded-For / X-Real-IP）
-func ClientIPFromRequest(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.Index(xff, ","); i > 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return strings.TrimSpace(xri)
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }
 
 // DurationSec 将秒数转为 time.Duration，<=0 时使用默认值

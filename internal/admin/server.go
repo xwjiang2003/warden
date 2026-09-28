@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
@@ -204,6 +205,16 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	newCfg.CCDefense.Normalize()
 	newCfg.Alert.Normalize()
 
+	// 可信代理写错会导致"日志里全是 nginx 的 IP"或"IP 可被伪造"，
+	// 这里在保存前就拦下来，避免用户只能靠重启日志排查。
+	if bad := validateTrustedProxies(newCfg.TrustedProxies); len(bad) > 0 {
+		log.Printf("[admin] 拒绝保存配置: trusted_proxies 有误: %s", strings.Join(bad, "；"))
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "trusted_proxies 配置有误: " + strings.Join(bad, "；"),
+		})
+		return
+	}
+
 	if err := store.Save(s.cfgPath, s.dbPath, &newCfg); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "写入配置文件失败: " + err.Error(),
@@ -219,6 +230,35 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		"message":          "配置已保存",
 		"restart_required": true,
 	})
+}
+
+// validateTrustedProxies 校验可信代理列表，返回问题描述（空表示通过）。
+// 与 util.NewClientIPResolver 的"跳过非法项"策略不同：配置界面保存时应当
+// 明确报错，否则写错的条目会被静默忽略，用户只能去翻启动日志。
+func validateTrustedProxies(list []string) []string {
+	var bad []string
+	for _, raw := range list {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			bad = append(bad, "存在空行（请删除多余空白行）")
+			continue
+		}
+		if !strings.Contains(s, "/") {
+			if net.ParseIP(s) == nil {
+				bad = append(bad, s+" 不是合法的 IP 或 CIDR")
+			}
+			continue
+		}
+		_, netw, err := net.ParseCIDR(s)
+		if err != nil {
+			bad = append(bad, s+" 不是合法的 IP 或 CIDR")
+			continue
+		}
+		if ones, bits := netw.Mask.Size(); ones == 0 && bits > 0 {
+			bad = append(bad, s+" 覆盖全网段，等同于信任所有转发头（客户端 IP 可被伪造），请改为具体地址或收窄网段")
+		}
+	}
+	return bad
 }
 
 func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {

@@ -58,6 +58,21 @@ func main() {
 	attacklog.Init(dbPath, cfg.AttackLogRetainDays)
 	blockpage.Set(cfg.BlockPage)
 
+	// 真实客户端 IP 解析必须在使用任何 IP 的中间件之前配置好：
+	// 默认只信任本机回环转发（同机 nginx 无需配置）；
+	// 配置了 trusted_proxies 才采信来自这些地址的 X-Forwarded-For/X-Real-IP。
+	util.SetTrustedProxies(cfg.TrustedProxies, cfg.TrustLocalProxyEnabled())
+	switch {
+	case util.TrustedProxies() > 0 && util.TrustLocalProxy():
+		log.Printf("trusted_proxies: %d 条 + 本机回环，将采信来自这些地址的 X-Forwarded-For", util.TrustedProxies())
+	case util.TrustedProxies() > 0:
+		log.Printf("trusted_proxies: %d 条（不含本机回环），将采信来自这些地址的 X-Forwarded-For", util.TrustedProxies())
+	case util.TrustLocalProxy():
+		log.Printf("trusted_proxies: 未配置，仅信任本机回环（127.0.0.0/8, ::1）转发的 X-Forwarded-For")
+	default:
+		log.Printf("trusted_proxies: 未配置且 trust_local_proxy=false，客户端 IP 一律取直连对端地址（忽略 XFF/X-Real-IP）")
+	}
+
 	adminSrv := admin.NewServer(cfg, cfgPath, dbPath, cfg.Admin)
 	adminSrv.Start()
 
@@ -110,7 +125,7 @@ func main() {
 	}
 	fwBlocker := proxy.NewFirewallBlocker(cfg.FirewallBlock.Enabled && cfg.FirewallBlock.AutoBlock, cfg.FirewallBlock.ExpireMin, cfg.FirewallBlock.WhitelistCIDRs, fwStore)
 
-	inner := realIPMiddleware(txhttp.WrapHandler(wafEngine, siteRouter))
+	inner := txhttp.WrapHandler(wafEngine, siteRouter)
 	var ccDef *proxy.CCDefenseHandler
 	rl := proxy.NewIPRateLimiter(cfg.RateLimit, cfg.BlockRequests, func(ip string) {
 		if ccDef != nil {
@@ -194,15 +209,6 @@ func fatalStartup(exeDir, format string, args ...interface{}) {
 func metricsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		metrics.TotalRequests.Inc()
-		next.ServeHTTP(w, r)
-	})
-}
-
-func realIPMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if ip := util.ClientIPFromRequest(r); ip != "" {
-			r.RemoteAddr = ip + ":0"
-		}
 		next.ServeHTTP(w, r)
 	})
 }

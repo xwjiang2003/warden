@@ -17,7 +17,7 @@ func BlocklistMiddleware(block *IPWhitelist, enabled bool, next http.Handler) ht
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := util.ClientIPFromRequest(r)
+		ip := util.ClientIP(r)
 		if block.contains(ip) {
 			metrics.IPCheckBlocked.Inc()
 			attacklog.Record(ip, r.Host, r.URL.Path, "IP黑名单", "blocklisted")

@@ -149,12 +149,12 @@ func copyFile(src, dst string) error {
 
 // Log 记录一条访问日志
 func (al *Logger) Log(r *http.Request, status int, bytes int64) {
-	if r == nil {
+	if al == nil || r == nil {
 		return
 	}
 	now := time.Now()
 	line := fmt.Sprintf("%s - [%s] \"%s %s %s\" %d %d \"%s\" \"%s\"\n",
-		util.ClientIPFromRequest(r),
+		util.ClientIP(r),
 		now.Format("02/Jan/2006:15:04:05 -0700"),
 		r.Method,
 		r.URL.RequestURI(),

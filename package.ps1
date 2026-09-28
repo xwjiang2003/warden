@@ -9,6 +9,8 @@
 #   rules/coraza.conf    WAF 规则
 #   data/ip2region.xdb   IP 归属库（国外/云厂商拦截依赖；-SkipIPDB 可排除，省约 10MB）
 #   LICENSE / NOTICE     Apache-2.0 第 4 条要求分发时随附
+#   README.md            部署与配置说明
+#   CHANGELOG.md         版本变更与升级注意（含行为变更，升级前必读）
 #
 # 用法：
 #   .\package.ps1                  # 先编译全部平台，再打包
@@ -45,6 +47,12 @@ foreach ($f in $required) {
     if (-not (Test-Path $f)) { throw "缺少 $f：请先执行 .\build.ps1 完成编译（或检查文件是否被误删）" }
 }
 
+# 文档类：缺失只告警不中断，保证打包流程不被文档问题卡住
+$docs = @("LICENSE", "NOTICE", "README.md", "CHANGELOG.md")
+foreach ($f in $docs) {
+    if (-not (Test-Path $f)) { Write-Warning "缺少 $f，将不会打进发布包" }
+}
+
 $build = "dist\warden"
 if (Test-Path $build) { Remove-Item $build -Recurse -Force }
 New-Item -ItemType Directory -Force -Path "$build\rules" | Out-Null
@@ -54,6 +62,10 @@ Copy-Item "rules\coraza.conf" "$build\rules\" -Force
 # Apache-2.0 第 4 条要求：分发时必须随附许可与声明文件
 Copy-Item "LICENSE" "$build\" -Force
 Copy-Item "NOTICE" "$build\" -Force
+# 说明文档：升级的人能直接看到行为变更（如 1.0.2 的真实 IP 解析变更）
+foreach ($f in @("README.md", "CHANGELOG.md")) {
+    if (Test-Path $f) { Copy-Item $f "$build\" -Force }
+}
 
 if (-not $SkipIPDB) {
     if (Test-Path "data\ip2region.xdb") {

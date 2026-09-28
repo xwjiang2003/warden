@@ -21,6 +21,10 @@ NOTICE         text eol=lf
 .gitattributes text eol=lf
 
 # ---------- Windows 脚本：检出为 CRLF（cmd / PowerShell 习惯） ----------
+# 注意：package.ps1 / build.ps1 含中文，必须保存为 **UTF-8 with BOM**。
+# 没有 BOM 时 Windows PowerShell 5.1 会按系统 ANSI 代码页解析文件，
+# 中文变乱码并直接报语法错误。用编辑器改动这些文件后请确认 BOM 还在
+# （例如 PowerShell 的 Set-Content -Encoding UTF8 会加 BOM，[IO.File]::WriteAllText 默认不加）。
 *.bat          text eol=crlf
 *.cmd          text eol=crlf
 *.ps1          text eol=crlf

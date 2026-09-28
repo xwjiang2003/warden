@@ -58,3 +58,7 @@ venv/
 tmp/
 temp/
 _pkg*
+
+# === Local toolchain sandbox (workspace-local GOCACHE / APPDATA) ===
+.gocache/
+.appdata/

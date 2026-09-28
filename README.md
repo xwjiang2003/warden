@@ -10,7 +10,7 @@
 - 依赖的 SQLite 是**纯 Go 实现**（`modernc.org/sqlite`），**不需要 cgo**，交叉编译和分发都很简单；
 - 面向真实攻击场景设计：新 IP 泛洪、脚本化 CC、扫描器探测、云厂商/国外 IP 刷量。
 
-> 许可证：[Apache-2.0](LICENSE) ｜ 第三方组件声明：[NOTICE](NOTICE)
+> 许可证：[Apache-2.0](LICENSE) ｜ 第三方组件声明：[NOTICE](NOTICE) ｜ 版本变更：[CHANGELOG.md](CHANGELOG.md)
 
 ---
 
@@ -58,7 +58,9 @@
 - 基于 [OWASP Coraza](https://coraza.io/) v3，兼容 ModSecurity / OWASP CRS 规则语法；
 - 内置脚本 UA 拦截、扫描器路径 / UA 拦截、自定义拦截路径（可配返回状态码）；
 - 支持 `DetectionOnly`（观察）与 `On`（拦截）两种引擎模式，方便先观察再上线；
-- 支持可选加载 OWASP CRS 规则集。
+- 支持可选加载 OWASP CRS 规则集；
+- 想系统学习 Coraza 规则：见 [Coraza 规则详解：从 SecRule 语法到写出第一条防护规则](https://devtools.help/blog/coraza-waf-rules)
+  —— 覆盖 `SecRule` 变量/运算符/动作、转换函数、`chain` 规则链、五个处理阶段与 CRS 调参。
 
 ### 🌊 CC 防护（核心能力）
 
@@ -94,7 +96,37 @@
 ### 🌐 多站点反向代理
 
 - 按 `Host` 头把请求路由到不同上游（`sites` 配置），未命中走默认 `backend`；
-- 自动注入 `X-Real-IP` / `X-Forwarded-For`，后端可拿到真实客户端 IP。
+- 自动注入 `X-Real-IP` / `X-Forwarded-For`，后端可拿到真实客户端 IP；
+- 转发前会**覆盖**（而非追加）客户端自带的转发头，阻断伪造 IP 向业务侧传播。
+
+### 🧭 真实客户端 IP（`trusted_proxies` / `trust_local_proxy`）
+
+X-Forwarded-For 是客户端可自填的头，所以 warden 用「可信代理」作为信任前提，
+这与 nginx 的 `set_real_ip_from`、Tomcat `RemoteIpValve` 的 `internalProxies` 是同一个机制：
+
+| 部署形态 | 需要配置吗 | 说明 |
+|---|---|---|
+| nginx/LB 与 warden **同机** | **不需要** | `trust_local_proxy` 默认 `true`，自动信任 `127.0.0.0/8`、`::1/128`，等价于 Tomcat 默认只信本机 |
+| nginx/LB 在**另一台机器** | 需要 | 把那台机器的内网地址/网段写进 `trusted_proxies` |
+| 前面还有 **CDN**（多层代理） | 需要 | 把各层代理的出口网段都写进 `trusted_proxies`，解析器会从右往左跳过它们 |
+| warden **直接对外** | 不需要 | 可显式写 `"trust_local_proxy": false`，此时完全不信任任何转发头 |
+
+解析规则（`internal/util/clientip.go`）：
+
+- 直连对端不在可信列表 → **转发头一律忽略**，以对端地址为准；
+- 对端可信 → 从 XFF 链**从右往左**跳过可信代理，取第一个不可信地址。
+  因此即使按标准 nginx 配置（`$proxy_add_x_forwarded_for`）把伪造值留在链首，也不会被采信；
+- XFF 缺失/不可用时才回退 `X-Real-IP`，且要求它本身也不可信（防伪造内网地址冒充代理）；
+- 每一段都做 IP 合法性校验，非法值丢弃而不是当成 IP 使用。
+
+> **容器部署注意**：若 warden 跑在容器里且端口用 `-p` 发布，docker-proxy 会把远端连接的
+> 对端地址改写成 `127.0.0.1`。此时请设 `"trust_local_proxy": false` 并显式配置
+> `trusted_proxies`，否则对端地址会失真。
+
+管理后台**「基本设置 → 真实客户端 IP」**页可在线配置这两项（含前端校验：非法条目、`/0`~`/8` 这类过宽网段会提示；
+保存接口也会拒绝 `0.0.0.0/0` 等全网段并返回明确错误）。保存后需**重启服务**生效。
+
+限流、CC 防御、IP 归属、白/黑名单、攻击日志、访问日志全部使用同一个解析结果。
 
 ### 📊 内嵌管理后台
 
@@ -136,6 +168,7 @@
 │  【TCP 层】ConnLimitListener —— 令牌桶，超额连接直接丢弃     │
 │  ──────────────────────────────────────────────────────  │
 │  【HTTP 中间件链】由外到内：                                │
+│    0. 客户端 IP 解析   ── 按 trusted_proxies 取真实 IP      │
 │    1. IP 黑名单        ── 命中 → 拦截                      │
 │    2. URL 白/黑名单    ── 命中 → 放行 / 拦截                │
 │    3. IP 白名单        ── 命中 → 直通（跳过后续检测）        │
@@ -263,7 +296,7 @@ Linux 下 zip 不保留可执行位，首次启动先赋权：
 
 ```bash
 mkdir -p /opt/warden && cd /opt/warden
-unzip ~/warden-v1.0.1.zip      # 文件平铺在包内根目录，建议先建好目录再解压
+unzip ~/warden-v1.0.2.zip      # 文件平铺在包内根目录，建议先建好目录再解压
 chmod +x run.sh warden warden-linux-arm64
 ./run.sh
 ```
@@ -332,6 +365,8 @@ curl -I  http://127.0.0.1:81/        # 应转发到后端
 | `block_page` | string | — | 自定义拦截页面 HTML |
 | `url_allowlist` | string[] | `[]` | URL 白名单（正则） |
 | `url_blocklist` | string[] | `[]` | URL 黑名单（正则） |
+| `trusted_proxies` | string[] | `[]` | 可信反向代理（CIDR 或单个 IP）。同机 nginx 无需配置，详见[真实客户端 IP](#-真实客户端-iptrusted_proxies--trust_local_proxy)。**可在管理后台「基本设置」页配置**，保存时校验非法/全网段条目 |
+| `trust_local_proxy` | bool | `true` | 是否信任本机回环（`127.0.0.0/8`、`::1`）转发的 XFF/X-Real-IP。容器部署建议设为 `false` |
 
 ### `rate_limit` 频率限制
 
@@ -442,14 +477,28 @@ server {
 }
 ```
 
-`config.json`：
+`config.json`（同机部署**无需配置** `trusted_proxies`，默认就信任本机回环；跨机才需要）：
 
 ```json
 {
   "listen": ":81",
-  "backend": "http://127.0.0.1:8002"
+  "backend": "http://127.0.0.1:8002",
+  "trusted_proxies": ["127.0.0.1/32"]
 }
 ```
+
+> **关于 XFF / X-Real-IP 伪造**：`$proxy_add_x_forwarded_for` 会保留客户端自带的 XFF
+> 再追加真实地址，因此链首可能是伪造值。warden 按「从右往左跳过可信代理」解析，
+> 不受链首伪造影响；`X-Real-IP` 优先级低于 XFF，仅在 XFF 不可用时兜底。
+> 若还想让 nginx 侧就把伪造值清掉，可把 XFF 改成覆盖写
+> `proxy_set_header X-Forwarded-For $remote_addr;`，二者可同时使用。
+
+> **从 1.0.1 及更早版本升级（1.0.2 起的行为变更）**：客户端 IP 改为按可信代理解析，
+> 默认只信任本机回环。若 nginx / LB **与 warden 不在同一台机器**，升级后日志与拦截判定
+> 会先看到 nginx 的 IP，请把它的地址填进 `trusted_proxies`（配置表见下文
+> [`trusted_proxies`](#-真实客户端-iptrusted_proxies--trust_local_proxy)）。
+> 同机部署无需任何改动。此前版本无条件采信客户端自填的 `X-Forwarded-For`，
+> 攻击者可借此绕过限流、伪造 IP 归属、甚至冒充白名单 IP 直通，建议尽快升级。
 
 ### 方案 B：WAF 直接对外
 
@@ -458,23 +507,34 @@ server {
 ```json
 {
   "listen": ":80",
-  "backend": "http://127.0.0.1:8002"
+  "backend": "http://127.0.0.1:8002",
+  "trust_local_proxy": false,
+  "trusted_proxies": []
 }
 ```
 
 > Windows 下监听 80 需要**以管理员身份**运行。
+>
+> 直接对外时把 `trust_local_proxy` 设为 `false`：此时 warden 完全忽略 XFF/X-Real-IP，
+> 客户端 IP 一律取 TCP 对端地址，无法伪造。
 
 ### 方案 C：多站点
 
 ```json
 {
   "backend": "http://127.0.0.1:8002",
+  "trusted_proxies": ["127.0.0.1/32", "10.0.0.0/8"],
   "sites": [
     { "name": "主站", "hosts": ["www.example.com"], "backend": "http://127.0.0.1:8002" },
     { "name": "后台", "hosts": ["admin.example.com"], "backend": "http://127.0.0.1:8003" }
   ]
 }
 ```
+
+> **部署铁律**：warden 的监听端口只能对 nginx（或内网 LB）开放，禁止公网直连。
+> 否则攻击者可以绕过 nginx 直连 warden 端口——此时对端地址不再是可信代理，
+> warden 会按其真实源地址判定（不会采信伪造头），但也就绕过了 nginx 层的
+> `limit_req` / `limit_conn` 等防护。
 
 ### 注册为系统服务
 
@@ -537,7 +597,7 @@ systemctl daemon-reload && systemctl enable --now warden
 | 菜单 | 功能 |
 |---|---|
 | 📊 仪表盘 | 实时指标、QPS/拦截率趋势图、拦截分类饼图、CPU/内存、代理信息 |
-| ⚙️ 基本设置 | 监听、上游、超时、访问日志等 |
+| ⚙️ 基本设置 | 监听、上游、超时、规则文件、真实客户端 IP（可信代理）、访问日志、全局开关、管理后台 |
 | ⏱️ 频率限制 | 热点路径、整站、子网阈值 |
 | 🛡️ CC 防御 | 泛洪/可信/验证码/违规升级等全部参数 |
 | 🔒 WAF 规则 | 脚本 UA、扫描器路径/UA、自定义拦截路径 |
@@ -698,6 +758,9 @@ Include rules/coreruleset/rules/*.conf
 > CRS 规则数量多、误报也相对更多，**务必**先用 `SecRuleEngine DetectionOnly` 观察一段时间，
 > 确认真实业务的误报可接受后再切换到 `On`。
 
+挂载 CRS 后若要写针对性规则或调参（`tx.paranoia_level`、异常分阈值等），
+规则语法与阶段机制可参考 [Coraza 规则详解：从 SecRule 语法到写出第一条防护规则](https://devtools.help/blog/coraza-waf-rules)，其中也说明了 CRS 的三个实用调节项。
+
 ### 6. 调参思路（应对大规模 CC）
 
 | 目标 | 调整 |
@@ -707,6 +770,20 @@ Include rules/coreruleset/rules/*.conf
 | 更早拦住顽固脚本 | 减小 `offender_persist_sec`（注意会更容易误伤短时突发） |
 | 降低资源消耗 | 关闭 `firewall_block`（内核层封禁代价高）、收紧 `conn_limit` |
 | 排查验证码通过率低 | 看 `captcha_passed / cc_challenged`，过低说明挑战过频或页面被脚本占据 |
+
+### 7. 日志里全是 127.0.0.1 / 只有 nginx 的 IP
+
+说明 warden 没把请求来源识别为可信代理，正在把直连对端（nginx）当成客户端：
+
+- **同机 nginx**：默认就该正常。若仍是 127.0.0.1，检查是否把 `trust_local_proxy` 设成了 `false`；
+- **跨机 nginx/LB**：把实际源地址写进 `trusted_proxies`（如 `"10.0.1.5"` 或 `"10.0.0.0/8"`）；
+- **前面有 CDN**：把各层代理网段都加进 `trusted_proxies`，缺失的那一跳会被当成客户端 IP；
+- **容器部署**：docker-proxy 会把对端改写成 127.0.0.1，需设 `"trust_local_proxy": false`
+  并显式配置 `trusted_proxies`；
+- 启动日志会打印 `trusted_proxies: N 条 + 本机回环` / `仅信任本机回环` / `未配置且 trust_local_proxy=false`，
+  可据此确认实际生效的策略；
+- 反过来，如果日志里出现了攻击者自填的 IP（如完全不存在的公网地址），
+  说明可信范围写得过宽（例如把公网网段加进去了），请立即收紧。
 
 ---
 
@@ -729,6 +806,8 @@ go build -ldflags "-X warden/internal/version.Version=1.2.3" -o warden.exe ./cmd
 - 第三方前端库放在 `web/vendor/`（本地化，不走 CDN），`embed_test.go` 会校验资源是否齐全；
 - 打包分发：`powershell -File package.ps1` 生成 `dist/warden.zip`。
 
+> Go 语法与标准库速查：[devtools.help/go-cheatsheet](https://devtools.help/go-cheatsheet)
+
 欢迎提交 Issue / PR，建议：
 
 1. 先开 Issue 说明场景与复现方式；
@@ -742,6 +821,12 @@ go build -ldflags "-X warden/internal/version.Version=1.2.3" -o warden.exe ./cmd
 - **管理后台默认无认证**（`admin.password` 为空），且默认只监听 `127.0.0.1`。
   如需远程访问，请**务必**设置强密码，并通过反向代理 + HTTPS + IP 白名单暴露；
 - 管理后台不要直接暴露到公网；
+- **客户端 IP 默认不可伪造**：只采信来自可信代理的 XFF/X-Real-IP，
+  默认仅信任本机回环（等价于 Tomcat `RemoteIpValve` 的默认策略）。
+  若配置了 `trusted_proxies`，请确保列表只包含你自己的 nginx/LB 地址——
+  写进公网网段（如 `0.0.0.0/0`）等同于关闭这道防护，启动时会打印告警；
+- **warden 监听端口只对可信代理开放**：能直连 warden 的客户端，其转发头不会被采信
+  （不会伪造成功），但可绕过 nginx 层的 `limit_req`/`limit_conn`；
 - `config.json` 中可能包含 SMTP 密码等敏感信息，注意文件权限，不要提交到仓库；
 - 本项目为应用层防护手段，**不能替代**系统补丁、最小权限、后端自身的安全编码。
 
@@ -764,6 +849,7 @@ You may obtain a copy of the License at
 - 你可以自由使用、修改、分发本项目，**包括商业用途与闭源集成**，只需保留版权与许可声明；
 - Apache-2.0 包含**明确的专利授权**，以及**商标条款**——协议不授予项目名称与 Logo 的商标使用权；
 - 本项目所用的第三方开源组件及其许可协议，见根目录 [`NOTICE`](NOTICE)。
+- 各版本变更与升级注意（含行为变更）见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ### 贡献
 

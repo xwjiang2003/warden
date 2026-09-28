@@ -244,6 +244,42 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
           </el-form>
         </div>
         <div class="page-card">
+          <h3>真实客户端 IP</h3>
+          <p style="color:#909399;font-size:13px;margin-bottom:12px">
+            影响全局：限流、CC 防御、IP 归属、黑白名单与访问日志都以此为准。
+            X-Forwarded-For / X-Real-IP 是客户端可自填的头，只有来自「可信代理」的请求才会被采信；
+            warden 从 XFF 链<b>从右往左</b>跳过可信代理，取第一个不可信地址作为真实客户端 IP，
+            因此链首的伪造值不会被采信。保存后需<b>重启服务</b>生效。
+          </p>
+          <el-form :model="config" label-width="130px" label-position="left">
+            <el-form-item label="信任本机回环代理">
+              <el-switch v-model="config.trust_local_proxy"></el-switch>
+              <div class="field-help">
+                开启后自动信任来自 127.0.0.0/8 与 ::1 的转发头，<b>同机 nginx/LB 无需任何配置</b>（等价于 Tomcat RemoteIpValve 的默认策略）。
+                容器部署（docker-proxy 会把对端地址改写成 127.0.0.1）请关闭，并显式填写下方可信代理。
+              </div>
+            </el-form-item>
+            <el-form-item label="可信代理 IP / CIDR">
+              <el-input v-model="trustedProxiesText" type="textarea" :rows="5"
+                        placeholder="10.0.1.5&#10;10.0.0.0/8&#10;172.16.0.0/12"></el-input>
+              <div class="field-help">
+                每行一个 IP 或 CIDR，填 nginx / LB / CDN 的出口地址。<b>跨机部署或前置 CDN 时必须填写</b>；
+                前面有多层代理时，把各层网段都写进来。
+                留空 + 关闭上面的开关 = 完全不信任转发头，客户端 IP 一律取直连对端地址（无法伪造，适合 warden 直接对外）。
+              </div>
+            </el-form-item>
+          </el-form>
+          <el-alert v-if="trustedProxyWarnings.length" type="warning" :closable="false" show-icon style="margin-top:4px">
+            <div v-for="(w, i) in trustedProxyWarnings" :key="i">{{ w }}</div>
+          </el-alert>
+          <el-alert v-else-if="!trustedProxiesText.trim() && !config.trust_local_proxy" type="info" :closable="false" show-icon style="margin-top:4px">
+            当前不信任任何转发头，客户端 IP 一律取 TCP 对端地址。仅在 warden 直接对外时才是期望行为。
+          </el-alert>
+          <el-alert v-else-if="!trustedProxiesText.trim()" type="info" :closable="false" show-icon style="margin-top:4px">
+            未配置可信代理，仅信任本机回环转发。若 nginx/LB 与 warden 不在同一台机器，请填写其地址。
+          </el-alert>
+        </div>
+        <div class="page-card">
           <h3>访问日志</h3>
           <el-form :model="config" label-width="130px" label-position="left">
             <el-form-item label="日志路径">
@@ -920,7 +956,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 <script src="vendor/axios.min.js"></script>
 <script src="vendor/echarts.min.js"></script>
 <script>
-const { createApp, ref, reactive, computed, onMounted } = Vue
+const { createApp, ref, reactive, computed, onMounted, onBeforeUnmount, watch } = Vue
 const { createRouter, createWebHashHistory } = VueRouter
 
 // API 基础路径
@@ -946,6 +982,8 @@ function defaultConfig() {
     url_blocklist: [],
     block_page: '',
     ip_check: { block_foreign: true, block_cloud: true },
+    trusted_proxies: [],
+    trust_local_proxy: true,
     admin: { enabled: true, listen: '127.0.0.1:9090', username: 'admin', password: '' },
     sites: [],
     alert: { enabled: false, smtp_host: '', smtp_port: 465, smtp_username: '', smtp_password: '', smtp_from: '', smtp_tls: true, to: [], cooldown_min: 10, block_rate_threshold: 50, webhook_url: '', dingtalk_url: '', wecom_url: '', feishu_url: '' }
@@ -1000,6 +1038,7 @@ const app = createApp({
     const customScriptUAsText = ref('')
     const customBlockPathsText = ref('')
     const whitelistCIDRsText = ref('')
+    const trustedProxiesText = ref('')
     const firewallWhitelistCIDRsText = ref('')
     const blacklistCIDRsText = ref('')
     const urlAllowlistText = ref('')
@@ -1023,6 +1062,30 @@ const app = createApp({
       const v = memPercent.value
       return v >= 85 ? '#f56c6c' : (v >= 60 ? '#e6a23c' : '#67c23a')
     })
+    // 可信代理列表的前端校验：只做"明显写错/过宽"的提示，
+    // 真正的解析仍以后端 Go 侧为准（后端会跳过非法项并在启动日志告警）。
+    const trustedProxyWarnings = computed(() => {
+      const out = []
+      const V4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(\/(\d{1,2}))?$/
+      textToArr(trustedProxiesText.value).forEach(item => {
+        const m = V4.exec(item)
+        if (m) {
+          const bad = [m[1], m[2], m[3], m[4]].some(x => Number(x) > 255)
+          const prefix = m[6] === undefined ? 32 : Number(m[6])
+          if (bad || prefix > 32) { out.push(item + '：不是合法的 IPv4 地址/CIDR'); return }
+          if (prefix <= 8) out.push(item + '：网段过大（/' + prefix + '），等同于信任所有转发头，客户端 IP 可被伪造')
+          return
+        }
+        if (item.includes(':')) {
+          // IPv6：只检查前缀长度范围，不解析压缩写法
+          const p = item.split('/')[1]
+          if (p !== undefined && (isNaN(Number(p)) || Number(p) > 128)) out.push(item + '：IPv6 前缀长度非法')
+          return
+        }
+        out.push(item + '：不是合法的 IP 或 CIDR')
+      })
+      return out
+    })
     const trend = ref([])
     const MAX_TREND = 60
     const cpuTrend = ref([])      // CPU 使用率趋势：/api/stats 每 3 秒给一个点
@@ -1030,14 +1093,12 @@ const app = createApp({
     let trendChart = null
     let cpuChart = null           // 系统状态卡片内的紧凑折线图
     let cpuChartFull = null       // 全屏弹窗内的大图
+    // 仪表盘图表每 2 秒刷新一次，但菜单切走时容器会被 v-if 卸载，
+    // 因此每轮都通过 whenChartReady 确认实例还绑在当前页面的节点上。
     function renderTrend() {
-      const el = document.getElementById('trend-chart')
-      if (!el) {
-        if (trendChart) { trendChart.dispose(); trendChart = null }
-        return
-      }
       if (!window.echarts) return
-      if (!trendChart) trendChart = echarts.init(el)
+      trendChart = whenChartReady(trendChart, 'trend-chart')
+      if (!trendChart) return
       trendChart.setOption({
         tooltip: { trigger: 'axis' },
         legend: { data: ['QPS', '拦截率%'] },
@@ -1068,13 +1129,9 @@ const app = createApp({
       ]
     }
     function renderBlockPie() {
-      const el = document.getElementById('block-pie')
-      if (!el) {
-        if (blockPie) { blockPie.dispose(); blockPie = null }
-        return
-      }
       if (!window.echarts) return
-      if (!blockPie) blockPie = echarts.init(el)
+      blockPie = whenChartReady(blockPie, 'block-pie')
+      if (!blockPie) return
       const data = blockCategories().filter(c => c.value > 0)
       blockPie.setOption({
         tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
@@ -1124,24 +1181,17 @@ const app = createApp({
     }
 
     function renderCpuChart() {
-      const el = document.getElementById('cpu-chart')
-      if (!el) {
-        if (cpuChart) { cpuChart.dispose(); cpuChart = null }
-        return
-      }
       if (!window.echarts) return
-      if (!cpuChart) cpuChart = echarts.init(el)
+      cpuChart = whenChartReady(cpuChart, 'cpu-chart')
+      if (!cpuChart) return
       cpuChart.setOption(cpuChartOption(false), true)
     }
 
     function renderCpuChartFull() {
-      const el = document.getElementById('cpu-chart-full')
-      if (!el) {
-        if (cpuChartFull) { cpuChartFull.dispose(); cpuChartFull = null }
-        return
-      }
       if (!window.echarts) return
-      if (!cpuChartFull) cpuChartFull = echarts.init(el)
+      // 全屏弹窗每次关闭都会 dispose，这里等价于"每次打开都重新 init"
+      cpuChartFull = whenChartReady(cpuChartFull, 'cpu-chart-full')
+      if (!cpuChartFull) return
       cpuChartFull.setOption(cpuChartOption(true), true)
     }
 
@@ -1163,6 +1213,7 @@ const app = createApp({
       customScriptUAsText.value = arrToText(config.waf_rules.custom_script_uas)
       customBlockPathsText.value = arrToText(config.waf_rules.custom_block_paths)
       whitelistCIDRsText.value = arrToText(config.ip_whitelist.cidrs)
+      trustedProxiesText.value = arrToText(config.trusted_proxies)
       blacklistCIDRsText.value = arrToText(config.ip_blacklist ? config.ip_blacklist.cidrs : [])
       urlAllowlistText.value = arrToText(config.url_allowlist)
       urlBlocklistText.value = arrToText(config.url_blocklist)
@@ -1181,6 +1232,7 @@ const app = createApp({
       config.waf_rules.custom_script_uas = textToArr(customScriptUAsText.value)
       config.waf_rules.custom_block_paths = textToArr(customBlockPathsText.value)
       config.ip_whitelist.cidrs = textToArr(whitelistCIDRsText.value)
+      config.trusted_proxies = textToArr(trustedProxiesText.value)
       if (config.ip_blacklist) config.ip_blacklist.cidrs = textToArr(blacklistCIDRsText.value)
       config.url_allowlist = textToArr(urlAllowlistText.value)
       config.url_blocklist = textToArr(urlBlocklistText.value)
@@ -1196,6 +1248,9 @@ const app = createApp({
         // ip_check 后端为可空指针，null 时按缺省 true 处理，避免开关显示为关但实际仍拦截
         if (config.ip_check.block_foreign == null) config.ip_check.block_foreign = true
         if (config.ip_check.block_cloud == null) config.ip_check.block_cloud = true
+        if (config.trusted_proxies == null) config.trusted_proxies = []
+        // trust_local_proxy 后端为可空指针，null 表示缺省 true
+        if (config.trust_local_proxy == null) config.trust_local_proxy = true
         if (config.sites == null) config.sites = []
         if (config.ip_blacklist == null) config.ip_blacklist = { enabled: false, cidrs: [] }
         if (config.url_allowlist == null) config.url_allowlist = []
@@ -1434,6 +1489,38 @@ const app = createApp({
       if (index === 'trustedips') loadTrustedIPs(1)
     }
 
+    // 各图表容器的 DOM 节点在切换菜单时会被 v-if 卸载并重新创建，
+    // 而 ECharts 实例在 init 时缓存了旧节点——直接 setOption 只会把图画到
+    // 已脱离文档的节点上（页面上什么都看不到）。所以每次渲染前都要校验
+    // 实例绑定的节点是否仍是当前页面上那个，不是就 dispose 重建。
+    function whenChartReady(chart, elId) {
+      const el = document.getElementById(elId)
+      if (!el) {
+        if (chart) chart.dispose()
+        return null
+      }
+      if (chart && chart.getDom() !== el) {
+        chart.dispose()
+        chart = null
+      }
+      return chart || echarts.init(el)
+    }
+
+    // 重绘仪表盘全部图表：窗口尺寸变化、以及切回仪表盘时调用
+    function refreshDashboardCharts() {
+      renderTrend()
+      renderBlockPie()
+      renderCpuChart()
+    }
+
+    function onWindowResize() {
+      if (!window.echarts) return
+      ;[trendChart, blockPie, cpuChart, cpuChartFull].forEach(c => {
+        // 已脱离文档的实例 resize 没有意义，等切回页面时重建即可
+        if (c && c.getDom() && c.getDom().isConnected) c.resize()
+      })
+    }
+
     onMounted(() => {
       loadConfig()
       // 每 3s 刷新状态：仪表盘走完整 /api/stats，其它页面走轻量 /api/state
@@ -1443,18 +1530,36 @@ const app = createApp({
       loadMetrics()
       metricsTimer = setInterval(loadMetrics, 2000)
       // 窗口尺寸变化时重绘各图表（全屏 CPU 图尤其需要）
-      window.addEventListener('resize', () => {
-        if (trendChart) trendChart.resize()
-        if (blockPie) blockPie.resize()
-        if (cpuChart) cpuChart.resize()
-        if (cpuChartFull) cpuChartFull.resize()
+      window.addEventListener('resize', onWindowResize)
+      // 离开仪表盘时 dispose 掉图表实例：容器节点马上会被 v-if 卸载，
+      // 留着旧实例的话后续渲染会画到已脱离文档的节点上，页面上就是空白。
+      watch(currentRoute, (to, from) => {
+        if (from === 'dashboard' && to !== 'dashboard') {
+          ;[trendChart, blockPie, cpuChart].forEach(c => c && c.dispose())
+          trendChart = null
+          blockPie = null
+          cpuChart = null
+        }
+        // 切回仪表盘：DOM 在本轮渲染后才就绪，等一个 tick 再重建图表
+        if (to === 'dashboard') setTimeout(refreshDashboardCharts, 0)
       })
+    })
+
+    onBeforeUnmount(() => {
+      window.removeEventListener('resize', onWindowResize)
+      clearInterval(statusTimer)
+      clearInterval(metricsTimer)
+      ;[trendChart, blockPie, cpuChart, cpuChartFull].forEach(c => c && c.dispose())
+      trendChart = null
+      blockPie = null
+      cpuChart = null
+      cpuChartFull = null
     })
 
     return {
       config, stats, metrics, qps, blockRate, captchaSuccessRate, trustedIPs, trustedIPsLoading, trustedIPsTotal, trustedIPsPage, trustedIPsPageSize, currentRoute, saving, restartNeeded, restarting, configLoaded, logsLoading, logLines, logFile, legalVisible, legalTitle, legalText, showLegal, cpuFullscreen, openCpuFullscreen, renderCpuChartFull, onCpuFullscreenClosed,
       hotPathsText, ccPathsText, scannerPathsText, scannerUAsText, customScriptUAsText, customBlockPathsText,
-      whitelistCIDRsText, firewallWhitelistCIDRsText, blacklistCIDRsText, urlAllowlistText, urlBlocklistText, alertToText, emailTesting,
+      whitelistCIDRsText, firewallWhitelistCIDRsText, blacklistCIDRsText, urlAllowlistText, urlBlocklistText, alertToText, emailTesting, trustedProxiesText, trustedProxyWarnings,
       pageTitle, blockType, cpuColor, memColor, cpuPercent, memPercent,
       navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, sendTestEmail, loadLogs, loadAttackLogs, clearAttackLogs, attackLogs,
       categoryType, fmtDetail, loadTrustedIPs, onTrustedPageSize, fmtTime

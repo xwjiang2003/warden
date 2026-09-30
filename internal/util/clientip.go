@@ -205,3 +205,26 @@ func TrustedProxies() int { return defaultClientIPResolver.Len() }
 
 // TrustLocalProxy 返回全局解析器是否在信任本机回环转发。
 func TrustLocalProxy() bool { return defaultClientIPResolver.localProxy }
+
+// RealIPMiddleware 把解析出的真实客户端 IP 写回 r.RemoteAddr。
+//
+// 为什么必须写回：并非所有下游都愿意调用 ClientIP。最典型的是 Coraza——
+// 它只认 http.Request.RemoteAddr，内部用 ProcessConnection(client, port, ...)
+// 填充 REMOTE_ADDR / REMOTE_PORT，既不读 X-Forwarded-For，也没有 realip 配置项。
+// 不写回的话 WAF 侧看到的是直连对端（前置 nginx 的 127.0.0.1）：规则中的
+// REMOTE_ADDR 判定全部失真，命中日志里的 [client ...] 也失去取证价值。
+//
+// 必须挂在整个中间件链的最外层，WAF 与所有以 IP 为判据的中间件都在它下游。
+// 端口沿用原始对端的真实端口（Coraza 会解析它做 ProcessConnection）。
+func RealIPMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ip := ClientIP(r); ip != "" {
+			if i := strings.LastIndex(r.RemoteAddr, ":"); i >= 0 {
+				r.RemoteAddr = ip + r.RemoteAddr[i:]
+			} else {
+				r.RemoteAddr = ip
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}

@@ -4,6 +4,38 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.3] - 2026-09-30
+
+修复 1.0.2 引入的回归：WAF 侧取不到真实客户端 IP。
+
+### 修复
+
+- **修复 Coraza 的 `REMOTE_ADDR` 退化为直连对端地址**（1.0.2 引入的回归）。
+  1.0.2 统一客户端 IP 口径时移除了把解析结果写回 `r.RemoteAddr` 的中间件，
+  而 Coraza 只认 `http.Request.RemoteAddr`（内部用 `ProcessConnection` 填
+  `REMOTE_ADDR`/`REMOTE_PORT`，既不读 `X-Forwarded-For` 也无 realip 配置项），
+  于是前置 nginx 同机部署时 WAF 看到的全是 `127.0.0.1`：
+  - 规则里的 `REMOTE_ADDR` 判定失真——CRS 的 `@ipMatch`、IP 白/黑名单类规则
+    要么恒命中、要么恒不命中；
+  - 命中日志 `[client "127.0.0.1"]` 失去取证价值，无法定位攻击者。
+
+  现在由 `util.RealIPMiddleware` 把解析结果写回 `RemoteAddr`，并挂到**整个中间件链
+  的最外层**（1.0.1 及以前它挂在 WAF 内层，位置本身也是错的）；端口沿用原始对端的
+  真实端口，不再写死 `:0`。
+
+### 说明
+
+- 其余以 IP 为判据的模块（频率限制、CC 防御、IP 归属、白/黑名单、访问日志、
+  转发给后端的 `X-Forwarded-For`）在 1.0.2 中不受影响，它们都走 `util.ClientIP`；
+  本次仅修复 Coraza 这条旁路。
+
+### 测试
+
+- `internal/util/realip_test.go`：`TestCorazaSeesResolvedClientIP` 用**真实 Coraza
+  引擎**跑 `@ipMatch` 规则做双向断言（装了中间件命中、没装则不命中），确保该用例
+  确实能抓住这次回归；另有 5 组用例覆盖 `RemoteAddr` 重写契约（取 XFF 链尾、
+  端口保留、对端不可信时忽略伪造 XFF、IPv6）。
+
 ## [1.0.2] - 2026-09-26
 
 安全修复版。**包含一项行为变更**，升级前请先阅读「升级注意」。
@@ -73,5 +105,6 @@
 
 1.0.2 之前的版本，变更未逐条记录。
 
+[1.0.3]: https://github.com/xwjiang2003/warden/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/xwjiang2003/warden/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/xwjiang2003/warden/releases/tag/v1.0.1

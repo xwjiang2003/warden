@@ -145,8 +145,11 @@ func main() {
 	writeTO := util.DurationSec(cfg.WriteTimeoutSec, 60)
 	idleTO := util.DurationSec(cfg.IdleTimeoutSec, 60)
 
+	// realIPMiddleware（util.RealIPMiddleware）必须在最外层：Coraza 只认
+	// RemoteAddr，需要在这一层就把解析结果写回，否则 WAF 的 REMOTE_ADDR
+	// 与命中日志里的 [client ...] 都会是直连对端（前置 nginx）。
 	srv := &http.Server{
-		Handler:           metricsMiddleware(mux),
+		Handler:           util.RealIPMiddleware(metricsMiddleware(mux)),
 		ReadTimeout:       readTO,
 		ReadHeaderTimeout: 10 * time.Second, // 慢速攻击防护：限制读取请求头的最长时间
 		WriteTimeout:      writeTO,

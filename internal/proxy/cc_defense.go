@@ -419,81 +419,180 @@ func (d *newIPFloodDetector) isFlooding(ip string) bool {
 // ---- IP 行为检测 ----
 // 在泛洪期间检测请求时序和路径多样性，识别脚本化 bot
 
+const (
+	// behaviorMaxEntries 行为状态的硬上限。超过后**只在后台 reaper 里**回收，
+	// 请求路径上仅做一个原子标记（避免在全局锁内做 O(n) 清扫）。
+	behaviorMaxEntries = 200000
+	// behaviorEvictWindow 仅在超过硬上限时才使用的激进回收窗口。
+	// 常态回收用 idleReset（默认 600s）——短窗口会把慢速访问者的状态反复清空，
+	// 导致间隔/路径两项检测都攒不到样本。
+	behaviorEvictWindow = 30 * time.Second
+	// behaviorMaxPathsPerIP 单 IP 记录的不同路径数上限，防止少量 IP 用海量路径撑爆内存。
+	behaviorMaxPathsPerIP = 64
+)
+
 type ipBehaviorTracker struct {
 	mu        sync.Mutex
 	lastSeen  map[string]time.Time      // 上次请求时间
-	intervals map[string][]int64        // 最近 5 次请求间隔(ms)
-	paths     map[string]map[string]int // IP → path → count
+	intervals map[string][]int64        // 最近 8 次请求间隔(ms)
+	paths     map[string]map[string]struct{} // IP → 访问过的路径集合（不记次数，天然有界）
+	pathTotal map[string]int            // IP → 累计请求数（与 paths 同步维护，避免每次遍历求和）
 	idleReset time.Duration             // 空闲超过该时长即清空该 IP 行为状态
+
+	// overCap 标记已超过 behaviorMaxEntries，等待 reaper 回收。
+	// 置位期间不再为新 IP 建立状态（已有 IP 继续正常判定），
+	// 用原子读替代锁内计数，保证请求路径不引入扫描成本。
+	overCap atomic.Bool
+
+	// "路径单一"判定阈值。原实现是 >10 次且 ≤2 路径，会把反复阅读同一篇
+	// 文章/同一列表页的真实用户判成脚本（线上日志里同一 URI 反复出现即是此形态），
+	// 因此阈值放宽为 pathReqsMin 次。两值均可由 behavior_path_* 配置覆盖。
+	pathReqsMin  int
+	pathCountMax int
 }
 
-func newIPBehaviorTracker(idleSec int) *ipBehaviorTracker {
+func newIPBehaviorTracker(idleSec, pathReqsMin, pathCountMax int) *ipBehaviorTracker {
+	if pathReqsMin <= 0 {
+		pathReqsMin = 100
+	}
+	if pathCountMax <= 0 {
+		pathCountMax = 2
+	}
 	return &ipBehaviorTracker{
-		lastSeen:  make(map[string]time.Time),
-		intervals: make(map[string][]int64),
-		paths:     make(map[string]map[string]int),
-		idleReset: time.Duration(idleSec) * time.Second,
+		lastSeen:     make(map[string]time.Time),
+		intervals:    make(map[string][]int64),
+		paths:        make(map[string]map[string]struct{}),
+		pathTotal:    make(map[string]int),
+		idleReset:    time.Duration(idleSec) * time.Second,
+		pathReqsMin:  pathReqsMin,
+		pathCountMax: pathCountMax,
 	}
 }
 
-// isBotLike 检测请求模式是否像脚本/bot
-// 返回 true 如果匹配以下特征:
-//   - 请求间隔高度均匀（方差 <50ms，真人浏览间隔不均匀）
-//   - 路径过于单一（>10 次请求但只访问 1-2 个路径）
+// drop 清理某个 IP 的全部行为状态。
+// 路径数直接由 len(paths[ip]) 得出（不再单独维护 distinct），所以删掉 paths 即归零。
+func (bt *ipBehaviorTracker) drop(ip string) {
+	delete(bt.lastSeen, ip)
+	delete(bt.intervals, ip)
+	delete(bt.paths, ip)
+	delete(bt.pathTotal, ip)
+}
+
+// isBotLike 检测请求模式是否像脚本/bot。命中以下任一特征即判定：
+//   - 请求间隔过于均匀（真人浏览间隔不均匀）；
+//   - 路径过于单一：累计请求 ≥ pathReqsMin 且只访问 ≤ pathCountMax 个不同路径。
+//
+// 重要：本函数必须在**所有返回路径**上更新 lastSeen —— 原实现在判定 1 命中时
+// 提前 return，导致该 IP 的 lastSeen 永不推进、间隔统计自相矛盾。
 func (bt *ipBehaviorTracker) isBotLike(ip, path string) bool {
 	bt.mu.Lock()
 	defer bt.mu.Unlock()
 
 	now := time.Now()
 
-	// 空闲衰减：超过 idleReset 未访问的 IP，清空其行为状态，当作全新会话重新判定，
-	// 避免"路径单一"等累计指标被永久记住、导致真人长时间无法恢复。
-	if bt.idleReset > 0 {
-		if prev, ok := bt.lastSeen[ip]; ok && now.Sub(prev) >= bt.idleReset {
-			delete(bt.lastSeen, ip)
-			delete(bt.intervals, ip)
-			delete(bt.paths, ip)
+	// 容量守卫（热路径）：只做一次原子读。已超上限时不再为新 IP 建状态，
+	// 等 reaper 回收后恢复——避免在锁内做任何 O(n) 操作。
+	over := bt.overCap.Load()
+	if over {
+		if _, known := bt.lastSeen[ip]; !known {
+			return false
 		}
 	}
 
-	// 1. 请求间隔检测
+	// 空闲衰减：超过 idleReset 未访问的 IP 视为全新会话，丢弃全部旧状态。
+	// 这里直接 return false：本次访问是新会话的第一个请求，既不用旧状态判定，
+	// 也不计入新会话的累计（从下一次请求开始重新计数）。
+	if bt.idleReset > 0 {
+		if prev, ok := bt.lastSeen[ip]; ok && now.Sub(prev) >= bt.idleReset {
+			bt.drop(ip)
+			bt.lastSeen[ip] = now
+			return false
+		}
+	}
+
+	// 1. 请求间隔检测（用更新前的 lastSeen 计算间隔）
 	if prev, ok := bt.lastSeen[ip]; ok {
 		interval := now.Sub(prev).Milliseconds()
 		bt.intervals[ip] = append(bt.intervals[ip], interval)
 		if len(bt.intervals[ip]) > 8 {
 			bt.intervals[ip] = bt.intervals[ip][len(bt.intervals[ip])-8:]
 		}
-		// 累计 5 个间隔后开始检测
-		if len(bt.intervals[ip]) >= 5 {
-			if bt.uniformIntervals(bt.intervals[ip]) {
-				return true // 间隔过于均匀 → bot
-			}
+		if len(bt.intervals[ip]) >= 5 && bt.uniformIntervals(bt.intervals[ip]) {
+			bt.lastSeen[ip] = now // 命中也要推进，避免状态失真
+			return true
 		}
 	}
 	bt.lastSeen[ip] = now
 
-	// 2. 路径多样性检测
+	// 2. 路径多样性检测。
+	// 只关心"不同路径数"与"累计请求数"，所以每个 IP 只记路径集合（不记次数）——
+	// 这样单 IP 的内存天然有界，且不会因为用 0 当哨兵而把计数算错。
 	if bt.paths[ip] == nil {
-		bt.paths[ip] = make(map[string]int)
+		bt.paths[ip] = make(map[string]struct{})
 	}
-	bt.paths[ip][path]++
-	totalReqs := 0
-	for _, cnt := range bt.paths[ip] {
-		totalReqs += cnt
+	if len(bt.paths[ip]) < behaviorMaxPathsPerIP {
+		bt.paths[ip][path] = struct{}{}
 	}
-	// >10 次请求但只访问 ≤2 个路径 → 疑似 bot（真人浏览会访问多个页面）
-	if totalReqs > 10 && len(bt.paths[ip]) <= 2 {
+	bt.pathTotal[ip]++
+
+	if bt.pathTotal[ip] >= bt.pathReqsMin && len(bt.paths[ip]) <= bt.pathCountMax {
 		return true
 	}
 
-	// 定期清理
-	if len(bt.lastSeen) > 100000 {
-		bt.lastSeen = make(map[string]time.Time)
-		bt.intervals = make(map[string][]int64)
-		bt.paths = make(map[string]map[string]int)
+	// 只做一次布尔判断；真正的回收在 reaper 里
+	if !over && len(bt.lastSeen) >= behaviorMaxEntries {
+		bt.overCap.Store(true)
 	}
 
+	// 请求路径上不做清扫：状态回收交给后台 reaper（与 trust/perIP/throttle 同一模型）。
+	// 曾在热路径上按"是否超过阈值"触发遍历，攻击期大量 IP 都活跃、遍历一条都删不掉，
+	// 于是每个请求都在全局锁内 O(n) 遍历，比原来的"整体重建"严重得多。
 	return false
+}
+
+// sweep 回收行为状态（由 reaper 定期调用，不在请求路径上）。
+//
+// 次序很重要：**常态按 idleReset(默认 600s) 回收**，只有删完仍超过硬上限时才切到
+// 更激进的窗口。反过来（常态就用短窗口）会把间隔较长的访问者状态反复清空：
+// drop() 连 intervals 一起清，导致"间隔均匀"攒不到 5 个样本、
+// pathTotal 也攒不到阈值，慢速检测整体失效，并架空 behavior_idle_reset_sec 配置。
+func (bt *ipBehaviorTracker) sweep(now time.Time) {
+	bt.mu.Lock()
+	defer bt.mu.Unlock()
+	if len(bt.lastSeen) == 0 {
+		bt.overCap.Store(false)
+		return
+	}
+
+	// 第一段：按 idleReset 回收长期不活动的 IP（常态路径）
+	cutoff := now.Add(-bt.idleReset)
+	if bt.idleReset <= 0 {
+		cutoff = now.Add(-10 * time.Minute)
+	}
+	for ip, t := range bt.lastSeen {
+		if t.Before(cutoff) {
+			bt.drop(ip)
+		}
+	}
+
+	// 第二段：删完仍超硬上限，说明是"海量活跃 IP"的极端场景，
+	// 先按更短的窗口再收一轮，还超就整体重建——宁可丢一轮判定状态也不能让内存无界增长。
+	if len(bt.lastSeen) > behaviorMaxEntries {
+		aggressive := now.Add(-behaviorEvictWindow)
+		for ip, t := range bt.lastSeen {
+			if t.Before(aggressive) {
+				bt.drop(ip)
+			}
+		}
+	}
+	if len(bt.lastSeen) > behaviorMaxEntries {
+		log.Printf("[cc_defense] 行为状态 %d 条超过上限 %d，整体重建", len(bt.lastSeen), behaviorMaxEntries)
+		bt.lastSeen = make(map[string]time.Time)
+		bt.intervals = make(map[string][]int64)
+		bt.paths = make(map[string]map[string]struct{})
+		bt.pathTotal = make(map[string]int)
+	}
+	bt.overCap.Store(false)
 }
 
 // uniformIntervals 检测请求间隔是否过于均匀（脚本特征）
@@ -665,10 +764,10 @@ func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *Fi
 		trust:        newIPTrustTracker(cfg.TrustIPWindowSec, cfg.TrustIPMinVisits, cfg.TrustIPTTLSec, trustStore),
 		flood:        newNewIPFloodDetector(cfg.NewIPCheckSec, cfg.NewIPRatioBlock, cfg.NewIPCheckMinReqs, cfg.FloodSlidingWindowSec),
 		fw:           fw,
-		behavior:     newIPBehaviorTracker(cfg.BehaviorIdleResetSec),
+		captcha:      newCaptchaStore(cfg.CaptchaGenMaxPerSec),
+		behavior:     newIPBehaviorTracker(cfg.BehaviorIdleResetSec, cfg.BehaviorPathReqsMin, cfg.BehaviorPathCountMax),
 		sessions:     newSessionTracker(),
 		ipChecker:    newIPRegionChecker(),
-		captcha:      newCaptchaStore(),
 		blockForeign: ipCfg.BlockForeignEnabled(),
 		blockCloud:   ipCfg.BlockCloudEnabled(),
 		throttle:     newLogThrottler(ccLogThrottleInterval),
@@ -676,9 +775,10 @@ func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *Fi
 		next:         next,
 	}
 	go h.trust.restore() // 异步恢复可信 IP，不阻塞启动
-	log.Printf("[cc_defense] enabled trusted_ips=%d/%ds ttl=%ds global_qps=%d burst=%d new_ip_qps=%d burst=%d per_ip_qps=%d burst=%d flood_ratio=%d%%",
+	log.Printf("[cc_defense] enabled trusted_ips=%d/%ds ttl=%ds global_qps=%d burst=%d new_ip_qps=%d burst=%d per_ip_qps=%d burst=%d flood_ratio=%d%% captcha_gen=%d/s behavior_path=%dreqs/%dpaths",
 		cfg.TrustIPMinVisits, cfg.TrustIPWindowSec, cfg.TrustIPTTLSec, cfg.GlobalQPSMax, cfg.GlobalQPSBurst,
-		cfg.NewIPQPSMax, cfg.NewIPQPSBurst, cfg.UntrustedIPQPSMax, cfg.UntrustedIPBurst, cfg.NewIPRatioBlock)
+		cfg.NewIPQPSMax, cfg.NewIPQPSBurst, cfg.UntrustedIPQPSMax, cfg.UntrustedIPBurst, cfg.NewIPRatioBlock,
+		cfg.CaptchaGenMaxPerSec, cfg.BehaviorPathReqsMin, cfg.BehaviorPathCountMax)
 	go h.reaper()
 	return h
 }
@@ -739,6 +839,14 @@ func (h *CCDefenseHandler) reaper() {
 
 		// 5) 日志限频 key：清理长期未活动的 key，避免无界增长
 		h.throttle.gc()
+
+		// 6) IP 行为状态：常态按 idle_reset 回收，超硬上限时整体重建。
+		// 放在这里而非请求路径上——请求路径只置 overCap 标记，不做 O(n) 扫描。
+		h.behavior.sweep(now)
+
+		// 7) 验证码：回收过期条目（TTL 5 分钟）。
+		// 同样不能在 generate() 里做：它持的是 verify() 共用锁，全表遍历会堵住用户提交。
+		h.captcha.sweep(now)
 	}
 }
 
@@ -974,10 +1082,14 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if !h.dlimiter.untrusted.allow() {
 		// 未信任共享桶达到上限：不再直接断连，改为验证码挑战。
-		// 通过验证后获得可信凭证（会话 Cookie / 可信 IP），转入 800 QPS 可信桶，
+		// 通过验证后获得可信凭证（会话 Cookie / 可信 IP），转入可信桶，
 		// 不再占用未信任桶，拥堵可自我恢复。搜索引擎爬虫例外，仍按原策略限速断连，
-		// 避免把验证码页喂给爬虫。serveCaptcha 内部有 captchaGenMaxPerSec(30 张/秒)
-		// 的生成节流，极端洪峰超限时自动退回断连，防止 OOM。
+		// 避免把验证码页喂给爬虫。
+		//
+		// 注意：验证码产能上限来自 cc_defense.captcha_gen_max_per_sec
+		// （缺省跟随 new_ip_qps_max），超出即回 503，不再静默断连。
+		// 另外这里的"桶耗尽"只是 4 个挑战来源之一：泛洪新 IP（flooding 分支）、
+		// bot-like 行为、per-IP 限速也会直接挑战，所以产能需求并不只由本桶决定。
 		if isSearchBot(r.Header.Get("User-Agent")) {
 			if h.throttle.allow("sbot:" + ip) {
 				log.Printf("[cc_defense] search bot ip=%s rate limited, closing connection", ip)

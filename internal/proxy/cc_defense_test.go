@@ -16,7 +16,7 @@ import (
 )
 
 func TestCaptchaFlow(t *testing.T) {
-	s := newCaptchaStore()
+	s := newCaptchaStore(0)
 	id, b64, err := s.generate("sid", "1.2.3.4")
 	if err != nil {
 		t.Fatalf("generate: %v", err)
@@ -44,7 +44,7 @@ func TestCaptchaFlow(t *testing.T) {
 }
 
 func TestCaptchaVerifyRejects(t *testing.T) {
-	s := newCaptchaStore()
+	s := newCaptchaStore(0)
 	id, _, _ := s.generate("sid", "1.2.3.4")
 
 	// 错误 IP
@@ -62,7 +62,7 @@ func TestCaptchaVerifyRejects(t *testing.T) {
 }
 
 func TestCaptchaImageValid(t *testing.T) {
-	s := newCaptchaStore()
+	s := newCaptchaStore(0)
 	_, b64, err := s.generate("sid", "1.2.3.4")
 	if err != nil {
 		t.Fatalf("generate: %v", err)
@@ -93,9 +93,10 @@ func TestParseClicks(t *testing.T) {
 
 // TestCaptchaThrottle 验证泛洪时节流：超过每秒上限后拒绝生成，防止 OOM
 func TestCaptchaThrottle(t *testing.T) {
-	s := newCaptchaStore()
+	const limit = 5 // 显式小上限，避免依赖默认值
+	s := newCaptchaStore(limit)
 	// 用空 sid（跳过复用）以便每次都真正生成，从而消耗节流额度
-	for i := 0; i < captchaGenMaxPerSec; i++ {
+	for i := 0; i < limit; i++ {
 		if _, _, err := s.generate("", "1.2.3.4"); err != nil {
 			t.Fatalf("第 %d 次生成不应被节流: %v", i+1, err)
 		}
@@ -105,12 +106,40 @@ func TestCaptchaThrottle(t *testing.T) {
 	}
 }
 
+// TestCaptchaGenLimitFromConfig 验证验证码产能由配置决定，
+// 避免再次出现"未信任桶放行 50/s、产能却只有 30/s"的配置错配。
+func TestCaptchaGenLimitFromConfig(t *testing.T) {
+	// 缺省：产能是"安全阀"而非目标速率，按其与下限 200 的较大者推导；
+	// **不能用 global_qps_max(可信通道容量) 推导**，否则默认 800/s →
+	// 稳态 24 万条、约 390MB，且超过条目上限后每轮清理都整体重建、
+	// 把在途验证码集体作废（用户表现为"提交验证码必失败"）。
+	cfg := config.CCDefenseConfig{Enabled: true, NewIPQPSMax: 50}
+	cfg.Normalize()
+	if cfg.CaptchaGenMaxPerSec != 200 {
+		t.Fatalf("缺省产能应为 max(new_ip_qps_max, 200)=200：got %d", cfg.CaptchaGenMaxPerSec)
+	}
+
+	// 显式配置时不被覆盖
+	cfg2 := config.CCDefenseConfig{Enabled: true, NewIPQPSMax: 50, CaptchaGenMaxPerSec: 300}
+	cfg2.Normalize()
+	if cfg2.CaptchaGenMaxPerSec != 300 {
+		t.Fatalf("显式配置不应被覆盖：got %d", cfg2.CaptchaGenMaxPerSec)
+	}
+
+	// 两个来源都很小时仍保留下限，避免默认配置在泛洪时大量 503
+	cfg3 := config.CCDefenseConfig{Enabled: true, GlobalQPSMax: 20, NewIPQPSMax: 10}
+	cfg3.Normalize()
+	if cfg3.CaptchaGenMaxPerSec != 200 {
+		t.Fatalf("产能应有 200 的下限：got %d", cfg3.CaptchaGenMaxPerSec)
+	}
+}
+
 // TestCaptchaSessionKeying 验证：
 //   - 同会话同 IP 在 TTL 内复用同一验证码（反复挑战不作废）；
 //   - 同会话不同 IP 生成新验证码；
 //   - 不同会话同 IP 生成不同验证码。
 func TestCaptchaSessionKeying(t *testing.T) {
-	s := newCaptchaStore()
+	s := newCaptchaStore(0)
 
 	// 同会话同 IP：复用
 	id1, img1, err := s.generate("sidA", "1.2.3.4")
@@ -300,7 +329,7 @@ func TestFloodDoesNotPromoteTrust(t *testing.T) {
 	h.flood.recentOld = 100
 	h.flood.mu.Unlock()
 	// 清空行为检测状态，避免泛洪期均匀间隔触发 bot-like 干扰后续断言
-	h.behavior = newIPBehaviorTracker(600)
+	h.behavior = newIPBehaviorTracker(600, 0, 0)
 
 	// 泛洪结束后仍需重新累计 minVisits 次才晋升
 	if rec := do("/d"); rec.Body.String() != "OK" {
@@ -381,17 +410,14 @@ func TestTrustedIPSweepExpired(t *testing.T) {
 // TestBehaviorIdleDecay 验证：IP 空闲超过阈值后，行为检测状态被清空，
 // "路径单一"等累计判定不再永久记住，恢复正常访问。
 func TestBehaviorIdleDecay(t *testing.T) {
-	bt := newIPBehaviorTracker(1) // idleReset = 1 秒
+	bt := newIPBehaviorTracker(1, 0, 0) // idleReset = 1 秒；路径阈值取默认
 
-	// 直接构造"累计 >10 次、单一路径"的状态
-	bt.mu.Lock()
-	bt.paths["1.2.3.4"] = map[string]int{"/": 11}
-	bt.lastSeen["1.2.3.4"] = time.Now()
-	bt.mu.Unlock()
-
-	// 未空闲：应判定为脚本
+	// 通过真实调用累计状态：同一路径连续请求到超过"路径单一"阈值
+	for i := 0; i <= bt.pathReqsMin; i++ {
+		bt.isBotLike("1.2.3.4", "/")
+	}
 	if !bt.isBotLike("1.2.3.4", "/") {
-		t.Fatalf("单一路径应判定为脚本")
+		t.Fatalf("同一路径累计超过 %d 次后应判定为脚本", bt.pathReqsMin)
 	}
 
 	// 空闲超过 1 秒：状态应被清空，下次访问不再判定为脚本
@@ -401,6 +427,60 @@ func TestBehaviorIdleDecay(t *testing.T) {
 
 	if bt.isBotLike("1.2.3.4", "/") {
 		t.Fatalf("空闲衰减后不应判定为脚本")
+	}
+	// 清空必须彻底：paths 若残留，新会话第一次访问就会被误判。
+	// 注意本次调用只做衰减与 lastSeen 推进，不记录路径（新会话第一请求不参与判定）。
+	bt.mu.Lock()
+	paths := bt.paths["1.2.3.4"]
+	ivs := bt.intervals["1.2.3.4"]
+	total := bt.pathTotal["1.2.3.4"]
+	bt.mu.Unlock()
+	if len(paths) != 0 || len(ivs) != 0 || total != 0 {
+		t.Fatalf("空闲衰减应清空状态（paths=%d intervals=%d total=%d）", len(paths), len(ivs), total)
+	}
+}
+
+// TestBehaviorPathThresholdNotTooAggressive 回归用例：
+// 反复阅读同一篇文章的真实用户（累计次数低于阈值）不应被判成脚本。
+// 原实现阈值是 >10 次，会把这类用户误伤成 bot（线上日志里同一 URI 反复出现即是此形态）。
+func TestBehaviorPathThresholdNotTooAggressive(t *testing.T) {
+	bt := newIPBehaviorTracker(600, 0, 0)
+	if bt.pathReqsMin <= 11 {
+		t.Fatalf("路径单一阈值 %d 过小，会误伤反复访问同一页面的真实用户", bt.pathReqsMin)
+	}
+
+	// 同一路径访问 50 次（远超旧的 >10 阈值），不应判为脚本
+	for i := 0; i < 50; i++ {
+		if bt.isBotLike("5.6.7.8", "/pub/news/4") {
+			t.Fatalf("第 %d 次访问同一路径就被判为脚本，阈值过激", i+1)
+		}
+	}
+}
+
+// TestBehaviorAlwaysUpdatesLastSeen 回归用例：
+// 原实现在"间隔均匀"判定命中时提前 return，导致 lastSeen 永不推进、间隔统计自相矛盾。
+// 现在无论走哪条返回路径都必须推进 lastSeen。
+func TestBehaviorAlwaysUpdatesLastSeen(t *testing.T) {
+	bt := newIPBehaviorTracker(600, 1000, 2) // 路径阈值调高，确保走的是间隔判定分支
+
+	// 确定性构造"间隔均匀"特征：预置 5 个 ~100ms 的间隔，
+	// 并把 lastSeen 设为 100ms 前 —— 本次算出的间隔才会落在同一量级（~100ms）。
+	// 两点都不能随意改：lastSeen 过久会让新间隔成为离群值、过短则同样破坏均匀性，
+	// 一旦极差超过平均值的 1/5，前置条件就不成立（用例会明确失败而不是静默跳过）。
+	old := time.Now().Add(-100 * time.Millisecond)
+	bt.mu.Lock()
+	bt.lastSeen["9.9.9.9"] = old
+	bt.intervals["9.9.9.9"] = []int64{100, 100, 100, 100, 100}
+	bt.mu.Unlock()
+
+	if !bt.isBotLike("9.9.9.9", "/") {
+		t.Fatal("间隔高度均匀应判定为脚本（前置条件未满足，用例失效）")
+	}
+	bt.mu.Lock()
+	last := bt.lastSeen["9.9.9.9"]
+	bt.mu.Unlock()
+	if !last.After(old) {
+		t.Fatalf("判定命中时必须推进 lastSeen：old=%v last=%v", old, last)
 	}
 }
 
@@ -427,9 +507,12 @@ func TestTrustedIPStillBehaviorChecked(t *testing.T) {
 	const ip = "203.0.113.88"
 	h.trust.setTrusted(ip) // 直接设为可信 IP
 
-	// 预置"累计 >10 次、单一路径"的行为状态
+	// 构造"累计超阈值、单一路径"的行为状态（通过真实调用累计）
+	h.behavior.pathReqsMin = 3
+	for i := 0; i < 4; i++ {
+		h.behavior.isBotLike(ip, "/pub/newsList/110")
+	}
 	h.behavior.mu.Lock()
-	h.behavior.paths[ip] = map[string]int{"/pub/newsList/110": 11}
 	h.behavior.lastSeen[ip] = time.Now()
 	h.behavior.mu.Unlock()
 

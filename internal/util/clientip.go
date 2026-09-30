@@ -131,17 +131,22 @@ func (r *ClientIPResolver) Trusts(ip net.IP) bool {
 }
 
 // ClientIP 见包级 ClientIP 的说明。
+//
+// 性能说明：这是每请求都要走的热路径，因此每个候选地址只解析一次
+// （normalizeIPInto 同时给出规范化字符串与已解析的 net.IP），
+// 避免"解析→字符串→再解析"的往返（原实现每请求多付 1~3 次 net.ParseIP）。
 func (r *ClientIPResolver) ClientIP(req *http.Request) string {
-	peer := normalizeIP(peerIP(req.RemoteAddr))
+	peer, peerParsed := normalizeIPInto(peerIP(req.RemoteAddr))
 	// 对端不可信（或无法解析）→ 转发头一律忽略，以对端为准。
-	if peer == "" || !r.Trusts(net.ParseIP(peer)) {
+	if peer == "" || !r.Trusts(peerParsed) {
 		return peer
 	}
 
 	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
 		for i := len(parts) - 1; i >= 0; i-- {
-			if ip := normalizeIP(parts[i]); ip != "" && !r.Trusts(net.ParseIP(ip)) {
+			ip, parsed := normalizeIPInto(parts[i])
+			if ip != "" && !r.Trusts(parsed) {
 				return ip
 			}
 		}
@@ -149,7 +154,7 @@ func (r *ClientIPResolver) ClientIP(req *http.Request) string {
 	}
 	// XFF 缺失/不可用时，退回 X-Real-IP，但仍要求它本身不可信，
 	// 避免客户端伪造 X-Real-IP 冒充可信代理网段内的地址。
-	if xri := normalizeIP(req.Header.Get("X-Real-IP")); xri != "" && !r.Trusts(net.ParseIP(xri)) {
+	if xri, parsed := normalizeIPInto(req.Header.Get("X-Real-IP")); xri != "" && !r.Trusts(parsed) {
 		return xri
 	}
 	return peer
@@ -158,9 +163,16 @@ func (r *ClientIPResolver) ClientIP(req *http.Request) string {
 // normalizeIP 把转发头里的一段整理成裸 IP 字符串。
 // 返回空串表示这一段不是合法 IP（例如被塞了 hostname 或随意字符串）。
 func normalizeIP(s string) string {
+	out, _ := normalizeIPInto(s)
+	return out
+}
+
+// normalizeIPInto 是 normalizeIP 的内部实现：一次解析同时返回规范化字符串
+// 与解析结果，供调用方复用，避免"解析→字符串→再解析"的往返。
+func normalizeIPInto(s string) (string, net.IP) {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return ""
+		return "", nil
 	}
 	// 去掉可选端口：1.2.3.4:5678 / [2001:db8::1]:443
 	if host, _, err := net.SplitHostPort(s); err == nil {
@@ -168,11 +180,12 @@ func normalizeIP(s string) string {
 	}
 	// 容忍带方括号的裸 IPv6：[2001:db8::1]
 	s = strings.TrimSuffix(strings.TrimPrefix(s, "["), "]")
-	ip := net.ParseIP(strings.TrimSpace(s))
+	s = strings.TrimSpace(s)
+	ip := net.ParseIP(s)
 	if ip == nil {
-		return ""
+		return "", nil
 	}
-	return ip.String()
+	return ip.String(), ip
 }
 
 // peerIP 从 RemoteAddr 中提取对端 IP。

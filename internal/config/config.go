@@ -178,9 +178,18 @@ type CCDefenseConfig struct {
 	OffenderTTLSec        int    `json:"offender_ttl_sec"`
 	OffenderPersistSec    int    `json:"offender_persist_sec"`
 	BehaviorIdleResetSec  int    `json:"behavior_idle_reset_sec"`
-	FloodSlidingWindowSec int    `json:"flood_sliding_window_sec"`
-	UntrustedIPQPSMax     int    `json:"untrusted_ip_qps_max"`
-	UntrustedIPBurst      int    `json:"untrusted_ip_burst"`
+	// BehaviorPathReqsMin / BehaviorPathCountMax："路径单一"判定的阈值。
+	// 累计请求数 ≥ ReqsMin 且不同路径数 ≤ CountMax 才判为脚本；
+	// 阈值过小会把反复阅读同一篇文章/列表页的真实用户误判为 bot。
+	BehaviorPathReqsMin  int `json:"behavior_path_reqs_min"`
+	BehaviorPathCountMax int `json:"behavior_path_count_max"`
+	// CaptchaGenMaxPerSec 验证码每秒生成上限（PNG 编码较重，需限流防 OOM）。
+	// <=0 时按 NewIPQPSMax 推导：生成的唯一来源是"未信任桶放行失败"的请求，
+	// 因此产能与之同源即可，避免出现"桶放行 50/s、产能只有 30/s"的配置错配。
+	CaptchaGenMaxPerSec   int `json:"captcha_gen_max_per_sec"`
+	FloodSlidingWindowSec int `json:"flood_sliding_window_sec"`
+	UntrustedIPQPSMax     int `json:"untrusted_ip_qps_max"`
+	UntrustedIPBurst      int `json:"untrusted_ip_burst"`
 }
 
 func (c *CCDefenseConfig) Normalize() {
@@ -228,6 +237,27 @@ func (c *CCDefenseConfig) Normalize() {
 	}
 	if c.BehaviorIdleResetSec <= 0 {
 		c.BehaviorIdleResetSec = 600
+	}
+	if c.BehaviorPathReqsMin <= 0 {
+		c.BehaviorPathReqsMin = 100
+	}
+	if c.BehaviorPathCountMax <= 0 {
+		c.BehaviorPathCountMax = 2
+	}
+	// 验证码产能上限：这是"安全阀"，不是目标速率。
+	//
+	// 不要用 global_qps_max 来推导：那是**可信通道**容量，而验证通过的 IP 会转入
+	// 可信桶，稳态挑战量本应远小于它。若按 800/s 配产能，稳态条目数会到
+	// 800×TTL(300s)=24 万条、按实测约 1.7KB/条 就是 ~390MB，且超过条目上限后
+	// 每次后台清理都会整体重建，把在途验证码集体作废（用户表现为"提交必失败"）。
+	//
+	// 改为按 CPU 预算反推：实测单张生成约 1.5ms，200/s ≈ 30% 单核。
+	// 需要更高挑战吞吐时应显式调大本项，同时注意内存与 CPU 同步增长。
+	if c.CaptchaGenMaxPerSec <= 0 {
+		c.CaptchaGenMaxPerSec = c.NewIPQPSMax
+		if c.CaptchaGenMaxPerSec < 200 {
+			c.CaptchaGenMaxPerSec = 200
+		}
 	}
 	if c.FloodSlidingWindowSec <= 0 {
 		c.FloodSlidingWindowSec = 600

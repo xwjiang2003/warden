@@ -391,7 +391,9 @@ curl -I  http://127.0.0.1:81/        # 应转发到后端
 | `new_ip_check_sec` / `new_ip_check_min_reqs` | `30` / `60` | 判定窗口与最小样本量 |
 | `flood_sliding_window_sec` | `600` | "新 IP"判定滑动窗口（窗口内出现过即视为老 IP） |
 | `untrusted_ip_qps_max` / `untrusted_ip_burst` | `30` / `40` | 未可信 IP 单 IP 令牌桶 |
-| `behavior_idle_reset_sec` | `600` | 行为状态空闲重置时间 |
+| `behavior_idle_reset_sec` | `600` | 行为状态空闲重置时间。后台回收**常态用这个值**；只有状态数超过硬上限（20 万）时才切到 30 秒的激进窗口，避免把间隔较长的访问者状态反复清空导致慢速检测失效 |
+| `behavior_path_reqs_min` / `behavior_path_count_max` | `100` / `2` | "路径单一"判定阈值：累计请求数 ≥ 前者**且**不同路径数 ≤ 后者才判为脚本。**权衡**：原阈值是 `>10`，会误伤反复阅读同一篇文章/列表页的真实用户，故放宽到 100——代价是这类"路径单一"特征的识别延迟约 10 倍，慢速扫描型脚本更难被它单独抓到（仍会被"请求间隔均匀"分支识别，且泛洪期阈值可临时调低）。单 IP 记录的路径数上限为 64，防止少量 IP 用海量路径撑爆内存 |
+| `captcha_gen_max_per_sec` | `0`（缺省取 `max(new_ip_qps_max, 200)`） | 验证码每秒生成上限，超出即回 503。这是**安全阀而非目标速率**：挑战有 4 个来源（未信任桶耗尽、泛洪期新 IP、bot-like 行为、单 IP 限速），其中泛洪分支速率受 `global_qps_max` 约束，但**不能用它推导产能**——`global_qps_max` 是可信通道容量，验证通过的 IP 会转入该通道，稳态挑战量本应远小于它；按 800/s 配产能会导致稳态 24 万条、约 390MB。实测单张生成约 1.5ms，200/s ≈ 30% 单核。条目上限按 `产能 × TTL × 3` 自动联动，并有 **40 万条绝对天花板**（≈0.7GB）——产能配得过高时天花板优先，淘汰会成为常态（宁可淘汰也不 OOM）；超限时**只淘汰最旧的**，不作废在途验证码 |
 | `challenge_cookie_key` | 自动生成 | 验证码 Cookie 签名密钥 |
 | `firewall_offender_limit` | `20` | 违规次数阈值 |
 | `offender_persist_sec` | `60` | **持续违规时长**：与次数阈值同时满足才升级 |
@@ -411,7 +413,7 @@ curl -I  http://127.0.0.1:81/        # 应转发到后端
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `conn_limit.max_conns_per_sec` / `burst` | `300` / `80` | TCP 层每秒新连接上限与突发容量 |
+| `conn_limit.max_conns_per_sec` / `burst` | `300` / `80` | TCP 层**每秒新连接**上限与突发容量。超限是 `conn.Close()` 优雅关闭、**不返回任何 HTTP 响应**（与验证码 503 症状不同）。注意它限的是"新连接数"而非 QPS：上游 nginx 保持 keepalive 复用时不会成为瓶颈，若客户端/代理大量短连接则直接卡在这个值上 |
 | `firewall_block.enabled` | `false` | 是否启用系统防火墙内核层封禁（**仅 Windows 有效**） |
 | `firewall_block.auto_block` | `false` | 是否自动封禁顽固攻击者 |
 | `firewall_block.expire_min` | `30` | 封禁自动过期时间（分钟） |

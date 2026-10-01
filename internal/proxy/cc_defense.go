@@ -433,11 +433,11 @@ const (
 
 type ipBehaviorTracker struct {
 	mu        sync.Mutex
-	lastSeen  map[string]time.Time      // 上次请求时间
-	intervals map[string][]int64        // 最近 8 次请求间隔(ms)
+	lastSeen  map[string]time.Time           // 上次请求时间
+	intervals map[string][]int64             // 最近 8 次请求间隔(ms)
 	paths     map[string]map[string]struct{} // IP → 访问过的路径集合（不记次数，天然有界）
-	pathTotal map[string]int            // IP → 累计请求数（与 paths 同步维护，避免每次遍历求和）
-	idleReset time.Duration             // 空闲超过该时长即清空该 IP 行为状态
+	pathTotal map[string]int                 // IP → 累计请求数（与 paths 同步维护，避免每次遍历求和）
+	idleReset time.Duration                  // 空闲超过该时长即清空该 IP 行为状态
 
 	// overCap 标记已超过 behaviorMaxEntries，等待 reaper 回收。
 	// 置位期间不再为新 IP 建立状态（已有 IP 继续正常判定），
@@ -695,6 +695,16 @@ func (st *sessionTracker) record(sessionID, ip string) (anomaly bool, reason str
 
 const ccLogThrottleInterval = 10 * time.Second
 
+// logThrottleHardCap logThrottler 的条目硬上限。
+//
+// 为什么需要它：logThrottler 是"长期存活 map"，key 通常是攻击者可控的 IP。
+// 回收如果依赖调用方记得周期性调 gc()，就迟早会漏——本项目已经出现过
+// 三处同类问题（behavior.lastSeen、captchaStore.s.m、以及这里的调用点本身：
+// IPRateLimiter 新建的 logThrottle 无人回收）。因此把边界内建到结构里：
+// 达到上限后先按过期时间清一轮，清不动就整体重建，保证内存有界，
+// 且不依赖任何外部清扫者。
+const logThrottleHardCap = 65536
+
 type logThrottler struct {
 	mu       sync.Mutex
 	last     map[string]int64
@@ -706,26 +716,43 @@ func newLogThrottler(interval time.Duration) *logThrottler {
 }
 
 // allow 判断 key 距上次打印是否已超过 interval；是则记录并返回 true。
+// 达到硬上限时会先做一轮回收（见 logThrottleHardCap），因此内存有界。
 func (t *logThrottler) allow(key string) bool {
 	now := time.Now().UnixNano()
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	if _, exists := t.last[key]; !exists && len(t.last) >= logThrottleHardCap {
+		t.pruneLocked(now)
+	}
 	if now-t.last[key] >= int64(t.interval) {
 		t.last[key] = now
+		t.mu.Unlock()
 		return true
 	}
+	t.mu.Unlock()
 	return false
 }
 
-// gc 清理超过 5 倍 interval 未活动的 key，避免攻击期 IP 轮换导致 map 无界增长。
-func (t *logThrottler) gc() {
-	cutoff := time.Now().UnixNano() - int64(t.interval)*5
-	t.mu.Lock()
+// pruneLocked 回收超过 5 倍 interval 未活动的 key（需持有 t.mu）。
+func (t *logThrottler) pruneLocked(now int64) {
+	cutoff := now - int64(t.interval)*5
 	for k, v := range t.last {
 		if v < cutoff {
 			delete(t.last, k)
 		}
 	}
+	// 清完仍满（短时间内涌入大量不同 IP）→ 整体重建。
+	// 代价只是"这些 IP 会多打一条日志"，不影响正确性。
+	if len(t.last) >= logThrottleHardCap {
+		t.last = make(map[string]int64, logThrottleHardCap)
+	}
+}
+
+// gc 清理超过 5 倍 interval 未活动的 key。
+// 保留它是为了让已有调用方（reaper）能主动清理；但内存边界不依赖它——
+// allow() 内部会在达到上限时自行回收。
+func (t *logThrottler) gc() {
+	t.mu.Lock()
+	t.pruneLocked(time.Now().UnixNano())
 	t.mu.Unlock()
 }
 

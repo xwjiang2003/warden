@@ -37,6 +37,16 @@ type IPRateLimiter struct {
 	counters    map[string]*ipCounters
 	subnetCount map[string]*subnetCounter // /24 子网计数
 	offenderCnt map[string]int
+
+	// logThrottle 限频打印"已拦截"日志。攻击期会有海量请求同时被限流，
+	// 若每个都 log.Printf，全部会去抢标准库 logger 的全局锁——
+	// pprof 实测这一处曾占锁争抢延迟的 80%（17.1s / 21.2s），
+	// 比任何一把业务锁都严重。
+	//
+	// 注意限频 key 是 IP：**每个新 IP 的第一条仍会打印**，
+	// 所以分布式 CC（海量不同 IP）下日志量约等于"不同 IP 数"而非请求数，
+	// 收益远低于少 IP 高频场景。
+	logThrottle *logThrottler
 }
 
 type subnetCounter struct {
@@ -70,6 +80,7 @@ func NewIPRateLimiter(cfg config.RateLimitConfig, blockRequests bool, onBlock fu
 		counters:    make(map[string]*ipCounters),
 		subnetCount: make(map[string]*subnetCounter),
 		offenderCnt: make(map[string]int),
+		logThrottle: newLogThrottler(ccLogThrottleInterval),
 	}
 }
 
@@ -91,7 +102,12 @@ func (rl *IPRateLimiter) Middleware(next http.Handler) http.Handler {
 		hot := rl.isHotPath(r.URL.Path)
 		reason, over := rl.check(ip, hot)
 		if over {
-			log.Printf("[ratelimit] ip=%s uri=%s reason=%s block=%v", ip, r.URL.Path, reason, rl.block)
+			// 限频打印：同一 IP 每 ccLogThrottleInterval 最多一条。
+			// 攻击期每个被拦请求都打印会让标准库 logger 的全局锁成为瓶颈
+			// （pprof 实测占锁争抢 80%），且会把日志刷爆。
+			if rl.logThrottle.allow("rl:" + ip) {
+				log.Printf("[ratelimit] ip=%s uri=%s reason=%s block=%v", ip, r.URL.Path, reason, rl.block)
+			}
 			if rl.block {
 				// 普通限流返回 429（而非静默断连），避免 nginx 端显示 500/空响应、也便于前端排查
 				metrics.RateLimitBlocked.Inc()

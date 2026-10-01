@@ -4,6 +4,66 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.5] - 2026-10-01
+
+性能与稳定性修复，含**一项崩溃级缺陷**。无行为变更，无配置变更。
+
+### 安全 / 稳定性
+
+- **修复 IP 白名单/黑名单的并发写崩溃**（`IPWhitelist.contains`）。
+  原实现用普通 map 缓存"IP → 是否命中网段"的结果，而 `contains()` 由每个请求
+  并发调用（白名单在 `main.go` 最外层、黑名单在 `access.go` 最外层）——
+  普通 map 的并发写是 Go 运行时**致命错误**：
+  `fatal error: concurrent map writes`，**直接终止进程且不可 `recover`**
+  （普通 defer/recover 拦不住 fatal error）。
+  **触发条件**：启用 `ip_whitelist` 或 `ip_blacklist` 且并发请求命中网段；
+  默认两者均关闭，因此默认配置不受影响。
+
+### 变更
+
+- **移除 IP 白名单的解析结果缓存**（连同它的互斥锁）。缓存只对"同一 IP 的重复
+  查询"有加速，而未命中是绝大多数请求的路径；实测未命中路径上"有缓存/无缓存/
+  sync.Map"三种实现的开销差异落在噪声范围内（支配项是 `net.ParseIP`），
+  也就是说缓存带来的是零收益的复杂度，却把一个并发原语放进每请求路径。
+  删除后 `nets` 构造即只读：无锁、无界、无失效逻辑，崩溃类别被整体消除。
+  （该缓存的容量上限与"首次命中"日志的告警逻辑一并移除；
+  "首次命中"日志改为按条数上限降级，见下。）
+
+### 修复
+
+- **修复高频拦截时日志锁成为瓶颈**：`IPRateLimiter` 在每次拦截时无条件
+  `log.Printf`，而标准库 logger 内部是一把全局锁。攻击期海量请求同时被限流，
+  pprof 实测这一处占**锁争抢延迟的 80%**（17.1s / 21.2s），比任何一把业务锁
+  都严重。现按 IP 限频（每 10 秒最多一条）。实测同一压测下锁争抢总延迟
+  **21.18s → 6.29s（−70%）**，吞吐 6869 → 7543 req/s（+10%；
+  收益未完全转化是因为压测端约 7.5k req/s 触顶）。
+  注意限频 key 是 IP，**每个新 IP 的第一条仍会打印**，因此分布式 CC
+  （海量不同 IP）下日志量约等于"不同 IP 数"而非请求数。
+- **`logThrottler` 的内存边界改为内建**：原设计依赖调用方周期性调用 `gc()`，
+  而新增的 `IPRateLimiter.logThrottle` 无人回收（key 是攻击者可控的 IP，
+  分布式 CC 可持续换 IP 导致无界增长）。现在 `allow()` 在写入新 key 且达到
+  硬上限（65536）时自行回收，清不动则整体重建——**内存边界不再依赖任何外部
+  清扫者**。同理，`IPWhitelist` 的"首次命中"日志记录也加上了条数上限。
+- **消除重复的 `net.ParseIP`**：`util.ClientIPResolver.ClientIP` 原先对每个候选
+  地址做"解析 → 转字符串 → 再解析"的往返，现在每个候选只解析一次。
+
+### 新增
+
+- **诊断用 pprof 端点**（默认关闭）：设置 `WARDEN_PPROF` 后启动，
+  **强制只绑回环**（非回环地址会被拒绝，避免把 goroutine 栈与堆快照暴露到对外
+  端口）；`WARDEN_PPROF_MUTEX` / `WARDEN_PROF_BLOCK` 可分别打开互斥锁与阻塞
+  采样。用法见 `internal/proxy/pprof.go` 的注释。
+
+### 测试
+
+- `ip_whitelist_test.go`：并发命中白名单不得崩溃。**注意其失效形态是进程
+  崩溃（`fatal error`）而非测试 FAIL**，同包其它用例结果会一并丢失。
+- `whitelist_bench_test.go`：固化"不做解析缓存"的决策依据与实测数据，
+  并记录一个被否证的诱惑（自写 IPv4 快速解析比 `net.ParseIP` 更慢）。
+- `ratelimit_log_test.go` / `ratelimit_throttle_bound_test.go`：拦截日志必须限频；
+  限频 map 必须有界（含"完全不调用 `gc()` 也有界"），这是与"限频是否生效"
+  不同的失效模式。
+
 ## [1.0.4] - 2026-09-30
 
 性能与误伤修复：消除热路径上的全局锁清扫，修正行为检测误伤真实用户，
@@ -170,6 +230,7 @@
 
 1.0.2 之前的版本，变更未逐条记录。
 
+[1.0.5]: https://github.com/xwjiang2003/warden/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/xwjiang2003/warden/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/xwjiang2003/warden/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/xwjiang2003/warden/compare/v1.0.1...v1.0.2

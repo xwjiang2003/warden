@@ -76,6 +76,9 @@ func main() {
 	adminSrv := admin.NewServer(cfg, cfgPath, dbPath, cfg.Admin)
 	adminSrv.Start()
 
+	// 诊断用 pprof 端点：默认关闭，仅 WARDEN_PPROF 设置时启动，且强制绑回环。
+	proxy.StartPprofIfEnabled()
+
 	alertChecker := alert.NewChecker(cfg)
 	go alertChecker.Run()
 

@@ -41,6 +41,53 @@ type Config struct {
 	// 若服务跑在容器里（docker-proxy 会把远端连接的对端地址改写成 127.0.0.1），
 	// 请显式设为 false，否则容器内的对端地址会来自被改写的回环地址而失真。
 	TrustLocalProxy *bool `json:"trust_local_proxy"`
+	// TLS HTTPS/TLS 配置。缺省关闭：保持纯 HTTP 监听（与既有部署完全兼容）。
+	TLS TLSConfig `json:"tls,omitempty"`
+}
+
+// TLSConfig HTTPS/TLS 配置块（v1.1.0 F2）
+//
+// 两种启用方式（Enabled=true 时二选一）：
+//  1. 手动证书：cert_file + key_file 指向 PEM 文件，Listen 改为 :443 即可。
+//  2. ACME 自动证书：acme=true，按 acme_domains 向 Let's Encrypt 申请并自动续期，
+//     证书缓存于 acme_dir（默认 data/acme，Docker 部署时由 data 卷持久化）。
+//
+// 端口约定：TLS 模式下 cfg.Listen 应为 TLS 监听地址（如 :443）；
+// HTTPListen 承载 ACME HTTP-01 校验（默认 :80），仅在 acme=true 时启用。
+type TLSConfig struct {
+	Enabled bool `json:"enabled"`
+
+	// 手动证书模式（acme=false 时使用）
+	CertFile string `json:"cert_file"`
+	KeyFile  string `json:"key_file"`
+
+	// ACME 自动证书模式（acme=true 时使用）
+	ACME        bool     `json:"acme"`
+	ACMEDomains []string `json:"acme_domains"` // 申请证书的域名（必须可解析到本机）
+	ACMEEmail   string   `json:"acme_email"`   // ACME 账户邮箱（用于续期通知）
+	ACMEDir     string   `json:"acme_dir"`     // 证书缓存目录，默认 data/acme
+	ACMEStaging bool     `json:"acme_staging"` // 使用 Let's Encrypt 预演环境（正式部署务必关闭）
+	HTTPListen  string   `json:"http_listen"`  // ACME HTTP-01 监听地址，默认 :80
+}
+
+// EnabledTLS 返回 TLS 是否启用。
+func (c *Config) EnabledTLS() bool { return c.TLS.Enabled }
+
+func (c *TLSConfig) Normalize() {
+	if c.HTTPListen == "" {
+		c.HTTPListen = ":80"
+	}
+	if c.ACMEDir == "" {
+		c.ACMEDir = "data/acme"
+	}
+	if !c.Enabled {
+		return
+	}
+	// 手动证书路径缺一即视为未配置（启动时校验报错）
+	if (c.CertFile == "") != (c.KeyFile == "") {
+		// 保持原值，交给启动校验给出明确错误
+		return
+	}
 }
 
 // TrustLocalProxyEnabled 返回是否信任本机回环转发，缺省 true。
@@ -369,6 +416,7 @@ func ApplyDefaults(cfg *Config) {
 	cfg.FirewallBlock.Normalize()
 	cfg.Alert.Normalize()
 	cfg.Admin.Normalize()
+	cfg.TLS.Normalize()
 }
 
 // Save 将配置序列化为格式化 JSON 并写入文件

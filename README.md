@@ -367,6 +367,7 @@ curl -I  http://127.0.0.1:81/        # 应转发到后端
 | `url_blocklist` | string[] | `[]` | URL 黑名单（正则） |
 | `trusted_proxies` | string[] | `[]` | 可信反向代理（CIDR 或单个 IP）。同机 nginx 无需配置，详见[真实客户端 IP](#-真实客户端-iptrusted_proxies--trust_local_proxy)。**可在管理后台「基本设置」页配置**，保存时校验非法/全网段条目 |
 | `trust_local_proxy` | bool | `true` | 是否信任本机回环（`127.0.0.0/8`、`::1`）转发的 XFF/X-Real-IP。容器部署建议设为 `false` |
+| `tls` | object | — | HTTPS/TLS（v1.1.0）：`{enabled, cert_file, key_file, acme, acme_domains[], acme_email, acme_dir, acme_staging, http_listen}`。默认关闭；开启后 `listen` 改为 `:443`，详见[方案 E](#方案-ehttpstls-内置手动证书--acme-自动证书) |
 
 ### `rate_limit` 频率限制
 
@@ -573,6 +574,49 @@ docker compose down         # 停止（卷数据保留）
 > 端口映射注释，并**务必先设置 `admin.password`**。
 >
 > 服务器验证清单见 [docs/docker-verify.md](docs/docker-verify.md)。
+
+### 方案 E：HTTPS/TLS 内置（手动证书 / ACME 自动证书）
+
+> v1.1.0 起内置 TLS 终止。默认 `tls.enabled=false`，保持纯 HTTP（与既有部署完全兼容）；
+> 需要 HTTPS 时二选一。
+
+**方式一：手动证书**（已有证书，如阿里云/腾讯云签发）：
+
+```jsonc
+{
+  "listen": ":443",
+  "tls": {
+    "enabled": true,
+    "cert_file": "certs/fullchain.pem",
+    "key_file": "certs/privkey.pem"
+  }
+}
+```
+
+**方式二：ACME 自动证书**（Let's Encrypt 免费自动申请 + 续期）：
+
+```jsonc
+{
+  "listen": ":443",
+  "tls": {
+    "enabled": true,
+    "acme": true,
+    "acme_domains": ["waf.example.com"],
+    "acme_email": "ops@example.com",   // 续期通知（可选）
+    "acme_dir": "data/acme",           // 证书缓存，默认 data/acme（Docker 用 data 卷持久化）
+    "http_listen": ":80"               // HTTP-01 校验端口（默认 :80，需未被占用）
+  }
+}
+```
+
+要点：
+
+- **ACME 需要 80 端口做 HTTP-01 校验**：启动后 warden 会在 `http_listen` 上应答校验请求，
+  并把其它 HTTP 请求 302 跳转到 HTTPS（80→443 约定）。若 80 已被 nginx 占用（方案 A 前置
+  nginx 时），**不要用 ACME**，改用方式一手动证书，或让 nginx 负责 TLS 卸载（方案 A 本身即推荐做法）。
+- **证书续期**：autocert 自动续期，证书缓存在 `acme_dir`，Docker 部署请确保该目录落入 `data` 卷。
+- **测试环境**：`acme_staging=true` 走 Let's Encrypt 预演环境（不消耗正式配额）；正式部署务必关闭。
+- **安全基线**：TLS 最低版本 TLS 1.2；此模式下 WAF/CC/限流等全部能力不变。
 
 ### 注册为系统服务
 

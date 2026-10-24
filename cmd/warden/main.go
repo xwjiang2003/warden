@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -13,6 +15,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/crypto/acme"
+	"golang.org/x/crypto/acme/autocert"
 	txhttp "github.com/corazawaf/coraza/v3/http"
 
 	"warden/internal/accesslog"
@@ -20,6 +24,7 @@ import (
 	"warden/internal/alert"
 	"warden/internal/attacklog"
 	"warden/internal/blockpage"
+	"warden/internal/config"
 	"warden/internal/fwstore"
 	"warden/internal/metrics"
 	"warden/internal/proxy"
@@ -181,6 +186,10 @@ func main() {
 	log.Printf("access_log: %s rotate=%s max_size_mb=%d",
 		cfg.AccessLog, cfg.AccessLogRotate.Mode, cfg.AccessLogRotate.MaxSizeMB)
 	log.Printf("health: http://127.0.0.1%s/healthz", util.TrimHost(cfg.Listen))
+	if cfg.EnabledTLS() {
+		log.Printf("tls: enabled=true cert_file=%q key_file=%q acme=%v domains=%v staging=%v",
+			cfg.TLS.CertFile, cfg.TLS.KeyFile, cfg.TLS.ACME, cfg.TLS.ACMEDomains, cfg.TLS.ACMEStaging)
+	}
 	log.Printf("按 Ctrl+C 停止服务")
 
 	ln, err := net.Listen("tcp", cfg.Listen)
@@ -190,7 +199,7 @@ func main() {
 	ln = proxy.NewConnLimitListener(ln, cfg.ConnLimit.MaxConnsPerSec, cfg.ConnLimit.Burst)
 
 	go func() {
-		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		if err := startServer(srv, ln, cfg, exeDir); err != nil && err != http.ErrServerClosed {
 			fatalStartup(exeDir, "serve: %v", err)
 		}
 	}()
@@ -200,6 +209,79 @@ func main() {
 	<-sig
 	log.Println("shutting down...")
 	_ = srv.Close()
+}
+
+// acmeStagingURL Let's Encrypt 预演环境 Directory 端点
+// （x/crypto v0.36.0 仅导出正式环境 LetsEncryptURL，staging 需显式指定）
+const acmeStagingURL = "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+// startServer 按 TLS 配置启动服务：
+//   - tls.enabled=false（默认）：纯 HTTP，srv.Serve(ln)
+//   - tls.acme=true：autocert 自动证书，另起 HTTP-01 校验监听（tls.http_listen），
+//     TLS 监听走 srv.ServeTLS（TLSConfig.GetCertificate 提供证书）
+//   - 手动证书：cert_file+key_file，srv.ServeTLS
+//
+// 返回 nil 表示服务已正常结束（如关机）；返回非 nil 错误由调用方按启动失败处理。
+func startServer(srv *http.Server, ln net.Listener, cfg *config.Config, exeDir string) error {
+	tlsCfg := &cfg.TLS
+	if !tlsCfg.Enabled {
+		return srv.Serve(ln)
+	}
+
+	if tlsCfg.ACME {
+		domains := tlsCfg.ACMEDomains
+		if len(domains) == 0 {
+			return errors.New("tls.acme=true 但 tls.acme_domains 为空：至少配置一个域名（且需解析到本机）")
+		}
+		acmeDir := tlsCfg.ACMEDir
+		if !filepath.IsAbs(acmeDir) {
+			acmeDir = filepath.Join(exeDir, acmeDir)
+		}
+		if err := os.MkdirAll(acmeDir, 0700); err != nil {
+			return fmt.Errorf("acme dir %s: %w", acmeDir, err)
+		}
+		mgr := &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(domains...),
+			Cache:      autocert.DirCache(acmeDir),
+			Email:      tlsCfg.ACMEEmail,
+		}
+		if tlsCfg.ACMEStaging {
+			// 预演环境：测试用，避免消耗正式环境配额；正式部署务必关闭
+			mgr.Client = &acme.Client{DirectoryURL: acmeStagingURL}
+		}
+		srv.TLSConfig = &tls.Config{
+			GetCertificate: mgr.GetCertificate,
+			MinVersion:     tls.VersionTLS12,
+		}
+		httpSrv := &http.Server{
+			Addr:              tlsCfg.HTTPListen,
+			Handler:           mgr.HTTPHandler(nil), // ACME HTTP-01 校验 + 非校验请求 301 跳转 https（80→443）
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			log.Printf("acme: HTTP-01 校验监听 %s，证书缓存 %s（domains=%v staging=%v）",
+				tlsCfg.HTTPListen, acmeDir, domains, tlsCfg.ACMEStaging)
+			if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("[tls] acme http listen %s: %v", tlsCfg.HTTPListen, err)
+			}
+		}()
+		return srv.ServeTLS(ln, "", "")
+	}
+
+	// 手动证书模式
+	certFile, keyFile := tlsCfg.CertFile, tlsCfg.KeyFile
+	if certFile == "" || keyFile == "" {
+		return errors.New("tls.enabled=true 需同时提供 cert_file 与 key_file，或启用 acme=true 自动申请证书")
+	}
+	if !filepath.IsAbs(certFile) {
+		certFile = filepath.Join(exeDir, certFile)
+	}
+	if !filepath.IsAbs(keyFile) {
+		keyFile = filepath.Join(exeDir, keyFile)
+	}
+	srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	return srv.ServeTLS(ln, certFile, keyFile)
 }
 
 func fatalStartup(exeDir, format string, args ...interface{}) {

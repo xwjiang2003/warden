@@ -8,6 +8,15 @@
 
 ### 新增
 
+- **HTTPS/TLS 内置（v1.1.0 第二项）**：`tls` 配置块支持两种方式——
+  - **手动证书**：`cert_file` + `key_file`（PEM），`listen` 改 `:443` 后 `ServeTLS` 直接生效；
+  - **ACME 自动证书**：`acme=true` + `acme_domains`，基于 `golang.org/x/crypto/acme/autocert`
+    自动申请并续期 Let's Encrypt 证书，证书缓存于 `acme_dir`（默认 `data/acme`，Docker 由
+    `data` 卷持久化）；`http_listen`（默认 `:80`）承载 HTTP-01 校验并把其它 HTTP 请求
+    302 跳转 HTTPS；`acme_staging=true` 走预演环境（测试用）。
+  - TLS 最低版本 TLS 1.2；默认 `enabled=false` 保持纯 HTTP，与既有部署完全兼容。
+  - 依赖：`golang.org/x/crypto v0.36.0`（兼容 go1.23 构建链）。
+
 - **Docker 容器部署（v1.1.0 首项）**：新增多阶段 `Dockerfile`（golang:1.23-alpine 构建 →
   alpine:3.20 运行，`CGO_ENABLED=0` 纯 Go 编译、**非 root 用户**、内置 `ca-certificates` /
   `tzdata`）与 `docker-compose.yml`，`docker compose up -d` 一键起防护。

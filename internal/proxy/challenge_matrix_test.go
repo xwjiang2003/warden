@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"warden/internal/config"
 	"warden/internal/metrics"
@@ -301,6 +302,103 @@ func TestEncodePNGIsBase64(t *testing.T) {
 		if img.Bounds().Dx() == 0 {
 			t.Fatalf("%s PNG 尺寸异常", name)
 		}
+	}
+}
+
+// TestChallengeFailCoolingHTTP 挑战提交失败后进入强制冷却：窗口内后续请求
+// 直接重发同档挑战（不允许按 per-IP 首次放行）；冷却过期或通过验证后解除。
+func TestChallengeFailCoolingHTTP(t *testing.T) {
+	var nextHits int
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { nextHits++; w.WriteHeader(200) })
+	h := NewCCDefense(config.CCDefenseConfig{Enabled: true, ChallengeCookieKey: "test-cc-secret"}, config.IPCheckConfig{}, nil, next, nil)
+
+	// 1) slider 作弊提交 → 失败 + 冷却
+	pageRec := httptest.NewRecorder()
+	pageReq := httptest.NewRequest(http.MethodGet, "/p", nil)
+	pageReq.RemoteAddr = "5.6.7.8:1234"
+	pageReq.AddCookie(&http.Cookie{Name: ccSessionCookieName, Value: "sess-cool"})
+	h.serveSlider(pageRec, pageReq, "5.6.7.8")
+	page := pageRec.Body.String()
+	fields := map[string]string{}
+	for _, m := range sliderFieldRe.FindAllStringSubmatch(page, -1) {
+		fields[m[1]] = m[2]
+	}
+	form := "id=" + fields["id"] + "&sig=" + fields["sig"] + "&expires=" + fields["expires"] +
+		"&x=0&dur=900&trail=12&url=%2Fp" // 偏移 0 远低于缺口 → 必拒
+	cheatReq := httptest.NewRequest(http.MethodPost, "/__cc_slider_verify", strings.NewReader(form))
+	cheatReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	cheatReq.RemoteAddr = "5.6.7.8:1234"
+	cheatReq.AddCookie(&http.Cookie{Name: ccSessionCookieName, Value: "sess-cool"})
+	cheatRec := httptest.NewRecorder()
+	h.handleSliderVerify(cheatRec, cheatReq)
+	if cheatRec.Code != http.StatusOK || !strings.Contains(cheatRec.Body.String(), "__cc_slider_verify") {
+		t.Fatalf("作弊提交应重发 slider 页，实际 %d", cheatRec.Code)
+	}
+	if lvl, ok := h.challengeFailCooling("5.6.7.8"); !ok || lvl != ChallengeHigh {
+		t.Fatalf("作弊失败后应进入 high 档冷却，实际 level=%d ok=%v", lvl, ok)
+	}
+
+	// 2) 冷却窗口内 follow → 直接重发挑战，不 hit next
+	followReq := httptest.NewRequest(http.MethodGet, "/p", nil)
+	followReq.RemoteAddr = "5.6.7.8:1234"
+	followRec := httptest.NewRecorder()
+	h.ServeHTTP(followRec, followReq)
+	if !strings.Contains(followRec.Body.String(), "__cc_slider_verify") {
+		t.Fatalf("冷却窗口内 follow 应重发 slider 页，实际: %s", followRec.Body.String()[:200])
+	}
+	if nextHits != 0 {
+		t.Fatalf("冷却窗口内不应放行到后端，next 被调用 %d 次", nextHits)
+	}
+
+	// 3) 冷却过期 → 不再强制挑战
+	h.chFails.Store("5.6.7.8", challengeFail{until: time.Now().Add(-time.Second), level: ChallengeHigh})
+	followReq2 := httptest.NewRequest(http.MethodGet, "/p", nil)
+	followReq2.RemoteAddr = "5.6.7.8:1234"
+	h.ServeHTTP(httptest.NewRecorder(), followReq2)
+	if nextHits == 0 {
+		t.Fatal("冷却过期后应回到正常判定（此处应放行到后端）")
+	}
+
+	// 4) 成功验证清除冷却
+	h.markChallengeFail("5.6.7.8", ChallengeHigh)
+	frReq := httptest.NewRequest(http.MethodGet, "/p", nil)
+	frReq.RemoteAddr = "5.6.7.8:1234"
+	frReq.AddCookie(&http.Cookie{Name: ccSessionCookieName, Value: "sess-cool"})
+	fr := httptest.NewRecorder()
+	h.serveSlider(fr, frReq, "5.6.7.8")
+	fields = map[string]string{}
+	for _, m := range sliderFieldRe.FindAllStringSubmatch(fr.Body.String(), -1) {
+		fields[m[1]] = m[2]
+	}
+	h.slide.mu.Lock()
+	tx := 0
+	if it, ok := h.slide.m[fields["id"]]; ok {
+		tx = it.targetX
+	}
+	h.slide.mu.Unlock()
+	if tx == 0 {
+		t.Fatal("未找到对应 slider 条目")
+	}
+	okForm := "id=" + fields["id"] + "&sig=" + fields["sig"] + "&expires=" + fields["expires"] +
+		"&x=" + strconv.Itoa(tx) + "&dur=850&trail=14&url=%2Fp"
+	okReq := httptest.NewRequest(http.MethodPost, "/__cc_slider_verify", strings.NewReader(okForm))
+	okReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	okReq.RemoteAddr = "5.6.7.8:1234"
+	okReq.AddCookie(&http.Cookie{Name: ccSessionCookieName, Value: "sess-cool"})
+	okRec := httptest.NewRecorder()
+	h.handleSliderVerify(okRec, okReq)
+	if _, ok := h.challengeFailCooling("5.6.7.8"); ok {
+		t.Fatal("通过验证后应清除失败冷却")
+	}
+
+	// 5) silent 失败 → low 档冷却；captcha 失败 → mid 档冷却
+	h.markChallengeFail("9.9.9.9", ChallengeLow)
+	if lvl, ok := h.challengeFailCooling("9.9.9.9"); !ok || lvl != ChallengeLow {
+		t.Fatalf("silent 失败冷却档位错误: %d %v", lvl, ok)
+	}
+	h.markChallengeFail("8.8.8.8", ChallengeMid)
+	if lvl, ok := h.challengeFailCooling("8.8.8.8"); !ok || lvl != ChallengeMid {
+		t.Fatalf("captcha 失败冷却档位错误: %d %v", lvl, ok)
 	}
 }
 

@@ -771,6 +771,7 @@ type CCDefenseHandler struct {
 	ipChecker       *IPRegionChecker
 	captcha         *captchaStore
 	trustedSessions sync.Map // sid -> time.Time，验证码通过后的可信会话
+	chFails         sync.Map // ip -> challengeFail，挑战提交失败后的强制冷却窗口
 	pow             *PoWChallenge // JS 计算挑战（nil 或未启用时回退验证码）
 	slide           *slideStore // 滑动拼图验证（v1.2.0 F7）
 	blockForeign    bool
@@ -778,6 +779,36 @@ type CCDefenseHandler struct {
 	throttle        *logThrottler
 	cfg             config.CCDefenseConfig
 	next            http.Handler
+}
+
+// 挑战失败冷却：提交校验失败后，该 IP 在窗口内的后续请求直接重发同档挑战。
+// 修复"失败 → flooding 窗口稀释 → 按 per-IP 首次请求放行"的绕过路径：
+// 挑战页 GET 与验证 POST 均不消耗 per-IP 桶，若不设冷却，作弊者无需通过验证
+// 即可在泛洪窗口稀释后拿到放行。
+const challengeFailCoolSec = 60
+
+type challengeFail struct {
+	until time.Time
+	level ChallengeLevel
+}
+
+// markChallengeFail 记录一次挑战提交失败（ip → 冷却到期时间 + 原档位）。
+func (h *CCDefenseHandler) markChallengeFail(ip string, level ChallengeLevel) {
+	h.chFails.Store(ip, challengeFail{until: time.Now().Add(challengeFailCoolSec * time.Second), level: level})
+}
+
+// challengeFailCooling 返回该 IP 是否处于失败冷却期；过期条目惰性清理。
+func (h *CCDefenseHandler) challengeFailCooling(ip string) (ChallengeLevel, bool) {
+	v, ok := h.chFails.Load(ip)
+	if !ok {
+		return ChallengeLow, false
+	}
+	ent := v.(challengeFail)
+	if time.Now().After(ent.until) {
+		h.chFails.Delete(ip)
+		return ChallengeLow, false
+	}
+	return ent.level, true
 }
 
 type offenderTrack struct {
@@ -1010,6 +1041,7 @@ func (h *CCDefenseHandler) handleCaptchaVerify(w http.ResponseWriter, r *http.Re
 		// 通过验证码即视为可信：清除该 IP 的违规累计并解除防火墙拉黑，
 		// 避免真人在反复挑战过程中被累计触发拉黑。
 		h.offenders.Delete(ip)
+		h.chFails.Delete(ip)
 		if h.fw != nil {
 			h.fw.unblock(ip)
 		}
@@ -1025,6 +1057,8 @@ func (h *CCDefenseHandler) handleCaptchaVerify(w http.ResponseWriter, r *http.Re
 	}
 	log.Printf("[cc_defense] captcha failed ip=%s id=%s clicks=%v", ip, id, clicks)
 	metrics.CaptchaFailed.Inc()
+	// 进入失败冷却：窗口内该 IP 后续请求直接重发点选挑战，防止"失败后按 per-IP 首次放行"绕过。
+	h.markChallengeFail(ip, ChallengeMid)
 	if expIP, expPos, ok := h.captcha.peek(id); ok {
 		log.Printf("[cc_defense] captcha expected ip=%s pos=%v", expIP, expPos)
 	}
@@ -1152,6 +1186,15 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 慢速路径：非可信 IP，需要 flooding 检测
 	h.trust.gc()
+
+	// 挑战失败冷却：窗口内直接重发同档挑战，不进入限速/晋升判定，
+	// 防止"挑战失败后 flooding 窗口稀释 → per-IP 首次放行"绕过。
+	if lvl, ok := h.challengeFailCooling(ip); ok {
+		attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "失败冷却")
+		h.serveChallenge(w, r, ip, lvl)
+		return
+	}
+
 	flooding := h.flood.isFlooding(ip)
 
 	// 对未可信 IP 进行行为检测（不限于泛洪期）

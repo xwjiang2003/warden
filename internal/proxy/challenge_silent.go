@@ -66,7 +66,9 @@ func (h *CCDefenseHandler) handleSilentVerify(w http.ResponseWriter, r *http.Req
 	}
 	if h.pow == nil || !h.pow.verify(ip, nonce, sig, difficulty, expires, solution) {
 		metrics.SilentFailed.Inc()
-		// 校验失败不重发（无感验证无重试 UI）：静默回首页，让限速继续生效
+		// 校验失败不重发（无感验证无重试 UI）：静默回首页，让限速继续生效；
+		// 同时进入失败冷却，窗口内后续请求直接重发无感挑战。
+		h.markChallengeFail(ip, ChallengeLow)
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
@@ -79,21 +81,25 @@ func (h *CCDefenseHandler) handleSilentVerify(w http.ResponseWriter, r *http.Req
 	fpTouch := r.FormValue("fp_touch")
 	if fpUA != uaHash {
 		metrics.SilentFailed.Inc()
+		h.markChallengeFail(ip, ChallengeLow)
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
 	if len(fpCanvas) < silentFPHashLen {
 		metrics.SilentFailed.Inc()
+		h.markChallengeFail(ip, ChallengeLow)
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
 	if fpLangs == "" {
 		metrics.SilentFailed.Inc()
+		h.markChallengeFail(ip, ChallengeLow)
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
 	if fpTouch != "0" && fpTouch != "1" {
 		metrics.SilentFailed.Inc()
+		h.markChallengeFail(ip, ChallengeLow)
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
@@ -104,6 +110,7 @@ func (h *CCDefenseHandler) handleSilentVerify(w http.ResponseWriter, r *http.Req
 // grantTrust 挑战通过的统一可信链路：清违规累计、解防火墙拉黑、签发可信会话并回跳。
 func (h *CCDefenseHandler) grantTrust(w http.ResponseWriter, r *http.Request, ip, sid, target, via string) {
 	h.offenders.Delete(ip)
+	h.chFails.Delete(ip)
 	if h.fw != nil {
 		h.fw.unblock(ip)
 	}

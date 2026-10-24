@@ -174,7 +174,9 @@ func (h *CCDefenseHandler) handleSliderVerify(w http.ResponseWriter, r *http.Req
 
 	fail := func() {
 		metrics.SliderFailed.Inc()
-		// 失败重发滑动验证页（保留原目标地址）
+		// 失败重发滑动验证页（保留原目标地址），并进入失败冷却：
+		// 窗口内该 IP 的后续请求直接重发挑战，防止 flooding 窗口稀释后按 per-IP 放行。
+		h.markChallengeFail(ip, ChallengeHigh)
 		h.serveSlider(w, r, ip)
 	}
 	if id == "" || sig == "" || errX != nil || errE != nil || errD != nil || errT != nil {

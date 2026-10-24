@@ -168,3 +168,34 @@ Stop-Process -Id $p.Id -Force; Remove-Item -Recurse -Force $t
 
 **遗留**：镜像 `warden:1.1.0` 保留在服务器供后续使用；测试容器/卷/后端已全部删除；生产站点
 https=200 / http=301 确认不受影响。
+
+## 8. 服务器真实验收记录 2（2026-10-24，F2/F3，devtools.help）
+
+在 F1 之后继续验收 **v1.1.0 的 F2（HTTPS/TLS 内置）与 F3（规则在线管理 + 热更新）**。
+镜像 `warden:1.1.0-f3`（含 F2/F3 代码，57MB，uid=100）在服务器构建；仍与生产 nginx 80/443 完全隔离。
+
+### 8.1 F3 规则在线管理 + 热更新
+
+| 项 | 结果 |
+|---|---|
+| 规则来源 | 容器首启日志 `规则已从 /app/rules/coraza.conf 迁移入库（rules 表）`；`GET /api/rules` 返回 `rules_source=db` |
+| 初始拦截 | `/admin` → 403（规则文件内容已生效） |
+| **热更新** | `PUT /api/rules` 换为拦 `/api` 的规则 → 响应 `{"message":"规则已保存并热加载（无需重启）","restart_required":false}`；**未重启**，下一条请求 `/api/x` 立即 403、`/admin` 恢复转发（404 来自测试后端） |
+| 动态 waf_rules | PUT 同时提交 `scanner_paths=["phpmyadmin"]` → `/phpmyadmin` 返回 **200 空响应（0 字节）**＝910002 drop 静默丢弃生效（与 §7 观察项 3 一致：drop=200 空体，deny=403，backend=404/460 字节可区分） |
+| 重启持久化 | `docker compose restart` 后 `/api/x` 仍 403、`/admin` 仍转发、`/phpmyadmin` 仍 200 空体——**DB 中规则重启后仍生效** |
+| 非法规则护栏 | （本地单测覆盖：非法规则 400 不落库不切换） |
+
+### 8.2 F2 HTTPS/TLS 手动证书
+
+| 项 | 结果 |
+|---|---|
+| 证书 | `openssl req -x509` 自签 `CN=devtools.help`（7 天），挂载 `certs/` 进容器 |
+| 监听 | `listen: ":443"` + `tls.enabled=true` + `cert_file/key_file`；容器映射 `18443:443` |
+| HTTPS | `curl -sk https://127.0.0.1:18443/healthz` → **200 `ok`** |
+| 证书校验 | `openssl s_client` → `subject=CN=devtools.help`，有效期 2026-10-24→10-31 |
+| TLS 版本 | TLSv1.3 / TLS_AES_128_GCM_SHA256（满足 TLS1.2+ 基线） |
+| WAF 叠加 | HTTPS 下 `/admin` → 403、`/ok` → 404——TLS 终止与 WAF/转发链路正常工作 |
+| 踩坑记录 | 容器非 root(uid=100) 读不了宿主 600 权限的 `privkey.pem`——需 `chmod 644` 证书文件再挂载（**部署注意：私钥文件必须对容器用户可读**） |
+
+**遗留**：镜像 `warden:1.1.0-f3` 保留在服务器；测试容器/卷/后端/证书目录/tar 已全部删除；生产站点
+https=200 / http=301 再次确认不受影响。

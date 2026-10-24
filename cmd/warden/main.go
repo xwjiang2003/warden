@@ -17,7 +17,6 @@ import (
 
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
-	txhttp "github.com/corazawaf/coraza/v3/http"
 
 	"warden/internal/accesslog"
 	"warden/internal/admin"
@@ -98,7 +97,9 @@ func main() {
 		rulesPath = filepath.Join(exeDir, rulesPath)
 	}
 
-	wafEngine, err := waf.New(rulesPath, &cfg.WAFRules)
+	// 规则加载：DB 优先（管理后台在线编辑生效）；首次启动自动从文件迁移入库。
+	// 之后通过 Holder 支持热更新，无需重启。
+	wafEngine, err := waf.LoadOrBuildEngine(dbPath, rulesPath, &cfg.WAFRules)
 	if err != nil {
 		fatalStartup(exeDir, "waf: %v", err)
 	}
@@ -109,6 +110,10 @@ func main() {
 	if err != nil {
 		fatalStartup(exeDir, "router: %v", err)
 	}
+	// 热更新引擎容器：请求路径每次 Load，管理后台保存规则后 SetEngine 原子切换
+	wafHolder := waf.NewHolder()
+	wafHolder.Init(siteRouter)
+	wafHolder.SetEngine(wafEngine)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -133,7 +138,7 @@ func main() {
 	}
 	fwBlocker := proxy.NewFirewallBlocker(cfg.FirewallBlock.Enabled && cfg.FirewallBlock.AutoBlock, cfg.FirewallBlock.ExpireMin, cfg.FirewallBlock.WhitelistCIDRs, fwStore)
 
-	inner := txhttp.WrapHandler(wafEngine, siteRouter)
+	inner := wafHolder.Handler() // 热更新入口：内部每次请求取当前引擎
 	var ccDef *proxy.CCDefenseHandler
 	rl := proxy.NewIPRateLimiter(cfg.RateLimit, cfg.BlockRequests, func(ip string) {
 		if ccDef != nil {
@@ -143,6 +148,7 @@ func main() {
 	handler := rl.Middleware(inner)
 	ccDef = proxy.NewCCDefense(cfg.CCDefense, cfg.IPCheck, fwBlocker, handler, trustStore)
 	adminSrv.SetTrustStore(trustStore)
+	adminSrv.SetRuleRepo(dbPath, &cfg.WAFRules, wafHolder)
 	whitelist := proxy.NewIPWhitelist(cfg.IPWhitelist.CIDRs)
 	blocklist := proxy.NewIPWhitelist(cfg.IPBlacklist.CIDRs)
 	mux.Handle("/", proxy.BlocklistMiddleware(blocklist, cfg.IPBlacklist.Enabled,

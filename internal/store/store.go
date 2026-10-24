@@ -17,6 +17,14 @@ import (
 // DefaultDBPath 默认 SQLite 数据库文件（相对可执行文件目录）
 const DefaultDBPath = "data/warden.db"
 
+// rules 表键名约定
+const (
+	// KeyCorazaConf Coraza 规则文本（默认来自 rules/coraza.conf，管理后台可在线编辑）
+	KeyCorazaConf = "coraza.conf"
+	// KeyWAFRules 动态 waf_rules 配置 JSON（scanner_paths / scanner_uas / block_script_ua 等）
+	KeyWAFRules = "waf_rules"
+)
+
 func openDB(dbPath string) (*sql.DB, error) {
 	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -43,7 +51,55 @@ func openDB(dbPath string) (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	// rules 表：在线规则（v1.1.0 F3 起）
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS rules (
+		key TEXT PRIMARY KEY,
+		data TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	)`); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return db, nil
+}
+
+// LoadRule 读取 rules 表指定键的内容。返回 ok=false 表示无记录。
+// 数据库不可用时返回错误（由调用方决定回退文件）。
+func LoadRule(dbPath, key string) (string, bool, error) {
+	if dbPath == "" {
+		dbPath = DefaultDBPath
+	}
+	db, err := openDB(dbPath)
+	if err != nil {
+		return "", false, err
+	}
+	defer db.Close()
+	var data string
+	err = db.QueryRow(`SELECT data FROM rules WHERE key = ?`, key).Scan(&data)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return data, true, nil
+}
+
+// SaveRule 写入 rules 表指定键（INSERT OR REPLACE）。
+func SaveRule(dbPath, key, data string) error {
+	if dbPath == "" {
+		dbPath = DefaultDBPath
+	}
+	db, err := openDB(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return sqlutil.Retry(func() error {
+		_, err := db.Exec(`INSERT OR REPLACE INTO rules (key, data, updated_at) VALUES (?, ?, ?)`,
+			key, data, time.Now().Format(time.RFC3339))
+		return err
+	})
 }
 
 func saveDB(db *sql.DB, cfg *config.Config) error {

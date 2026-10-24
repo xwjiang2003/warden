@@ -27,6 +27,7 @@ import (
 	"warden/internal/truststore"
 	"warden/internal/util"
 	"warden/internal/version"
+	"warden/internal/waf"
 )
 
 // Server 管理后台服务
@@ -39,6 +40,10 @@ type Server struct {
 	mux           *http.ServeMux
 	trustStore    *truststore.Store
 	restartNeeded atomic.Bool // 保存配置后置位，重启进程后清零
+	// 规则在线管理（F3）：注入后 GET/PUT /api/rules 可用
+	ruleDBPath string
+	wafRules   *config.WAFRulesConfig
+	holder     *waf.Holder
 }
 
 func NewServer(cfg *config.Config, cfgPath, dbPath string, adminCfg config.AdminConfig) *Server {
@@ -70,6 +75,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/alert/test", s.handleAlertTest)
 	s.mux.HandleFunc("GET /api/license", s.handleLegal("LICENSE"))
 	s.mux.HandleFunc("GET /api/notice", s.handleLegal("NOTICE"))
+	s.mux.HandleFunc("GET /api/rules", s.handleGetRules)
+	s.mux.HandleFunc("PUT /api/rules", s.handlePutRules)
 	s.mux.HandleFunc("GET /", s.handleStatic)
 }
 
@@ -300,6 +307,101 @@ func (s *Server) handleAttackLogsClear(w http.ResponseWriter, r *http.Request) {
 // SetTrustStore 注入可信 IP 持久化存储（用于分页查询）。
 func (s *Server) SetTrustStore(store *truststore.Store) {
 	s.trustStore = store
+}
+
+// SetRuleRepo 注入规则仓库（F3 规则在线管理）：dbPath 为 SQLite 路径、
+// wr 指向进程内生效的 WAFRules 配置、holder 为热更新引擎容器。
+// main.go 启动时注入；未注入时 /api/rules 返回 503。
+func (s *Server) SetRuleRepo(dbPath string, wr *config.WAFRulesConfig, holder *waf.Holder) {
+	s.ruleDBPath = dbPath
+	s.wafRules = wr
+	s.holder = holder
+}
+
+// handleGetRules 返回当前生效的规则（coraza.conf 文本 + waf_rules 结构化配置）。
+func (s *Server) handleGetRules(w http.ResponseWriter, r *http.Request) {
+	if s.holder == nil || s.wafRules == nil || s.ruleDBPath == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "规则仓库未就绪（进程启动中）",
+		})
+		return
+	}
+	conf, _, _ := store.LoadRule(s.ruleDBPath, store.KeyCorazaConf)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"coraza_conf":  conf,
+		"waf_rules":    s.wafRules,
+		"hot_reload":   true,
+		"rules_source": "db", // DB 优先；启动时已自动从 rules_file 迁移入库
+	})
+}
+
+// handlePutRules 保存规则并热加载（无需重启）。
+// 保存前先编译验证：不合法 → 400 且不落库、不切换，保证线上引擎不被坏规则破坏。
+func (s *Server) handlePutRules(w http.ResponseWriter, r *http.Request) {
+	if s.holder == nil || s.wafRules == nil || s.ruleDBPath == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "规则仓库未就绪（进程启动中）",
+		})
+		return
+	}
+	var req struct {
+		CorazaConf *string                `json:"coraza_conf"` // 缺省/空 = 保持现有
+		WAFRules   *config.WAFRulesConfig `json:"waf_rules"`  // 缺省 = 保持现有
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "JSON 解析失败: " + err.Error(),
+		})
+		return
+	}
+
+	// 合并请求与当前生效内容
+	conf, _, _ := store.LoadRule(s.ruleDBPath, store.KeyCorazaConf)
+	if req.CorazaConf != nil && *req.CorazaConf != "" {
+		conf = *req.CorazaConf
+	}
+	if conf == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "coraza_conf 不能为空（规则内容不可清空）",
+		})
+		return
+	}
+	wr := *s.wafRules
+	if req.WAFRules != nil {
+		wr = *req.WAFRules
+	}
+
+	// 先编译验证，再落库与切换
+	engine, err := waf.NewFromText(conf, &wr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "规则编译失败，未保存: " + err.Error(),
+		})
+		return
+	}
+
+	if err := store.SaveRule(s.ruleDBPath, store.KeyCorazaConf, conf); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "规则保存失败: " + err.Error(),
+		})
+		return
+	}
+	wafRulesJSON, _ := json.Marshal(wr)
+	if err := store.SaveRule(s.ruleDBPath, store.KeyWAFRules, string(wafRulesJSON)); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "waf_rules 保存失败: " + err.Error(),
+		})
+		return
+	}
+
+	*s.wafRules = wr
+	s.holder.SetEngine(engine) // 原子切换，下一请求即用新引擎
+
+	log.Printf("[admin] 规则已更新并热加载（无需重启；coraza 文本 %d 字节）", len(conf))
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"message":          "规则已保存并热加载（无需重启）",
+		"restart_required": false,
+	})
 }
 
 func (s *Server) handleTrustedIPs(w http.ResponseWriter, r *http.Request) {

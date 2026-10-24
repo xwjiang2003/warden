@@ -8,6 +8,18 @@
 
 ### 新增
 
+- **规则在线管理 + 热更新（v1.1.0 第三项）**：管理后台新增 `GET/PUT /api/rules`，
+  Coraza 规则文本与动态 `waf_rules` 均可在线编辑，保存即热加载生效，**无需重启**。
+  - 规则存储迁移至 SQLite `rules` 表（`coraza.conf` / `waf_rules` 两个键），
+    **DB 优先**：首次启动自动把 `rules_file` 内容迁移入库，此后以库内内容为准；
+    规则持久化与配置表（`config`）同机制。
+  - 热更新引擎：`internal/waf` 新增 `Holder`（原子指针持有 Coraza 引擎 + 包装
+    handler），请求路径每次 Load，保存规则后原子切换，下一请求即生效、无锁。
+  - **安全护栏**：`PUT /api/rules` 保存前先编译验证（`NewFromText`），规则不合法
+    返回 400 且不落库、不切换，线上引擎不会被坏规则破坏；`coraza_conf` 不可清空。
+  - `waf.New` 重构为 `NewFromText`（规则文本构建，与动态规则共用编译路径）；
+    新增 `LoadOrBuildEngine`（DB 优先加载）。启动流程、Docker 部署均自动受益。
+
 - **HTTPS/TLS 内置（v1.1.0 第二项）**：`tls` 配置块支持两种方式——
   - **手动证书**：`cert_file` + `key_file`（PEM），`listen` 改 `:443` 后 `ServeTLS` 直接生效；
   - **ACME 自动证书**：`acme=true` + `acme_domains`，基于 `golang.org/x/crypto/acme/autocert`

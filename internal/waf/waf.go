@@ -20,8 +20,19 @@ func New(rulesFile string, wr *config.WAFRulesConfig) (coraza.WAF, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := os.Stat(abs); err != nil {
+	data, err := os.ReadFile(abs)
+	if err != nil {
 		return nil, fmt.Errorf("rules file missing: %s", abs)
+	}
+	return NewFromText(string(data), wr)
+}
+
+// NewFromText 从规则文本与动态 waf_rules 配置创建 Coraza WAF 引擎。
+// 供启动加载（文件）与规则热更新（管理后台在线编辑）共用：
+// 任何规则变更都必须先经过本函数编译验证，成功后才可落库/切换。
+func NewFromText(rulesText string, wr *config.WAFRulesConfig) (coraza.WAF, error) {
+	if wr == nil {
+		wr = &config.WAFRulesConfig{}
 	}
 	dynamic := BuildRules(wr)
 	log.Printf("waf_rules: cc_paths=%d scanner_paths=%d scanner_uas=%d script_ua=%v custom_block=%d",
@@ -29,7 +40,7 @@ func New(rulesFile string, wr *config.WAFRulesConfig) (coraza.WAF, error) {
 		wr.BlockScriptUA, len(wr.CustomBlockPaths))
 	return coraza.NewWAF(
 		coraza.NewWAFConfig().
-			WithDirectivesFromFile(abs).
+			WithDirectives(rulesText). // 与 WithDirectivesFromFile 等价（内部均按字符串 directives 解析）
 			WithDirectives(dynamic).
 			WithErrorCallback(func(mr types.MatchedRule) {
 				metrics.WAFBlocked.Inc()

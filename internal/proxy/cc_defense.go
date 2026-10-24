@@ -3,6 +3,7 @@ package proxy
 import (
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -770,6 +771,7 @@ type CCDefenseHandler struct {
 	ipChecker       *IPRegionChecker
 	captcha         *captchaStore
 	trustedSessions sync.Map // sid -> time.Time，验证码通过后的可信会话
+	pow             *PoWChallenge // JS 计算挑战（nil 或未启用时回退验证码）
 	blockForeign    bool
 	blockCloud      bool
 	throttle        *logThrottler
@@ -801,11 +803,14 @@ func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *Fi
 		cfg:          cfg,
 		next:         next,
 	}
+	if cfg.Pow.Enabled {
+		h.pow = newPoWChallenge(cfg.Pow, cfg.ChallengeCookieKey)
+	}
 	go h.trust.restore() // 异步恢复可信 IP，不阻塞启动
-	log.Printf("[cc_defense] enabled trusted_ips=%d/%ds ttl=%ds global_qps=%d burst=%d new_ip_qps=%d burst=%d per_ip_qps=%d burst=%d flood_ratio=%d%% captcha_gen=%d/s behavior_path=%dreqs/%dpaths",
+	log.Printf("[cc_defense] enabled trusted_ips=%d/%ds ttl=%ds global_qps=%d burst=%d new_ip_qps=%d burst=%d per_ip_qps=%d burst=%d flood_ratio=%d%% captcha_gen=%d/s behavior_path=%dreqs/%dpaths pow=%v",
 		cfg.TrustIPMinVisits, cfg.TrustIPWindowSec, cfg.TrustIPTTLSec, cfg.GlobalQPSMax, cfg.GlobalQPSBurst,
 		cfg.NewIPQPSMax, cfg.NewIPQPSBurst, cfg.UntrustedIPQPSMax, cfg.UntrustedIPBurst, cfg.NewIPRatioBlock,
-		cfg.CaptchaGenMaxPerSec, cfg.BehaviorPathReqsMin, cfg.BehaviorPathCountMax)
+		cfg.CaptchaGenMaxPerSec, cfg.BehaviorPathReqsMin, cfg.BehaviorPathCountMax, cfg.Pow.Enabled)
 	go h.reaper()
 	return h
 }
@@ -890,6 +895,69 @@ func (h *CCDefenseHandler) serveCaptcha(w http.ResponseWriter, r *http.Request, 
 	w.Write([]byte(captchaHTML(id, imgB64, r.URL.String())))
 }
 
+// serveChallenge 挑战策略接口（v1.2.0 F6）：按风险档分发验证方式。
+// PoW 启用时中/高风险档发 JS 计算挑战；否则（或低风险档）回退点选验证码。
+// 触发点统一走这里，后续 F7（无感/滑动验证矩阵）在此扩展即可。
+func (h *CCDefenseHandler) serveChallenge(w http.ResponseWriter, r *http.Request, ip string, level ChallengeLevel) {
+	if h.pow != nil && h.pow.Enabled() && level != ChallengeLow {
+		metrics.PoWChallenged.Inc()
+		nonce, difficulty, expires, sig := h.pow.issue(ip, level)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(powChallengeHTML(nonce, difficulty, expires, sig, r.URL.String())))
+		return
+	}
+	h.serveCaptcha(w, r, ip)
+}
+
+// handlePoWVerify 处理 JS 计算挑战提交：校验通过则标记 IP/会话可信并跳回原地址。
+// 与验证码共用"通过即可信"语义（清违规、解拉黑、签发可信会话 Cookie）。
+func (h *CCDefenseHandler) handlePoWVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	ip := util.ClientIP(r)
+	sid := getSessionID(r)
+	target := r.FormValue("url")
+	// 防开放重定向：仅允许站内相对路径
+	if !strings.HasPrefix(target, "/") || strings.Contains(target, "//") {
+		target = "/"
+	}
+	nonce := r.FormValue("nonce")
+	solution := r.FormValue("solution")
+	sig := r.FormValue("sig")
+	difficulty, errD := strconv.ParseInt(r.FormValue("difficulty"), 10, 64)
+	expires, errE := strconv.ParseInt(r.FormValue("expires"), 10, 64)
+	if nonce == "" || solution == "" || sig == "" || errD != nil || errE != nil {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	if h.pow != nil && h.pow.verify(ip, nonce, sig, difficulty, expires, solution) {
+		log.Printf("[cc_defense] pow passed ip=%s difficulty=%d", ip, difficulty)
+		// 通过挑战即视为可信：清违规累计、解除防火墙拉黑、签发可信会话
+		h.offenders.Delete(ip)
+		if h.fw != nil {
+			h.fw.unblock(ip)
+		}
+		if sid != "" {
+			h.trustedSessions.Store(sid, time.Now())
+		} else {
+			h.trust.setTrusted(ip)
+		}
+		http.Redirect(w, r, target, http.StatusSeeOther)
+		return
+	}
+	log.Printf("[cc_defense] pow failed ip=%s", ip)
+	// 失败重发挑战（PoW 页面）
+	if h.pow != nil && h.pow.Enabled() {
+		nonce, difficulty, expires, sig := h.pow.issue(ip, ChallengeMid)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(powChallengeHTML(nonce, difficulty, expires, sig, target)))
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 // handleCaptchaVerify 处理验证码提交：校验点击序列，通过则标记 IP 可信并跳回原地址
 func (h *CCDefenseHandler) handleCaptchaVerify(w http.ResponseWriter, r *http.Request) {
 	// 只处理 POST：GET/刷新等空请求直接回首页，避免触发验证码循环
@@ -945,7 +1013,7 @@ func (h *CCDefenseHandler) blockIfBotLike(w http.ResponseWriter, r *http.Request
 		}
 		attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "bot-like")
 		metrics.CCChallenged.Inc()
-		h.serveCaptcha(w, r, ip)
+		h.serveChallenge(w, r, ip, ChallengeMid)
 		return true
 	}
 	return false
@@ -975,6 +1043,11 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 验证码提交接口
 	if r.URL.Path == "/__cc_verify" {
 		h.handleCaptchaVerify(w, r)
+		return
+	}
+	// JS 计算挑战提交接口（v1.2.0 F6）
+	if r.URL.Path == "/__cc_pow_verify" {
+		h.handlePoWVerify(w, r)
 		return
 	}
 
@@ -1074,7 +1147,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.ReportOffender(ip)
 		metrics.CCChallenged.Inc()
 		attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "captcha")
-		h.serveCaptcha(w, r, ip)
+		h.serveChallenge(w, r, ip, ChallengeHigh)
 		return
 	}
 
@@ -1086,7 +1159,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "captcha")
 		metrics.CCChallenged.Inc()
-		h.serveCaptcha(w, r, ip)
+		h.serveChallenge(w, r, ip, ChallengeLow)
 		return
 	}
 
@@ -1131,7 +1204,7 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "captcha")
 		metrics.CCChallenged.Inc()
-		h.serveCaptcha(w, r, ip)
+		h.serveChallenge(w, r, ip, ChallengeLow)
 		return
 	}
 

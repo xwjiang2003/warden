@@ -8,6 +8,23 @@
 
 ### 新增
 
+- **JS 计算挑战 Proof-of-Work（v1.2.0 F6）**：`cc_defense.pow` 配置块（默认关闭）。
+  开启后，中/高风险档的验证码挑战改为客户端 SHA-256 前缀碰撞——
+  - **无状态签发**：挑战参数（nonce/difficulty/expires）由 `challenge_cookie_key`
+    HMAC 签名并绑定 IP，服务端不存表、零内存；挑战页内嵌**纯 JS SHA-256**
+    （不依赖 `crypto.subtle`，HTTP 部署同样可用），浏览器自动求解并回传
+    `/__cc_pow_verify`。
+  - **服务端校验恒定成本**：签名（常数时间比较）→ 时间窗防重放 → 难度范围 →
+    一次 SHA-256 前缀零 bit 校验。通过后与验证码同等语义：清违规累计、解防火墙
+    拉黑、签发 24h 可信会话 Cookie（或可信 IP），302 跳回原地址。
+  - **三档风险映射**：低风险（单 IP 限速）→ `difficulty_min`（默认 12bit，
+    浏览器 <100ms 无感）；中风险（行为检测）→ 中间值；高风险（泛洪）→
+    `difficulty_max`（默认 16bit，约 1s）。低风险档仍保留点选验证码，
+    挑战策略统一走 `serveChallenge(w,r,ip,level)` 接口，为 F7 验证矩阵留位。
+  - 指标新增 `pow_challenged` / `pow_passed` / `pow_failed`。
+  - 防护细节：错误解只重发挑战页，不触发验证码循环；`<noscript>` 降级提示；
+    `url` 回跳参数防开放重定向（仅允许站内相对路径）。
+
 - **规则在线管理 + 热更新（v1.1.0 第三项）**：管理后台新增 `GET/PUT /api/rules`，
   Coraza 规则文本与动态 `waf_rules` 均可在线编辑，保存即热加载生效，**无需重启**。
   - 规则存储迁移至 SQLite `rules` 表（`coraza.conf` / `waf_rules` 两个键），

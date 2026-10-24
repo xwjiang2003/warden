@@ -237,6 +237,21 @@ type CCDefenseConfig struct {
 	FloodSlidingWindowSec int `json:"flood_sliding_window_sec"`
 	UntrustedIPQPSMax     int `json:"untrusted_ip_qps_max"`
 	UntrustedIPBurst      int `json:"untrusted_ip_burst"`
+	// Pow JS 计算挑战（v1.2.0 F6）：启用后，中/高风险档的验证码挑战改为
+	// SHA-256 前缀碰撞 PoW（计算在客户端，服务端签发成本趋近于零）。
+	Pow PoWConfig `json:"pow"`
+}
+
+// PoWConfig JS 计算挑战（Proof-of-Work）配置。
+type PoWConfig struct {
+	Enabled bool `json:"enabled"` // 默认 false：保持既有点选验证码行为
+	// DifficultyMin/Max 目标前缀零 bit 数（SHA-256 结果的高位起算）。
+	// 低风险档用 DifficultyMin、高风险档用 DifficultyMax，中风险取中间值。
+	// 参考：12bit ≈ 平均 4096 次 SHA-256（浏览器 <100ms）；16bit ≈ 65536 次（约 1s）。
+	DifficultyMin int `json:"difficulty_min"`
+	DifficultyMax int `json:"difficulty_max"`
+	// TTLSec 挑战 nonce 有效期（秒），过期即失效（防重放窗口）。
+	TTLSec int `json:"ttl_sec"`
 }
 
 func (c *CCDefenseConfig) Normalize() {
@@ -314,6 +329,26 @@ func (c *CCDefenseConfig) Normalize() {
 	}
 	if c.UntrustedIPBurst <= 0 {
 		c.UntrustedIPBurst = 40
+	}
+	// PoW 挑战默认关闭；开启时难度档位归一（min<=max，默认 12/16，TTL 60s）
+	if !c.Pow.Enabled {
+		c.Pow = PoWConfig{} // 未启用时忽略其余字段，保持既有行为
+		return
+	}
+	if c.Pow.DifficultyMin <= 0 {
+		c.Pow.DifficultyMin = 12
+	}
+	if c.Pow.DifficultyMax <= 0 {
+		c.Pow.DifficultyMax = 16
+	}
+	if c.Pow.DifficultyMax < c.Pow.DifficultyMin {
+		c.Pow.DifficultyMax = c.Pow.DifficultyMin
+	}
+	if c.Pow.TTLSec <= 0 {
+		c.Pow.TTLSec = 60
+	}
+	if c.Pow.DifficultyMax > 24 {
+		c.Pow.DifficultyMax = 24 // 上限 24bit（约 1600 万次，远超正常交互成本）
 	}
 }
 

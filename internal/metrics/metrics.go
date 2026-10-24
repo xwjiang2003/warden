@@ -16,6 +16,9 @@ var (
 	CCChallenged     Counter // CC 防御验证码挑战（弹挑战页次数）
 	CaptchaPassed    Counter // 验证码挑战通过次数
 	CaptchaFailed    Counter // 验证码挑战失败次数
+	PoWChallenged    Counter // PoW 计算挑战（弹挑战页次数，v1.2.0 F6）
+	PoWPassed        Counter // PoW 挑战通过次数
+	PoWFailed        Counter // PoW 挑战失败次数
 	RateLimitBlocked Counter // 频率限制(429)
 	ConnLimitDropped Counter // L4 连接限制丢弃
 	IPCheckBlocked   Counter // IP 归属拦截（国外/云厂商）
@@ -32,6 +35,9 @@ func Snapshot() map[string]int64 {
 		"cc_challenged":      CCChallenged.Value(),
 		"captcha_passed":     CaptchaPassed.Value(),
 		"captcha_failed":     CaptchaFailed.Value(),
+		"pow_challenged":     PoWChallenged.Value(),
+		"pow_passed":         PoWPassed.Value(),
+		"pow_failed":         PoWFailed.Value(),
 		"rate_limit_blocked": RateLimitBlocked.Value(),
 		"conn_limit_dropped": ConnLimitDropped.Value(),
 		"ip_check_blocked":   IPCheckBlocked.Value(),

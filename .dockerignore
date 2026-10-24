@@ -1,0 +1,51 @@
+# ============================================================
+# Docker 构建上下文忽略清单
+# 注意：data/ip2region.xdb 需进镜像（Dockerfile 显式 COPY），不在忽略之列
+# ============================================================
+
+# 构建产物与本地二进制
+warden
+warden.exe
+warden-linux-arm64
+dist/
+build/
+*.test
+
+# 运行时数据（由 compose named volume 持久化，不进镜像）
+logs/
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# 本地工具链 / 缓存
+.gocache/
+.appdata/
+.pprof/
+.loadtest/
+.dsh/
+.vendor-cache/
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# 本地脚本（进不了镜像）
+env.bat
+install.bat
+run.bat
+run.sh
+set-proxy.bat
+analyze_access.py
+
+# Python / 临时
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.tmp
+*.temp

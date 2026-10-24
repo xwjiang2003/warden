@@ -9,8 +9,12 @@
 #   .\build.ps1                  # 编译全部目标（推荐）
 #   .\build.ps1 -WindowsOnly     # 只编 Windows 版本（本机调试，最快）
 #   .\build.ps1 -Version 1.0.2   # 构建时注入版本号
+#   .\build.ps1 -DockerBuild -Version 1.1.0      # 构建 Docker 镜像（amd64，需本机 docker）
+#   .\build.ps1 -DockerPush -Version 1.1.0       # buildx 多架构（amd64+arm64）并推送
 param(
     [switch]$WindowsOnly,
+    [switch]$DockerBuild,
+    [switch]$DockerPush,
     [string]$Version
 )
 
@@ -68,3 +72,20 @@ foreach ($f in @("warden.exe", "warden", "warden-linux-arm64")) {
 Write-Host ""
 Write-Host "Windows: 双击 run.bat"
 Write-Host "Linux:   chmod +x run.sh && ./run.sh"
+
+# ---------- Docker 镜像（可选目标） ----------
+if ($DockerBuild -or $DockerPush) {
+    $dockerCmd = Get-Command docker -ErrorAction SilentlyContinue
+    if (-not $dockerCmd) { throw "未检测到 docker 命令（需要 Docker 引擎，含 buildx）。请先安装 Docker 后重试。" }
+    if (-not $Version) { $Version = "dev" }
+    $tag = "warden:$Version"
+    if ($DockerPush) {
+        Write-Host "==> docker buildx build（linux/amd64 + linux/arm64）--push $tag"
+        docker buildx build --platform linux/amd64,linux/arm64 --build-arg "VERSION=$Version" -t $tag --push .
+    } else {
+        Write-Host "==> docker build（linux/amd64）$tag"
+        docker build --build-arg "VERSION=$Version" -t $tag .
+    }
+    if ($LASTEXITCODE -ne 0) { throw "docker 构建失败（$tag）" }
+    Write-Host "镜像就绪：$tag"
+}

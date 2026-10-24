@@ -1,0 +1,68 @@
+# ============================================================
+# Warden（沃盾）Docker Compose —— 一键起防护
+#   docker compose up -d          # 启动
+#   docker compose ps             # 查看健康状态
+#   docker compose logs -f warden # 跟踪日志
+#   docker compose down           # 停止（保留卷数据）
+#
+# 容器内默认配置见 docker/config.json（已按容器场景调整：
+#   trust_local_proxy=false、管理后台监听 0.0.0.0:9090）。
+#
+# 真实客户端 IP 三种拓扑（详见 README「方案 D」）：
+#   1) warden 直接对外：默认端口映射下 docker-proxy 会把对端改写为 127.0.0.1，
+#      容器默认 trust_local_proxy=false（不采信伪造 XFF），此时后台看到的 IP 会失真；
+#      要拿真实 IP 请改用下方注释的 network_mode: "host"（Linux 专属）。
+#   2) nginx 容器前置：warden 与 nginx 同一 compose 网络，把 nginx 所在网段
+#      填入 config.json 的 trusted_proxies（如 "172.16.0.0/12"），
+#      warden 会从 X-Forwarded-For 右侧跳过可信代理解析出真实 IP。
+#   3) 外部 nginx 前置（非容器）：把 nginx 机器地址填入 trusted_proxies。
+#
+# 管理后台默认不映射端口（安全默认：默认无密码认证）；
+# 需要从宿主机访问时取消下方 9090 映射注释，并务必先设置 admin.password。
+# ============================================================
+
+services:
+  warden:
+    image: ${WARDEN_IMAGE:-warden:1.1.0}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${WARDEN_VERSION:-1.1.0}
+    restart: unless-stopped
+    # 直接对外（拓扑 1）。若前置 nginx 走 compose 内网，可删除本段映射
+    ports:
+      - "${WARDEN_PORT:-81}:81"
+    # 管理后台（默认不暴露，启用前务必设置 admin.password）
+    # ports:
+    #   - "9090:9090"
+    environment:
+      # 日志按天轮转使用本地时区（镜像带 tzdata）
+      - TZ=${TZ:-Asia/Shanghai}
+      - WARDEN_PPROF=0
+    volumes:
+      # 四个卷：配置 / 规则 / 数据 / 日志，全部持久化，升级镜像不丢数据
+      # config.json 用命名卷：管理后台保存配置可写回，无需重启
+      - warden-config:/app/config.json
+      # 想直接编辑 config.json（改完需重启容器生效），改用 bind mount：
+      # - ./config.json:/app/config.json:ro
+      - warden-rules:/app/rules
+      - warden-data:/app/data
+      - warden-logs:/app/logs
+    # 健康检查：探 /healthz（容器内 warden 监听 :81）
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:81/healthz"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    # 拓扑 1 要真实客户端 IP 时启用 host 网络（Linux 专属）：
+    #   network_mode: "host"
+    #   注意：host 模式下上方 ports 映射不生效，warden 直接监听宿主端口
+    #   （config.json 的 listen），对端即真实 IP，trusted_proxies 无需配置。
+
+volumes:
+  warden-config:
+  warden-rules:
+  warden-data:
+  warden-logs:

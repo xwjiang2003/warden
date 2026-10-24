@@ -4,6 +4,21 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- **Docker 容器部署（v1.1.0 首项）**：新增多阶段 `Dockerfile`（golang:1.23-alpine 构建 →
+  alpine:3.20 运行，`CGO_ENABLED=0` 纯 Go 编译、**非 root 用户**、内置 `ca-certificates` /
+  `tzdata`）与 `docker-compose.yml`，`docker compose up -d` 一键起防护。
+  - 容器默认配置 `docker/config.json`：较根目录配置仅两处差异——`admin.listen` 改
+    `0.0.0.0:9090`（容器内可访问）；`trust_local_proxy` 改 `false`（安全默认，不采信
+    伪造转发头）。生产部署建议设置 `admin.password`。
+  - 四个命名卷持久化：`config.json`（管理后台写回，免重启）、`rules/`、`data/`、`logs/`。
+  - 内置 `HEALTHCHECK` 探 `/healthz`；`build.ps1` 新增 `-DockerBuild` / `-DockerPush`
+    （buildx 多架构 linux/amd64 + linux/arm64）目标；README 新增「方案 D：Docker 部署」。
+  - 服务器验收清单见 `docs/docker-verify.md`。
+
 ## [1.0.4] - 2026-10-01
 
 性能与稳定性修复：含**一项崩溃级缺陷**，并修正行为检测误伤真实用户、

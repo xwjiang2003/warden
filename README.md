@@ -538,6 +538,42 @@ server {
 > warden 会按其真实源地址判定（不会采信伪造头），但也就绕过了 nginx 层的
 > `limit_req` / `limit_conn` 等防护。
 
+### 方案 D：Docker 部署（Compose 一键起）
+
+仓库根目录已带 `Dockerfile` + `docker-compose.yml`，Linux 服务器上一条命令起防护：
+
+```bash
+docker compose up -d        # 启动
+docker compose ps           # 查看健康状态（healthcheck 探 /healthz）
+docker compose logs -f warden
+docker compose down         # 停止（卷数据保留）
+```
+
+- **镜像**：多阶段构建（`golang:1.23-alpine` → `alpine:3.20`），`CGO_ENABLED=0` 纯 Go 编译，
+  **非 root 用户**运行，内置 `ca-certificates`（告警 Webhook / HTTPS 上游）与 `tzdata`（`TZ` 环境变量切时区）。
+- **默认配置**：容器场景版 `docker/config.json`（与仓库根目录 `config.json` 的区别仅两处：
+  `admin.listen` 改为 `0.0.0.0:9090` 以便容器内访问；`trust_local_proxy` 改为 `false` 作为安全默认）。
+- **持久化**：四个命名卷——`config.json`（管理后台保存配置直接写回，无需重启）、`rules/`、`data/`（SQLite + IP 库）、`logs/`；升级镜像不丢数据。
+- **健康检查**：内置 `HEALTHCHECK` 每 30s 探 `/healthz`，`docker compose ps` 即可看到容器健康状态。
+- **构建与多架构**：
+  ```powershell
+  .\build.ps1 -DockerBuild -Version 1.1.0          # 本机构建 linux/amd64 镜像
+  .\build.ps1 -DockerPush  -Version 1.1.0          # buildx 构建 amd64+arm64 并推送（需登录 registry）
+  ```
+  版本号经 `-ldflags` 注入，启动日志与管理后台可见。
+
+> **容器里的真实客户端 IP**：默认端口映射（`-p 81:81`）时 docker-proxy 会把远端对端改写为
+> `127.0.0.1`，而容器默认 `trust_local_proxy=false`（不采信伪造的 XFF），此时管理后台看到的
+> 客户端 IP 会失真。三种解法（详见 `docker-compose.yml` 顶部注释）：
+> 1. **host 网络**：compose 中启用 `network_mode: "host"`，对端即真实 IP（Linux 专属，端口映射失效）；
+> 2. **nginx 容器前置**：warden 与 nginx 同网络，把 nginx 所在网段填入 `trusted_proxies`；
+> 3. **外部 nginx 前置**：把 nginx 机器地址填入 `trusted_proxies`。
+>
+> 管理后台默认**不映射端口**（默认无密码认证）；需要从宿主机访问时取消 compose 中 9090 的
+> 端口映射注释，并**务必先设置 `admin.password`**。
+>
+> 服务器验证清单见 [docs/docker-verify.md](docs/docker-verify.md)。
+
 ### 注册为系统服务
 
 **Windows（NSSM）：**

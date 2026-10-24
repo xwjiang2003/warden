@@ -6,6 +6,23 @@ import (
 	"strings"
 )
 
+// 挑战方式合法值（与 proxy 的 ChallengeKind 常量一致，此处独立于 proxy 包定义）
+const (
+	ChallengeSilent  = "silent"
+	ChallengePow     = "pow"
+	ChallengeCaptcha = "captcha"
+	ChallengeSlider  = "slider"
+)
+
+// normalizeChallengeKind 校验挑战方式取值：空或非法值回退给定默认。
+func normalizeChallengeKind(v, def string) string {
+	switch v {
+	case ChallengeSilent, ChallengePow, ChallengeCaptcha, ChallengeSlider:
+		return v
+	}
+	return def
+}
+
 // Config 顶层配置
 type Config struct {
 	Listen              string                `json:"listen"`
@@ -240,6 +257,19 @@ type CCDefenseConfig struct {
 	// Pow JS 计算挑战（v1.2.0 F6）：启用后，中/高风险档的验证码挑战改为
 	// SHA-256 前缀碰撞 PoW（计算在客户端，服务端签发成本趋近于零）。
 	Pow PoWConfig `json:"pow"`
+	// ChallengeByRisk 三档挑战矩阵（v1.2.0 F7）：低/中/高风险档分别映射
+	// 到验证方式（silent 无感 / pow 整页 PoW / captcha 点选 / slider 滑动）。
+	// 默认 {low:silent, mid:captcha, high:slider}；任一档配 "pow" 但
+	// Pow.Enabled=false 时回退 captcha。
+	ChallengeByRisk ChallengeByRiskConfig `json:"challenge_by_risk"`
+}
+
+// ChallengeByRiskConfig 三档挑战矩阵配置（v1.2.0 F7）。
+// 档位取值：silent=无感验证、pow=整页 JS PoW、captcha=点选验证码、slider=滑动拼图。
+type ChallengeByRiskConfig struct {
+	Low  string `json:"low"`
+	Mid  string `json:"mid"`
+	High string `json:"high"`
 }
 
 // PoWConfig JS 计算挑战（Proof-of-Work）配置。
@@ -252,6 +282,11 @@ type PoWConfig struct {
 	DifficultyMax int `json:"difficulty_max"`
 	// TTLSec 挑战 nonce 有效期（秒），过期即失效（防重放窗口）。
 	TTLSec int `json:"ttl_sec"`
+	// SilentDifficulty 无感验证档（silent）的前缀零 bit 数。
+	// 无感验证页透明、浏览器秒过，因此难度必须很低（默认 6bit ≈ 64 次哈希，
+	// <10ms 无感知）；它主要拦「无 JS 客户端」（curl/requests 类纯脚本），
+	// 拦不了带 JS 的无头浏览器——那类由中/高风险档的 captcha/slider 承担。
+	SilentDifficulty int `json:"silent_difficulty"`
 }
 
 func (c *CCDefenseConfig) Normalize() {
@@ -330,11 +365,10 @@ func (c *CCDefenseConfig) Normalize() {
 	if c.UntrustedIPBurst <= 0 {
 		c.UntrustedIPBurst = 40
 	}
-	// PoW 挑战默认关闭；开启时难度档位归一（min<=max，默认 12/16，TTL 60s）
-	if !c.Pow.Enabled {
-		c.Pow = PoWConfig{} // 未启用时忽略其余字段，保持既有行为
-		return
-	}
+	// PoW 引擎字段无条件归一（难度档位 min<=max，默认 12/16，TTL 60s）。
+	// 引擎实例始终创建：无感验证（silent 档）内部复用轻量 PoW 签发/校验，
+	// 不依赖 Pow.Enabled；Pow.Enabled 只控制"整页 PoW 档"（challenge_by_risk
+	// 显式配 "pow"）是否可用，未启用时该档回退点选验证码。
 	if c.Pow.DifficultyMin <= 0 {
 		c.Pow.DifficultyMin = 12
 	}
@@ -350,6 +384,19 @@ func (c *CCDefenseConfig) Normalize() {
 	if c.Pow.DifficultyMax > 24 {
 		c.Pow.DifficultyMax = 24 // 上限 24bit（约 1600 万次，远超正常交互成本）
 	}
+	// 无感验证难度独立归一（默认 6bit，<10ms 无感知）
+	if c.Pow.SilentDifficulty <= 0 {
+		c.Pow.SilentDifficulty = 6
+	}
+	if c.Pow.SilentDifficulty > 24 {
+		c.Pow.SilentDifficulty = 24
+	}
+	// 三档挑战矩阵：空值补默认 {low=silent, mid=captcha, high=slider}；非法值回退档位默认。
+	// 注意默认矩阵与 F6 语义不同：F6 在 pow.enabled 时中/高默认 PoW；
+	// F7 起请用 challenge_by_risk.mid/high="pow" 显式配置，README「升级注意」有说明。
+	c.ChallengeByRisk.Low = normalizeChallengeKind(c.ChallengeByRisk.Low, "silent")
+	c.ChallengeByRisk.Mid = normalizeChallengeKind(c.ChallengeByRisk.Mid, "captcha")
+	c.ChallengeByRisk.High = normalizeChallengeKind(c.ChallengeByRisk.High, "slider")
 }
 
 type WAFRulesConfig struct {

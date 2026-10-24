@@ -19,6 +19,12 @@ var (
 	PoWChallenged    Counter // PoW 计算挑战（弹挑战页次数，v1.2.0 F6）
 	PoWPassed        Counter // PoW 挑战通过次数
 	PoWFailed        Counter // PoW 挑战失败次数
+	SilentChallenged Counter // 无感验证下发次数（v1.2.0 F7）
+	SilentPassed     Counter // 无感验证通过次数
+	SilentFailed     Counter // 无感验证失败次数
+	SliderChallenged Counter // 滑动验证下发次数（v1.2.0 F7）
+	SliderPassed     Counter // 滑动验证通过次数
+	SliderFailed     Counter // 滑动验证失败次数
 	RateLimitBlocked Counter // 频率限制(429)
 	ConnLimitDropped Counter // L4 连接限制丢弃
 	IPCheckBlocked   Counter // IP 归属拦截（国外/云厂商）
@@ -38,6 +44,12 @@ func Snapshot() map[string]int64 {
 		"pow_challenged":     PoWChallenged.Value(),
 		"pow_passed":         PoWPassed.Value(),
 		"pow_failed":         PoWFailed.Value(),
+		"silent_challenged":  SilentChallenged.Value(),
+		"silent_passed":      SilentPassed.Value(),
+		"silent_failed":      SilentFailed.Value(),
+		"slider_challenged":  SliderChallenged.Value(),
+		"slider_passed":      SliderPassed.Value(),
+		"slider_failed":      SliderFailed.Value(),
 		"rate_limit_blocked": RateLimitBlocked.Value(),
 		"conn_limit_dropped": ConnLimitDropped.Value(),
 		"ip_check_blocked":   IPCheckBlocked.Value(),

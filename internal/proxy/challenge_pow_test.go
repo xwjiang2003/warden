@@ -19,9 +19,10 @@ import (
 )
 
 // powTestConfig 返回启用 PoW 的 CCDefense 配置（低难度便于测试）。
+// 显式指定中档用 pow（F7 起默认矩阵 mid=captcha，PoW 需显式启用）。
 func powTestConfig() config.CCDefenseConfig {
 	c := config.CCDefenseConfig{
-		Enabled:           true,
+		Enabled:            true,
 		ChallengeCookieKey: "test-cc-secret",
 		Pow: config.PoWConfig{
 			Enabled:       true,
@@ -29,6 +30,7 @@ func powTestConfig() config.CCDefenseConfig {
 			DifficultyMax: 14,
 			TTLSec:        60,
 		},
+		ChallengeByRisk: config.ChallengeByRiskConfig{Mid: "pow"},
 	}
 	c.Normalize()
 	return c
@@ -290,19 +292,23 @@ func TestPoWFlowHTTP(t *testing.T) {
 	}
 }
 
-// TestPoWDisabledFallsBackCaptcha PoW 未启用时 serveChallenge 回退验证码页。
+// TestPoWDisabledFallsBackCaptcha 档位映射 pow 但引擎未启用时 serveChallenge 回退点选验证码。
 func TestPoWDisabledFallsBackCaptcha(t *testing.T) {
-	cfg := config.CCDefenseConfig{Enabled: true, ChallengeCookieKey: "k"}
+	cfg := config.CCDefenseConfig{
+		Enabled:            true,
+		ChallengeCookieKey: "k",
+		Pow:                config.PoWConfig{Enabled: false},
+		ChallengeByRisk:    config.ChallengeByRiskConfig{Mid: "pow"}, // 显式映射 pow
+	}
 	cfg.Normalize() // Pow 默认关闭
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	h := NewCCDefense(cfg, config.IPCheckConfig{}, nil, next, nil)
-	if h.pow != nil {
-		t.Fatal("Pow 未启用时 pow 应为 nil")
+	if h.pow == nil || h.pow.Enabled() {
+		t.Fatal("Pow 未启用时引擎应存在但不可用")
 	}
 	rec := httptest.NewRecorder()
-	h.serveChallenge(rec, httptest.NewRequest(http.MethodGet, "/", nil), "1.2.3.4", ChallengeHigh)
-	// 回退验证码页（页面包含验证码 id 输入域或 img）
-	if !strings.Contains(rec.Body.String(), "<img") && !strings.Contains(rec.Body.String(), "id=") {
-		t.Fatalf("应回退验证码页面，实际: %s", rec.Body.String()[:200])
+	h.serveChallenge(rec, httptest.NewRequest(http.MethodGet, "/", nil), "1.2.3.4", ChallengeMid)
+	if !strings.Contains(rec.Body.String(), "依次点击数字") {
+		t.Fatalf("应回退点选验证码页面，实际: %s", rec.Body.String()[:200])
 	}
 }

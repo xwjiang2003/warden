@@ -8,6 +8,27 @@
 
 ### 新增
 
+- **无感验证 + 滑动验证码（三档挑战矩阵，v1.2.0 F7）**：`cc_defense.challenge_by_risk`
+  配置把低/中/高风险档映射到验证方式，默认 **低 → silent 无感 / 中 → captcha 点选 /
+  高 → slider 滑动**，三档通过后统一走可信会话链路（清违规、解拉黑、签发 24h 会话）。
+  - **无感验证（silent）**：透明挑战页，内嵌 JS 在用户无感知下完成轻量 PoW
+    （默认 6bit，<10ms）+ 浏览器指纹采集（UA 一致性 / canvas / 语言 / 触屏），
+    通过即签发可信会话；主要拦截无 JS 客户端（curl/requests 类纯脚本），
+    生成成本趋近于零（实测单次下发 ~6µs）。
+  - **滑动拼图（slider）**：自研极简滑动验证，不接任何第三方服务——服务端用
+    标准库生成 320×120 渐变噪点背景与 42×42 拼图块（索引色 PNG，复用点选验证码
+    的量化优化，实测生成 ~0.7ms、完整下发 ~0.9ms），缺口位置 HMAC 签名绑定
+    sid/IP；校验：偏移容差 ≤4px + 拖动时长 ≥300ms + 轨迹点数 ≥6 + 一次性 + TTL 60s
+    （防重放、防直连 POST）。生成走 `captcha_gen_max_per_sec` 产能限流。
+  - **矩阵可配**：任一档可显式设 `pow`（整页 PoW 挑战，需 `pow.enabled`；
+    未启用时该档回退点选）。升级路径可追溯：挑战事件统一记录为
+    `CC挑战/silent|captcha|slider|pow`（`attacklog` + 新增
+    `silent_*` / `slider_*` 指标），触发原因（bot-like / flooding / per-IP 限速 /
+    未信任桶耗尽）保留在事件 Detail 前置判断中。
+  - **行为变更**：低风险档（单 IP 限速、未信任桶耗尽）默认由点选验证码改为
+    **无感验证**；高风险档默认由点选改为**滑动拼图**。v1.1.0 用户如需保持原
+    PoW 语义，请显式配置 `challenge_by_risk`（见 README）。
+
 - **JS 计算挑战 Proof-of-Work（v1.2.0 F6）**：`cc_defense.pow` 配置块（默认关闭）。
   开启后，中/高风险档的验证码挑战改为客户端 SHA-256 前缀碰撞——
   - **无状态签发**：挑战参数（nonce/difficulty/expires）由 `challenge_cookie_key`

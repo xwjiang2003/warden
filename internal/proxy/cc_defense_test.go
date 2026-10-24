@@ -214,10 +214,10 @@ func TestUntrustedOverflowServesCaptcha(t *testing.T) {
 		t.Fatalf("溢出请求不应转发到后端, backendHits=%d", backendHits)
 	}
 
-	// 事件应记录为 CC挑战/captcha（而非 CC限速/untrusted）
+	// 事件应记录为 CC挑战/低档方式（默认矩阵 low=silent，而非 CC限速/untrusted）
 	logs := attacklog.List(1)
-	if len(logs) == 0 || logs[0].Category != "CC挑战" || logs[0].Detail != "captcha" {
-		t.Fatalf("应记录 CC挑战/captcha, 实际 %+v", logs)
+	if len(logs) == 0 || logs[0].Category != "CC挑战" || logs[0].Detail != "silent" {
+		t.Fatalf("应记录 CC挑战/silent, 实际 %+v", logs)
 	}
 }
 

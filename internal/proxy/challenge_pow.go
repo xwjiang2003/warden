@@ -64,6 +64,31 @@ func (p *PoWChallenge) difficultyFor(level ChallengeLevel) int {
 	}
 }
 
+// silentDifficulty 无感验证档难度（独立低难度，浏览器 <10ms 无感知）。
+func (p *PoWChallenge) silentDifficulty() int {
+	d := p.difficultyFor(ChallengeLow) / 2
+	if d < 4 {
+		d = 4
+	}
+	if d > 16 {
+		d = 16
+	}
+	return d
+}
+
+// issueWithDifficulty 按指定难度签发挑战参数（silent 档专用）。
+func (p *PoWChallenge) issueWithDifficulty(ip string, difficulty int) (nonce string, diff int64, expires int64, sig string) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		copy(buf, []byte(fmt.Sprintf("%d-%d", time.Now().UnixNano(), randInt())))
+	}
+	nonce = hex.EncodeToString(buf)
+	diff = int64(difficulty)
+	expires = time.Now().Add(p.ttl).Unix()
+	sig = p.sign(nonce, diff, expires, ip)
+	return
+}
+
 // issue 签发挑战参数。返回 nonce（hex）、difficulty（前缀零 bit）、
 // expires（Unix 秒）与签名。所有字段直接嵌入 HTML/表单，无服务端状态。
 func (p *PoWChallenge) issue(ip string, level ChallengeLevel) (nonce string, difficulty int64, expires int64, sig string) {

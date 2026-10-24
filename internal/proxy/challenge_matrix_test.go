@@ -1,6 +1,11 @@
 package proxy
 
 import (
+	"bytes"
+	"image"
+	"image/color"
+	"image/png"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -280,6 +285,86 @@ func BenchmarkRenderSliderPieces(b *testing.B) {
 		bg, block := renderSliderPieces(100+i%50, 40)
 		if bg == "" || block == "" {
 			b.Fatal("渲染失败")
+		}
+	}
+}
+
+// TestStoredPNGDecodeParity 手动 stored-PNG 编码器与标准库解码一致性：
+// 输出的 PNG 必须能被 image/png.Decode 正常解码，且像素与编码前逐点一致。
+// 防止自定义 IDAT 构造破坏浏览器兼容性（滑动挑战页依赖 data: URL 解码）。
+func TestStoredPNGDecodeParity(t *testing.T) {
+	rng := rand.New(rand.NewSource(7))
+	// 真彩不透明（RGBA colortype 6，alpha=255 直写路径，等价挑战页真实输出）
+	rgba := image.NewRGBA(image.Rect(0, 0, 320, 120))
+	for i := 0; i < len(rgba.Pix); i += 4 {
+		rgba.Pix[i] = uint8(rng.Intn(256))
+		rgba.Pix[i+1] = uint8(rng.Intn(256))
+		rgba.Pix[i+2] = uint8(rng.Intn(256))
+		rgba.Pix[i+3] = 255
+	}
+	assertPNGParity(t, rgba)
+
+	// 真彩半透明：writePNG 输出须与标准库 png.Encode 解码结果逐点一致
+	// （PNG colortype 6 存非预乘，预乘↔非预乘转换由编码器负责，一致性对比最可靠）
+	half := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	for i := 0; i < len(half.Pix); i += 4 {
+		half.Pix[i], half.Pix[i+1], half.Pix[i+2], half.Pix[i+3] = 50, 50, 50, 128
+	}
+	var mine bytes.Buffer
+	writePNG(&mine, half)
+	var ref bytes.Buffer
+	_ = png.Encode(&ref, half)
+	decMine, err := png.Decode(bytes.NewReader(mine.Bytes()))
+	if err != nil {
+		t.Fatalf("半透明 stored-PNG 解码失败: %v", err)
+	}
+	decRef, err := png.Decode(bytes.NewReader(ref.Bytes()))
+	if err != nil {
+		t.Fatalf("标准库半透明 PNG 解码失败: %v", err)
+	}
+	for y := 0; y < 8; y++ {
+		for x := 0; x < 8; x++ {
+			ar, ag, ab, aa := decMine.At(x, y).RGBA()
+			br, bg, bb, ba := decRef.At(x, y).RGBA()
+			if ar != br || ag != bg || ab != bb || aa != ba {
+				t.Fatalf("半透明像素不一致 @(%d,%d): mine=(%d,%d,%d,%d) ref=(%d,%d,%d,%d)",
+					x, y, ar>>8, ag>>8, ab>>8, aa>>8, br>>8, bg>>8, bb>>8, ba>>8)
+			}
+		}
+	}
+
+	// 索引色（Paletted colortype 3 路径）：模拟 quantizeCaptcha 输出
+	pal := make(color.Palette, 256)
+	for i := range pal {
+		pal[i] = color.RGBA{R: uint8(i), G: uint8(i & 0xF0), B: uint8(i * 2), A: 255}
+	}
+	ptd := image.NewPaletted(image.Rect(0, 0, 42, 42), pal)
+	for i := range ptd.Pix {
+		ptd.Pix[i] = uint8(i % 256)
+	}
+	assertPNGParity(t, ptd)
+}
+
+func assertPNGParity(t *testing.T, img image.Image) {
+	t.Helper()
+	var buf bytes.Buffer
+	writePNG(&buf, img)
+	dec, err := png.Decode(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("stored-PNG 无法被标准库解码: %v", err)
+	}
+	want := img.Bounds()
+	if dec.Bounds() != want {
+		t.Fatalf("尺寸不一致: got %v want %v", dec.Bounds(), want)
+	}
+	for y := want.Min.Y; y < want.Max.Y; y++ {
+		for x := want.Min.X; x < want.Max.X; x++ {
+			er, eg, eb, ea := img.At(x, y).RGBA()
+			gr, gg, gb, ga := dec.At(x, y).RGBA()
+			if er != gr || eg != gg || eb != gb || ea != ga {
+				t.Fatalf("像素不一致 @(%d,%d): src=(%d,%d,%d,%d) dec=(%d,%d,%d,%d)",
+					x, y, er>>8, eg>>8, eb>>8, ea>>8, gr>>8, gg>>8, gb>>8, ga>>8)
+			}
 		}
 	}
 }

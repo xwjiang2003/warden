@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/base64"
 	"image"
 	"image/color"
 	"image/png"
@@ -280,6 +281,29 @@ func TestSliderFlowHTTP(t *testing.T) {
 
 // BenchmarkRenderSliderPieces 滑动拼图两张小 PNG 的生成成本。
 // 参考量级：本机约 1-3ms/次；服务端产能由 captcha_gen_max_per_sec 限流。
+// TestEncodePNGIsBase64 回归：encodePNG 输出必须能被 base64 解码且解码后是
+// 合法 PNG（sliderHTML 以 data:image/png;base64, 内联）。曾因 writePNG 直接
+// 返回原始字节导致拼图/背景在浏览器与自动化解析中全部损坏。
+func TestEncodePNGIsBase64(t *testing.T) {
+	bg, block := renderSliderPieces(120, 40)
+	for name, s := range map[string]string{"bg": bg, "block": block} {
+		raw, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			t.Fatalf("%s 不是合法 base64: %v", name, err)
+		}
+		if len(raw) < 8 || string(raw[:8]) != "\x89PNG\r\n\x1a\n" {
+			t.Fatalf("%s base64 解码后不是 PNG 签名: %x", name, raw[:min(8, len(raw))])
+		}
+		img, err := png.Decode(bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("%s 解码为 PNG 失败: %v", name, err)
+		}
+		if img.Bounds().Dx() == 0 {
+			t.Fatalf("%s PNG 尺寸异常", name)
+		}
+	}
+}
+
 func BenchmarkRenderSliderPieces(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		bg, block := renderSliderPieces(100+i%50, 40)

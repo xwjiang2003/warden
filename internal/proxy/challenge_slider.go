@@ -278,7 +278,9 @@ func encodePNG(img image.Image) string {
 	bp := pngBufPool.Get().(*[]byte)
 	buf := bytes.NewBuffer((*bp)[:0])
 	writePNG(buf, img)
-	out := buf.String()
+	// writePNG 输出原始 PNG 字节，而调用方（sliderHTML）要求 base64 内联
+	// data URI。必须在此编码，否则浏览器与自动化解析都无法读取拼图/背景。
+	out := base64.StdEncoding.EncodeToString(buf.Bytes())
 	*bp = buf.Bytes()[:0]
 	pngBufPool.Put(bp)
 	return out

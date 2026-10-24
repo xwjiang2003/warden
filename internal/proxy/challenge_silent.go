@@ -37,6 +37,9 @@ func (h *CCDefenseHandler) serveSilent(w http.ResponseWriter, r *http.Request, i
 		h.serveCaptcha(w, r, ip)
 		return
 	}
+	// 必须先签发 sid cookie：grantTrust 以 sid 为键签发可信会话，
+	// 无 cookie 时验证通过后 follow 仍走慢速路径被再次挑战（真实缺陷，见 F7 验收 [2]）。
+	getOrSetSessionID(w, r)
 	nonce, difficulty, expires, sig := h.pow.issueWithDifficulty(ip, h.pow.silentDifficulty())
 	metrics.SilentChallenged.Inc()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

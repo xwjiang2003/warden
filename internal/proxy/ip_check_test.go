@@ -27,7 +27,7 @@ func TestIsNonPublicIP(t *testing.T) {
 	}
 	for _, c := range cases {
 		ip := net.ParseIP(c.ip)
-		if ip == nil {
+		if ip == nil {  
 			t.Fatalf("bad test ip: %s", c.ip)
 		}
 		if got := isNonPublicIP(ip); got != c.exp {

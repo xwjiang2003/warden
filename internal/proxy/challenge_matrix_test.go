@@ -120,12 +120,27 @@ func TestSilentFlowHTTP(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "__cc_silent_verify") {
 		t.Fatalf("silent 页异常: %d %s", rec.Code, rec.Body.String()[:160])
 	}
+	// serveSilent 必须下发 sid cookie：否则验证通过后 follow 无可信会话，
+	// 会重新落入慢速路径被再次挑战（F7 服务器验收 [2] 暴露的真实缺陷）。
+	if !strings.Contains(rec.Header().Get("Set-Cookie"), ccSessionCookieName) {
+		t.Fatalf("silent 页应设置 sid cookie，实际 Set-Cookie=%q", rec.Header().Get("Set-Cookie"))
+	}
 	vr, _ := silentSubmit(h, rec.Body.String(), nil)
 	if vr.Code != http.StatusSeeOther || vr.Header().Get("Location") != "/p" {
 		t.Fatalf("正常指纹应 302 回 /p，实际 %d %q", vr.Code, vr.Header().Get("Location"))
 	}
 	if _, ok := h.trustedSessions.Load("sess-silent"); !ok {
 		t.Fatal("通过后应签发可信会话")
+	}
+	// follow：同 cookie 请求被保护路径 → 可信会话快速放行（不透出挑战/限速）
+	fr := httptest.NewRecorder()
+	freq := httptest.NewRequest(http.MethodGet, "/p", nil)
+	freq.Header.Set("User-Agent", "test-browser/1.0")
+	freq.RemoteAddr = "1.2.3.4:1234"
+	freq.AddCookie(&http.Cookie{Name: ccSessionCookieName, Value: "sess-silent"})
+	h.ServeHTTP(fr, freq)
+	if fr.Code != http.StatusOK {
+		t.Fatalf("silent 通过后 follow 应放行 200，实际 %d", fr.Code)
 	}
 }
 

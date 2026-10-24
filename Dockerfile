@@ -22,9 +22,9 @@ ARG VERSION=dev
 WORKDIR /src
 
 # 依赖层：go.mod / go.sum 不变时命中缓存，避免每次全量下载
+# 使用普通 RUN 而非 --mount=type=cache（兼容非 BuildKit 构建器）
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download
+RUN go mod download
 
 COPY . .
 

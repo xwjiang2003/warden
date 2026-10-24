@@ -143,3 +143,28 @@ Stop-Process -Id $p.Id -Force; Remove-Item -Recurse -Force $t
 
 **说明**：Windows 本地模拟验证不了 Linux 镜像的「非 root 运行、alpine 层、healthcheck 周期、
 多架构构建」——这些必须在服务器上按第 1–4 节执行。
+
+## 7. 服务器真实验收记录（2026-10-24，devtools.help）
+
+环境与产物（与生产 nginx 80/443 完全隔离，全程未触碰生产链路）：
+
+| 项 | 结果 |
+|---|---|
+| 系统 | Ubuntu resolute（25.04 amd64）；Docker 由 `apt install docker.io docker-compose-v2` 安装（**Ubuntu 仓库包名为 docker-compose-v2**，非官方源的 docker-compose-plugin） |
+| 引擎 | Docker 29.1.3 + Compose 2.40.3 |
+| 构建 | `docker build --build-arg VERSION=1.1.0` 成功；镜像 `warden:1.1.0` 56MB；运行用户 uid=100(warden) |
+| 启动 | compose up 后 `healthy`；`/healthz` 返回 `ok`；访问日志按日轮转 `access.log.YYYY-MM-DD` |
+| 转发 | 容器经网关 `172.17.0.1` 到达测试后端，正常 200/404（非 502） |
+| XFF 伪造 | 带 `X-Forwarded-For: 1.2.3.4` 请求，访问日志记录直连对端 `172.18.0.1`，伪造头被忽略（`trust_local_proxy=false` 生效） |
+| WAF | 脚本 UA 静默丢弃（910004）；SQLi `union select` → 403（920001）；XSS `<script>` → 403（920002） |
+| 管理后台 | 9090 映射后返回 200 |
+| 卷持久化 | down → up 后 `data/warden.db`、轮转日志完整保留；ip2region.xdb 随镜像复制 |
+
+**验收期间观察到的行为（记录待跟进，不影响 F1 判定）**：
+
+1. `scanner_paths`（910002）对浏览器 UA 的 `/.env` 请求未拦截（请求被转发）——仅 curl 默认 UA 场景被 910004 拦下；
+2. URL 编码的路径穿越载荷（`..%2f..%2fetc%2fpasswd`）未触发 920004（920004 正则按解码后明文 `../` 匹配，编码串未命中）——疑似 ARGS 传入 coraza 前未 URL 解码；
+3. coraza `drop` 动作对外表现为返回 200 空响应（静默丢弃伪装，属 warden 既有设计）。
+
+**遗留**：镜像 `warden:1.1.0` 保留在服务器供后续使用；测试容器/卷/后端已全部删除；生产站点
+https=200 / http=301 确认不受影响。

@@ -8,7 +8,13 @@
 
 ### 新增
 
-- **Windows 防火墙拉黑性能治理（v1.2.1）**：`firewall_block` 在 Windows 服务器实测有两个性能问题：
+- 规划中（v1.3.0：Linux iptables 防火墙集成 / 规则批量聚合后续优化等）。
+
+## [1.2.0] - 2026-10-25
+
+### 新增
+
+- **Windows 防火墙拉黑性能治理**：`firewall_block` 在 Windows 服务器实测有两个性能问题：
   ① 原 `block()` 在锁内同步执行 `netsh` 子进程，大批量拉黑时全局请求路径被持锁排队拖垮；
   ② 逐 IP 新增规则导致防火墙规则量无限膨胀（攻击积累上万条 `warden-block-*`），Windows 防火墙
   引擎对每个数据包遍历规则匹配，规则量很大时严重拖垮整体系统性能。修复：
@@ -331,6 +337,7 @@
 
 1.0.2 之前的版本，变更未逐条记录。
 
+[1.2.0]: https://github.com/xwjiang2003/warden/compare/v1.0.4...v1.2.0
 [1.0.4]: https://github.com/xwjiang2003/warden/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/xwjiang2003/warden/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/xwjiang2003/warden/compare/v1.0.1...v1.0.2

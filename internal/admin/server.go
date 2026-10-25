@@ -21,6 +21,7 @@ import (
 	"warden/internal/alert"
 	"warden/internal/attacklog"
 	"warden/internal/config"
+	"warden/internal/greyliststore"
 	"warden/internal/metrics"
 	"warden/internal/restart"
 	"warden/internal/store"
@@ -39,6 +40,7 @@ type Server struct {
 	startTime     time.Time
 	mux           *http.ServeMux
 	trustStore    *truststore.Store
+	greyStore     *greyliststore.Store
 	restartNeeded atomic.Bool // 保存配置后置位，重启进程后清零
 	// 规则在线管理（F3）：注入后 GET/PUT /api/rules 可用
 	ruleDBPath string
@@ -70,6 +72,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/attack_logs", s.handleAttackLogs)
 	s.mux.HandleFunc("POST /api/attack_logs/clear", s.handleAttackLogsClear)
 	s.mux.HandleFunc("GET /api/trusted_ips", s.handleTrustedIPs)
+	s.mux.HandleFunc("GET /api/grey_ips", s.handleGreyIPs)
 	s.mux.HandleFunc("GET /api/metrics", s.handleMetrics)
 	s.mux.HandleFunc("POST /api/restart", s.handleRestart)
 	s.mux.HandleFunc("POST /api/alert/test", s.handleAlertTest)
@@ -309,6 +312,11 @@ func (s *Server) SetTrustStore(store *truststore.Store) {
 	s.trustStore = store
 }
 
+// SetGreyStore 注入灰名单持久化存储（F8，用于分页查询）。
+func (s *Server) SetGreyStore(store *greyliststore.Store) {
+	s.greyStore = store
+}
+
 // SetRuleRepo 注入规则仓库（F3 规则在线管理）：dbPath 为 SQLite 路径、
 // wr 指向进程内生效的 WAFRules 配置、holder 为热更新引擎容器。
 // main.go 启动时注入；未注入时 /api/rules 返回 503。
@@ -425,6 +433,33 @@ func (s *Server) handleTrustedIPs(w http.ResponseWriter, r *http.Request) {
 	}
 	offset := (page - 1) * pageSize
 	list, total := s.trustStore.List(offset, pageSize)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"list": list, "total": total, "page": page, "page_size": pageSize,
+	})
+}
+
+// handleGreyIPs 返回灰名单分页列表（F8 挑战失败递进）。
+func (s *Server) handleGreyIPs(w http.ResponseWriter, r *http.Request) {
+	page := 1
+	pageSize := 20
+	if v := r.URL.Query().Get("page"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			page = n
+		}
+	}
+	if v := r.URL.Query().Get("page_size"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 {
+			pageSize = n
+		}
+	}
+	if s.greyStore == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"list": []greyliststore.Entry{}, "total": 0, "page": page, "page_size": pageSize,
+		})
+		return
+	}
+	offset := (page - 1) * pageSize
+	list, total := s.greyStore.List(offset, pageSize)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"list": list, "total": total, "page": page, "page_size": pageSize,
 	})

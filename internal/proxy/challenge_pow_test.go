@@ -216,7 +216,7 @@ func TestPoWFlowHTTP(t *testing.T) {
 		_, _ = w.Write([]byte("backend"))
 	})
 	cfg := powTestConfig()
-	h := NewCCDefense(cfg, config.IPCheckConfig{}, nil, next, nil)
+	h := NewCCDefense(cfg, config.IPCheckConfig{}, nil, next, nil, nil)
 
 	// 1) 触发中风险挑战
 	rec := httptest.NewRecorder()
@@ -302,7 +302,7 @@ func TestPoWDisabledFallsBackCaptcha(t *testing.T) {
 	}
 	cfg.Normalize() // Pow 默认关闭
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
-	h := NewCCDefense(cfg, config.IPCheckConfig{}, nil, next, nil)
+	h := NewCCDefense(cfg, config.IPCheckConfig{}, nil, next, nil, nil)
 	if h.pow == nil || h.pow.Enabled() {
 		t.Fatal("Pow 未启用时引擎应存在但不可用")
 	}

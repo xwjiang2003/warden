@@ -190,7 +190,7 @@ func TestUntrustedOverflowServesCaptcha(t *testing.T) {
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			atomic.AddInt32(&backendHits, 1)
 			w.Write([]byte("OK"))
-		}), nil)
+		}), nil, nil)
 
 	do := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, "http://www.zzfls.com.cn/pub/newsList/110", nil)
@@ -238,7 +238,7 @@ func TestUntrustedOverflowSearchBotKeepsRateLimit(t *testing.T) {
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			atomic.AddInt32(&backendHits, 1)
 			w.Write([]byte("OK"))
-		}), nil)
+		}), nil, nil)
 
 	newReq := func() *http.Request {
 		req := httptest.NewRequest(http.MethodGet, "http://www.zzfls.com.cn/pub/newsList/110", nil)
@@ -292,7 +292,7 @@ func TestFloodDoesNotPromoteTrust(t *testing.T) {
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			atomic.AddInt32(&hits, 1)
 			w.Write([]byte("OK"))
-		}), nil)
+		}), nil, nil)
 
 	const ip = "203.0.113.77"
 	do := func(path string) *httptest.ResponseRecorder {
@@ -502,7 +502,7 @@ func TestTrustedIPStillBehaviorChecked(t *testing.T) {
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			atomic.AddInt32(&hits, 1)
 			w.Write([]byte("OK"))
-		}), nil)
+		}), nil, nil)
 
 	const ip = "203.0.113.88"
 	h.trust.setTrusted(ip) // 直接设为可信 IP
@@ -600,7 +600,7 @@ func TestUntrustedPerIPRateLimit(t *testing.T) {
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			atomic.AddInt32(&hits, 1)
 			w.Write([]byte("OK"))
-		}), nil)
+		}), nil, nil)
 
 	do := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, "http://www.zzfls.com.cn/pub/newsList/110", nil)

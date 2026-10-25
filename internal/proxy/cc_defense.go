@@ -10,6 +10,7 @@ import (
 	"time"
 	"warden/internal/attacklog"
 	"warden/internal/config"
+	"warden/internal/greyliststore"
 	"warden/internal/metrics"
 	"warden/internal/truststore"
 	"warden/internal/util"
@@ -774,6 +775,7 @@ type CCDefenseHandler struct {
 	chFails         sync.Map // ip -> challengeFail，挑战提交失败后的强制冷却窗口
 	pow             *PoWChallenge // JS 计算挑战（nil 或未启用时回退验证码）
 	slide           *slideStore // 滑动拼图验证（v1.2.0 F7）
+	grey            *greyList   // 挑战失败灰名单递进（v1.2.0 F8）
 	blockForeign    bool
 	blockCloud      bool
 	throttle        *logThrottler
@@ -792,9 +794,11 @@ type challengeFail struct {
 	level ChallengeLevel
 }
 
-// markChallengeFail 记录一次挑战提交失败（ip → 冷却到期时间 + 原档位）。
+// markChallengeFail 记录一次挑战提交失败（ip → 冷却到期时间 + 原档位），
+// 并同步进入灰名单递进计数（F8）。
 func (h *CCDefenseHandler) markChallengeFail(ip string, level ChallengeLevel) {
 	h.chFails.Store(ip, challengeFail{until: time.Now().Add(challengeFailCoolSec * time.Second), level: level})
+	h.grey.recordFail(ip, level)
 }
 
 // challengeFailCooling 返回该 IP 是否处于失败冷却期；过期条目惰性清理。
@@ -817,7 +821,7 @@ type offenderTrack struct {
 	lastSeen   int64
 }
 
-func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *FirewallBlocker, next http.Handler, trustStore *truststore.Store) *CCDefenseHandler {
+func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *FirewallBlocker, next http.Handler, trustStore *truststore.Store, greyStore *greyliststore.Store) *CCDefenseHandler {
 	cfg.Normalize()
 	h := &CCDefenseHandler{
 		dlimiter:     newDualRateLimiter(cfg.GlobalQPSMax, cfg.GlobalQPSBurst, cfg.NewIPQPSMax, cfg.NewIPQPSBurst),
@@ -830,6 +834,7 @@ func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *Fi
 		sessions:     newSessionTracker(),
 		ipChecker:    newIPRegionChecker(),
 		slide:        newSlideStore(cfg.CaptchaGenMaxPerSec),
+		grey:         newGreyList(cfg.Greylist, greyStore),
 		blockForeign: ipCfg.BlockForeignEnabled(),
 		blockCloud:   ipCfg.BlockCloudEnabled(),
 		throttle:     newLogThrottler(ccLogThrottleInterval),
@@ -840,11 +845,12 @@ func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *Fi
 	// 与 Pow.Enabled 解耦；Pow.Enabled 仅控制整页 PoW 档是否可用。
 	h.pow = newPoWChallenge(cfg.Pow, cfg.ChallengeCookieKey)
 	go h.trust.restore() // 异步恢复可信 IP，不阻塞启动
-	log.Printf("[cc_defense] enabled trusted_ips=%d/%ds ttl=%ds global_qps=%d burst=%d new_ip_qps=%d burst=%d per_ip_qps=%d burst=%d flood_ratio=%d%% captcha_gen=%d/s behavior_path=%dreqs/%dpaths pow=%v matrix=%s/%s/%s",
+	log.Printf("[cc_defense] enabled trusted_ips=%d/%ds ttl=%ds global_qps=%d burst=%d new_ip_qps=%d burst=%d per_ip_qps=%d burst=%d flood_ratio=%d%% captcha_gen=%d/s behavior_path=%dreqs/%dpaths pow=%v matrix=%s/%s/%s greylist=%v(%dqps/ttl=%ds/escalate=%d)",
 		cfg.TrustIPMinVisits, cfg.TrustIPWindowSec, cfg.TrustIPTTLSec, cfg.GlobalQPSMax, cfg.GlobalQPSBurst,
 		cfg.NewIPQPSMax, cfg.NewIPQPSBurst, cfg.UntrustedIPQPSMax, cfg.UntrustedIPBurst, cfg.NewIPRatioBlock,
 		cfg.CaptchaGenMaxPerSec, cfg.BehaviorPathReqsMin, cfg.BehaviorPathCountMax, cfg.Pow.Enabled,
-		cfg.ChallengeByRisk.Low, cfg.ChallengeByRisk.Mid, cfg.ChallengeByRisk.High)
+		cfg.ChallengeByRisk.Low, cfg.ChallengeByRisk.Mid, cfg.ChallengeByRisk.High,
+		cfg.Greylist.Enabled, cfg.Greylist.LimitQPS, cfg.Greylist.TTLSec, cfg.Greylist.EscalateAfterFailures)
 	go h.reaper()
 	return h
 }
@@ -915,6 +921,8 @@ func (h *CCDefenseHandler) reaper() {
 		h.captcha.sweep(now)
 		// 8) 滑动拼图：回收过期条目（TTL 60s）。
 		h.slide.sweep(now)
+		// 9) 灰名单持久化：清理已过期条目（内存态由 status 惰性降级/清除）。
+		h.grey.sweepExpired(now)
 	}
 }
 
@@ -1192,6 +1200,27 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if lvl, ok := h.challengeFailCooling(ip); ok {
 		attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "失败冷却")
 		h.serveChallenge(w, r, ip, lvl)
+		return
+	}
+
+	// 灰名单递进（F8）：挑战失败累计进入的中间档。
+	// 顽固灰名单 → 必弹挑战；灰名单（限速档）→ 超限弹挑战，未超限直接放行
+	// （不参与可信晋升，只有挑战通过 grantTrust 才解除）。
+	if st, glvl := h.grey.status(ip); st != greyNone {
+		if st == greyHard {
+			attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "顽固灰名单")
+			h.serveChallenge(w, r, ip, glvl)
+			return
+		}
+		if !h.grey.allow(ip) {
+			if h.throttle.allow("grey:" + ip) {
+				log.Printf("[cc_defense] greylist ip=%s rate limited, serving challenge", ip)
+			}
+			attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "灰名单限速")
+			h.serveChallenge(w, r, ip, glvl)
+			return
+		}
+		h.next.ServeHTTP(w, r)
 		return
 	}
 

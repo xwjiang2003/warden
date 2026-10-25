@@ -43,7 +43,7 @@ func TestCaptchaGenLimitDerivationChain(t *testing.T) {
 
 			// 与 main.go 完全一致的装配方式
 			h := NewCCDefense(cfg.CCDefense, config.IPCheckConfig{}, nil,
-				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), nil)
+				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), nil, nil)
 
 			if got := h.captcha.genMaxPerSec; got != c.wantCaptchaGenMax {
 				t.Fatalf("生效的验证码产能 = %d, want %d（newIP=%d global=%d 显式=%d）",

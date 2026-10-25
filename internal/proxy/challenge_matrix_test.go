@@ -46,7 +46,7 @@ func TestChallengeByRiskCustomAndFallback(t *testing.T) {
 // TestServeChallengeMatrixKinds 三档触发 → 对应页面类型。
 func TestServeChallengeMatrixKinds(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
-	h := NewCCDefense(config.CCDefenseConfig{Enabled: true, ChallengeCookieKey: "k"}, config.IPCheckConfig{}, nil, next, nil)
+	h := NewCCDefense(config.CCDefenseConfig{Enabled: true, ChallengeCookieKey: "k"}, config.IPCheckConfig{}, nil, next, nil, nil)
 
 	cases := []struct {
 		level    ChallengeLevel
@@ -80,7 +80,7 @@ func silentTestHandler(t *testing.T) *CCDefenseHandler {
 		Pow:                config.PoWConfig{Enabled: true, DifficultyMin: 10, DifficultyMax: 14, TTLSec: 60, SilentDifficulty: 6},
 	}
 	cfg.Normalize()
-	return NewCCDefense(cfg, config.IPCheckConfig{}, nil, next, nil)
+	return NewCCDefense(cfg, config.IPCheckConfig{}, nil, next, nil, nil)
 }
 
 // silentSubmit 构造合法（或按覆盖参数构造异常）的 silent 提交请求。
@@ -206,7 +206,7 @@ func sliderSubmit(h *CCDefenseHandler, page string, targetX int, mutate func(map
 func TestSliderFlowHTTP(t *testing.T) {
 	metrics.SliderPassed.Add(0)
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
-	h := NewCCDefense(config.CCDefenseConfig{Enabled: true, ChallengeCookieKey: "test-cc-secret"}, config.IPCheckConfig{}, nil, next, nil)
+	h := NewCCDefense(config.CCDefenseConfig{Enabled: true, ChallengeCookieKey: "test-cc-secret"}, config.IPCheckConfig{}, nil, next, nil, nil)
 
 	// 页面生成
 	pageRec := httptest.NewRecorder()
@@ -325,7 +325,7 @@ func TestEncodePNGIsBase64(t *testing.T) {
 func TestChallengeFailCoolingHTTP(t *testing.T) {
 	var nextHits int
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { nextHits++; w.WriteHeader(200) })
-	h := NewCCDefense(config.CCDefenseConfig{Enabled: true, ChallengeCookieKey: "test-cc-secret"}, config.IPCheckConfig{}, nil, next, nil)
+	h := NewCCDefense(config.CCDefenseConfig{Enabled: true, ChallengeCookieKey: "test-cc-secret"}, config.IPCheckConfig{}, nil, next, nil, nil)
 
 	// 1) slider 作弊提交 → 失败 + 冷却
 	pageRec := httptest.NewRecorder()
@@ -509,7 +509,7 @@ func assertPNGParity(t *testing.T, img image.Image) {
 // BenchmarkServeSlider 完整滑动挑战页下发（含 PNG 编码 + HTML 组装）。
 func BenchmarkServeSlider(b *testing.B) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
-	h := NewCCDefense(config.CCDefenseConfig{Enabled: true, ChallengeCookieKey: "bench-secret"}, config.IPCheckConfig{}, nil, next, nil)
+	h := NewCCDefense(config.CCDefenseConfig{Enabled: true, ChallengeCookieKey: "bench-secret"}, config.IPCheckConfig{}, nil, next, nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/p", nil)
 	req.RemoteAddr = "1.2.3.4:1234"
 	req.AddCookie(&http.Cookie{Name: ccSessionCookieName, Value: "bench-sid"})
@@ -532,7 +532,7 @@ func BenchmarkServeSilent(b *testing.B) {
 	}
 	cfg.Normalize()
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
-	h := NewCCDefense(cfg, config.IPCheckConfig{}, nil, next, nil)
+	h := NewCCDefense(cfg, config.IPCheckConfig{}, nil, next, nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/p", nil)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

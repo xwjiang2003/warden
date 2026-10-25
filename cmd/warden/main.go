@@ -29,6 +29,7 @@ import (
 	"warden/internal/proxy"
 	"warden/internal/router"
 	"warden/internal/store"
+	"warden/internal/greyliststore"
 	"warden/internal/truststore"
 	"warden/internal/util"
 	"warden/internal/waf"
@@ -136,6 +137,13 @@ func main() {
 	if trustStore != nil {
 		defer trustStore.Close()
 	}
+	greyStore, greyErr := greyliststore.Open(dbPath)
+	if greyErr != nil {
+		log.Printf("[greyliststore] 打开灰名单持久化失败(%v)，灰名单将不持久化", greyErr)
+	}
+	if greyStore != nil {
+		defer greyStore.Close()
+	}
 	fwBlocker := proxy.NewFirewallBlocker(cfg.FirewallBlock.Enabled && cfg.FirewallBlock.AutoBlock, cfg.FirewallBlock.ExpireMin, cfg.FirewallBlock.WhitelistCIDRs, fwStore)
 
 	inner := wafHolder.Handler() // 热更新入口：内部每次请求取当前引擎
@@ -146,8 +154,9 @@ func main() {
 		}
 	})
 	handler := rl.Middleware(inner)
-	ccDef = proxy.NewCCDefense(cfg.CCDefense, cfg.IPCheck, fwBlocker, handler, trustStore)
+	ccDef = proxy.NewCCDefense(cfg.CCDefense, cfg.IPCheck, fwBlocker, handler, trustStore, greyStore)
 	adminSrv.SetTrustStore(trustStore)
+	adminSrv.SetGreyStore(greyStore)
 	adminSrv.SetRuleRepo(dbPath, &cfg.WAFRules, wafHolder)
 	whitelist := proxy.NewIPWhitelist(cfg.IPWhitelist.CIDRs)
 	blocklist := proxy.NewIPWhitelist(cfg.IPBlacklist.CIDRs)

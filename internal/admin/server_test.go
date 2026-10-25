@@ -7,8 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"warden/internal/config"
+	"warden/internal/greyliststore"
 	"warden/internal/store"
 )
 
@@ -171,5 +173,49 @@ func TestPutConfigRejectsBadTrustedProxies(t *testing.T) {
 	}
 	if !reloaded.TrustLocalProxyEnabled() {
 		t.Fatal("trust_local_proxy 缺省应为 true")
+	}
+}
+
+// TestHandleGreyIPs 灰名单分页 API（F8）：未注入时返回空列表；注入后按 DB 数据分页。
+func TestHandleGreyIPs(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "warden.db")
+	cfg := &config.Config{Listen: ":81", Backend: "http://127.0.0.1:8002"}
+	s := NewServer(cfg, "config.json", dbPath, config.AdminConfig{})
+
+	// 1) 未注入 store：空列表而非 503/500
+	m := getJSON(t, s.handleGreyIPs, "/api/grey_ips")
+	if total, ok := m["total"].(float64); !ok || total != 0 {
+		t.Fatalf("未注入时 total 应为 0，实际 %v", m["total"])
+	}
+	if list, ok := m["list"].([]interface{}); !ok || len(list) != 0 {
+		t.Fatalf("未注入时 list 应为空，实际 %v", m["list"])
+	}
+
+	// 2) 注入 store 后：写入两条再查询
+	gstore, err := greyliststore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open greyliststore: %v", err)
+	}
+	defer gstore.Close()
+	now := time.Now()
+	gstore.Upsert("9.9.9.1", greyliststore.StateSoft, 1, now.Add(time.Minute), now, 1)
+	gstore.Upsert("9.9.9.2", greyliststore.StateHard, 2, now.Add(time.Hour), now, 2)
+	s.SetGreyStore(gstore)
+
+	m = getJSON(t, s.handleGreyIPs, "/api/grey_ips?page=1&page_size=20")
+	if total, ok := m["total"].(float64); !ok || total != 2 {
+		t.Fatalf("total 应为 2，实际 %v", m["total"])
+	}
+	list := m["list"].([]interface{})
+	if len(list) != 2 {
+		t.Fatalf("list 应为 2 条，实际 %d", len(list))
+	}
+	first := list[0].(map[string]interface{})
+	if first["ip"] != "9.9.9.2" {
+		t.Fatalf("按 until 倒序第一条应为 9.9.9.2，实际 %v", first["ip"])
+	}
+	if first["state"].(float64) != greyliststore.StateHard {
+		t.Fatalf("state 应为 2(hard)，实际 %v", first["state"])
 	}
 }

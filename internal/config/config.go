@@ -262,6 +262,22 @@ type CCDefenseConfig struct {
 	// 默认 {low:silent, mid:captcha, high:slider}；任一档配 "pow" 但
 	// Pow.Enabled=false 时回退 captcha。
 	ChallengeByRisk ChallengeByRiskConfig `json:"challenge_by_risk"`
+	// Greylist 挑战失败灰名单递进（v1.2.0 F8）：
+	// 挑战失败累计 escalate_after_failures 次 → 灰名单（限速档 grey_limit_qps）→
+	// 灰名单内再次失败 → 顽固灰名单（必弹挑战）→ 顽固内持续失败且满足违规双条件
+	// → 防火墙封禁。每级 TTL（grey_ttl_sec，顽固档为其 2 倍）到期自动降级恢复。
+	Greylist GreylistConfig `json:"greylist"`
+}
+
+// GreylistConfig 挑战失败灰名单递进配置（v1.2.0 F8）。
+type GreylistConfig struct {
+	Enabled bool `json:"enabled"`
+	// GreyLimitQPS 灰名单（限速档）每 IP 的请求速率上限。
+	LimitQPS int `json:"grey_limit_qps"`
+	// GreyTTLSec 灰名单档 TTL（秒）；顽固灰名单档为其 2 倍。
+	TTLSec int `json:"grey_ttl_sec"`
+	// EscalateAfterFailures 升级所需连续失败次数（各档位内独立计数）。
+	EscalateAfterFailures int `json:"escalate_after_failures"`
 }
 
 // ChallengeByRiskConfig 三档挑战矩阵配置（v1.2.0 F7）。
@@ -397,6 +413,16 @@ func (c *CCDefenseConfig) Normalize() {
 	c.ChallengeByRisk.Low = normalizeChallengeKind(c.ChallengeByRisk.Low, "silent")
 	c.ChallengeByRisk.Mid = normalizeChallengeKind(c.ChallengeByRisk.Mid, "captcha")
 	c.ChallengeByRisk.High = normalizeChallengeKind(c.ChallengeByRisk.High, "slider")
+	// 灰名单递进（F8）：默认关闭保持既有行为；其余字段给安全默认值。
+	if c.Greylist.LimitQPS <= 0 {
+		c.Greylist.LimitQPS = 5
+	}
+	if c.Greylist.TTLSec <= 0 {
+		c.Greylist.TTLSec = 3600
+	}
+	if c.Greylist.EscalateAfterFailures <= 0 {
+		c.Greylist.EscalateAfterFailures = 3
+	}
 }
 
 type WAFRulesConfig struct {

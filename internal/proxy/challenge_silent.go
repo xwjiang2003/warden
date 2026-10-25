@@ -110,13 +110,14 @@ func (h *CCDefenseHandler) handleSilentVerify(w http.ResponseWriter, r *http.Req
 	h.grantTrust(w, r, ip, sid, target, "silent")
 }
 
-// grantTrust 挑战通过的统一可信链路：清违规累计、解防火墙拉黑、签发可信会话并回跳。
+// grantTrust 挑战通过的统一可信链路：清违规累计、解防火墙拉黑、解灰名单、签发可信会话并回跳。
 func (h *CCDefenseHandler) grantTrust(w http.ResponseWriter, r *http.Request, ip, sid, target, via string) {
 	h.offenders.Delete(ip)
 	h.chFails.Delete(ip)
 	if h.fw != nil {
 		h.fw.unblock(ip)
 	}
+	h.grey.clear(ip) // F8：挑战通过即解除灰名单，避免限速档滞留
 	if sid != "" {
 		h.trustedSessions.Store(sid, time.Now())
 	} else {

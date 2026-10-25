@@ -42,9 +42,10 @@ type greyList struct {
 	ttl     time.Duration
 	hardTTL time.Duration
 	store   *greyliststore.Store
+	onHard  func(ip string) // 顽固档内达到升级阈值时上报（接 ReportOffender → 防火墙）
 }
 
-func newGreyList(cfg config.GreylistConfig, store *greyliststore.Store) *greyList {
+func newGreyList(cfg config.GreylistConfig, store *greyliststore.Store, onHard func(ip string)) *greyList {
 	if cfg.LimitQPS <= 0 {
 		cfg.LimitQPS = 5
 	}
@@ -61,6 +62,7 @@ func newGreyList(cfg config.GreylistConfig, store *greyliststore.Store) *greyLis
 		ttl:     time.Duration(cfg.TTLSec) * time.Second,
 		hardTTL: time.Duration(cfg.TTLSec) * 2 * time.Second, // 顽固档更久
 		store:   store,
+		onHard:  onHard,
 	}
 	if g.enabled && store != nil {
 		go g.restore()
@@ -127,10 +129,13 @@ func (g *greyList) recordFail(ip string, level ChallengeLevel) {
 			log.Printf("[greylist] ip=%s 灰名单内再次失败 %d 次 → 顽固灰名单(必弹挑战) ttl=%s", ip, fails, g.hardTTL)
 		}
 	case greyHard:
-		// 顽固档内持续失败：满足违规双条件时由 ReportOffender 升级防火墙封禁
+		// 顽固档内持续失败：达到升级阈值 → 上报违规，由 ReportOffender 判双条件决定是否防火墙封禁
 		if fails >= int(g.escalate) {
 			e.fails = 0
 			g.persist(e)
+			if g.onHard != nil {
+				g.onHard(ip)
+			}
 			log.Printf("[greylist] ip=%s 顽固灰名单内连续失败 %d 次 → 上报违规(双条件满足则防火墙封禁)", ip, fails)
 		}
 	}

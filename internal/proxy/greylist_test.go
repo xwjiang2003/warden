@@ -21,9 +21,11 @@ func testGreyCfg(enabled bool) config.GreylistConfig {
 	}
 }
 
-// TestGreyListEscalate 递进路径：无 → 灰名单(soft) → 顽固灰名单(hard)，各档内独立计数。
+// TestGreyListEscalate 递进路径：无 → 灰名单(soft) → 顽固灰名单(hard)，各档内独立计数；
+// 顽固档内达到阈值 → 上报违规（onHard 回调触发，由 ReportOffender 判双条件）。
 func TestGreyListEscalate(t *testing.T) {
-	g := newGreyList(testGreyCfg(true), nil)
+	var reported int32
+	g := newGreyList(testGreyCfg(true), nil, func(ip string) { atomic.AddInt32(&reported, 1) })
 	ip := "9.9.9.1"
 
 	if st, _ := g.status(ip); st != greyNone {
@@ -39,23 +41,38 @@ func TestGreyListEscalate(t *testing.T) {
 	if st, _ := g.status(ip); st != greySoft {
 		t.Fatalf("2 次失败后状态 = %v, want greySoft", st)
 	}
+	if atomic.LoadInt32(&reported) != 0 {
+		t.Fatalf("soft 档不应上报违规")
+	}
 	// soft 内再 2 次失败：升级顽固
 	g.recordFail(ip, ChallengeLow)
 	g.recordFail(ip, ChallengeMid)
 	if st, lvl := g.status(ip); st != greyHard || lvl != ChallengeMid {
 		t.Fatalf("soft 内 2 次失败后 = (%v,%v), want (greyHard,ChallengeMid)", st, lvl)
 	}
-	// hard 内持续失败：不上报（fw 由 ReportOffender 管），仍保持 hard
+	if atomic.LoadInt32(&reported) != 0 {
+		t.Fatalf("升级顽固档本身不应上报违规")
+	}
+	// hard 内持续失败：达到 escalate 阈值 → 上报违规（每轮重置计数）
 	g.recordFail(ip, ChallengeHigh)
 	g.recordFail(ip, ChallengeHigh)
 	if st, lvl := g.status(ip); st != greyHard || lvl != ChallengeHigh {
 		t.Fatalf("hard 内失败后 = (%v,%v), want (greyHard,ChallengeHigh)", st, lvl)
 	}
+	if atomic.LoadInt32(&reported) != 1 {
+		t.Fatalf("hard 内 2 次失败应上报 1 次, got %d", atomic.LoadInt32(&reported))
+	}
+	// 再失败 2 次 → 再上报（持续违规会被持续上报，由 ReportOffender 持续性判定）
+	g.recordFail(ip, ChallengeHigh)
+	g.recordFail(ip, ChallengeHigh)
+	if atomic.LoadInt32(&reported) != 2 {
+		t.Fatalf("持续 hard 失败应继续上报, got %d", atomic.LoadInt32(&reported))
+	}
 }
 
 // TestGreyListTTL 自动降级恢复：顽固到期 → 灰名单；灰名单到期 → 恢复正常。
 func TestGreyListTTL(t *testing.T) {
-	g := newGreyList(testGreyCfg(true), nil)
+	g := newGreyList(testGreyCfg(true), nil, nil)
 	ip := "9.9.9.2"
 
 	g.recordFail(ip, ChallengeLow)
@@ -85,7 +102,7 @@ func TestGreyListTTL(t *testing.T) {
 
 // TestGreyListAllow 灰名单（限速档）限速：LimitQPS=2/burst=1 时第 3 次拒绝。
 func TestGreyListAllow(t *testing.T) {
-	g := newGreyList(testGreyCfg(true), nil)
+	g := newGreyList(testGreyCfg(true), nil, nil)
 	ip := "9.9.9.3"
 	// 直接写入 soft 状态（绕过升级计数）
 	g.entries.Store(ip, &greyEntry{ip: ip, state: greySoft, until: time.Now().Add(time.Minute), since: time.Now()})
@@ -103,7 +120,7 @@ func TestGreyListAllow(t *testing.T) {
 
 // TestGreyListClear 挑战通过即解除。
 func TestGreyListClear(t *testing.T) {
-	g := newGreyList(testGreyCfg(true), nil)
+	g := newGreyList(testGreyCfg(true), nil, nil)
 	ip := "9.9.9.4"
 	g.recordFail(ip, ChallengeLow)
 	g.recordFail(ip, ChallengeLow) // soft
@@ -118,7 +135,7 @@ func TestGreyListClear(t *testing.T) {
 
 // TestGreyListDisabled 关闭时不记录任何状态。
 func TestGreyListDisabled(t *testing.T) {
-	g := newGreyList(testGreyCfg(false), nil)
+	g := newGreyList(testGreyCfg(false), nil, nil)
 	ip := "9.9.9.5"
 	for i := 0; i < 10; i++ {
 		g.recordFail(ip, ChallengeLow)
@@ -178,7 +195,7 @@ func TestGreyListPersistRestore(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer s2.Close()
-	g := newGreyList(testGreyCfg(true), s2)
+	g := newGreyList(testGreyCfg(true), s2, nil)
 	time.Sleep(50 * time.Millisecond) // restore 是异步 goroutine
 
 	if st, _ := g.status("9.9.9.8"); st != greyHard {

@@ -834,13 +834,14 @@ func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *Fi
 		sessions:     newSessionTracker(),
 		ipChecker:    newIPRegionChecker(),
 		slide:        newSlideStore(cfg.CaptchaGenMaxPerSec),
-		grey:         newGreyList(cfg.Greylist, greyStore),
 		blockForeign: ipCfg.BlockForeignEnabled(),
 		blockCloud:   ipCfg.BlockCloudEnabled(),
 		throttle:     newLogThrottler(ccLogThrottleInterval),
 		cfg:          cfg,
 		next:         next,
 	}
+	// 灰名单顽固档违规上报接防火墙（回调在 h 构造完成后注册，闭包安全捕获 h）
+	h.grey = newGreyList(cfg.Greylist, greyStore, func(ip string) { h.ReportOffender(ip) })
 	// PoW 引擎无条件创建：无感验证（silent）内部复用轻量 PoW 签发/校验，
 	// 与 Pow.Enabled 解耦；Pow.Enabled 仅控制整页 PoW 档是否可用。
 	h.pow = newPoWChallenge(cfg.Pow, cfg.ChallengeCookieKey)

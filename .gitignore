@@ -62,3 +62,6 @@ _pkg*
 # === Local toolchain sandbox (workspace-local GOCACHE / APPDATA) ===
 .gocache/
 .appdata/
+
+# F17 验收二进制
+warden-f17

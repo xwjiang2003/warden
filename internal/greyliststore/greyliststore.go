@@ -55,7 +55,7 @@ func Open(driver, dsn string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	if _, err := db.Exec(d.Placeholders(`CREATE INDEX IF NOT EXISTS idx_grey_ip_until ON grey_ip(until)`)); err != nil {
+	if err := sqlutil.EnsureIndex(db, d, "idx_grey_ip_until", "grey_ip", "until"); err != nil {
 		log.Printf("[greyliststore] 建索引失败: %v", err)
 	}
 	return &Store{db: db, driver: driver}, nil

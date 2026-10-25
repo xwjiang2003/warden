@@ -47,7 +47,7 @@ func Init(driver, dsn string, days int) {
 	}
 	dialect = sqlutil.DialectFor(driver)
 	if _, err := d.Exec(dialect.Placeholders(`CREATE TABLE IF NOT EXISTS attack_log (
-		id ` + dialect.AutoIncPK() + `,
+		` + dialect.AutoIncPK() + `,
 		time TEXT NOT NULL,
 		ip TEXT, host TEXT, path TEXT, category TEXT, detail TEXT
 	)`)); err != nil {
@@ -55,7 +55,7 @@ func Init(driver, dsn string, days int) {
 		d.Close()
 		return
 	}
-	if _, err := d.Exec(dialect.Placeholders(`CREATE INDEX IF NOT EXISTS idx_attack_log_time ON attack_log(time)`)); err != nil {
+	if err := sqlutil.EnsureIndex(d, dialect, "idx_attack_log_time", "attack_log", "time"); err != nil {
 		log.Printf("[attacklog] 建索引失败: %v", err)
 	}
 	db = d

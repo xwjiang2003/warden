@@ -41,9 +41,9 @@ func openDB(driver, dsn string) (*sql.DB, error) {
 		return nil, err
 	}
 	// rules 表：在线规则（v1.1.0 F3 起）。key 用 VARCHAR(255) 作 PK——
-	// MySQL 的 TEXT 列不能直接作主键，SQLite/PG 的 VARCHAR 语义兼容。
+	// MySQL 的 TEXT 列不能直接作主键、key 是保留字需反引号，SQLite/PG 语义兼容。
 	if _, err := db.Exec(d.Placeholders(`CREATE TABLE IF NOT EXISTS rules (
-		key VARCHAR(255) PRIMARY KEY,
+		` + d.Quote("key") + ` VARCHAR(255) PRIMARY KEY,
 		data TEXT NOT NULL,
 		updated_at TEXT NOT NULL
 	)`)); err != nil {
@@ -63,7 +63,7 @@ func LoadRule(driver, dsn, key string) (string, bool, error) {
 	defer db.Close()
 	d := sqlutil.DialectFor(driver)
 	var data string
-	err = db.QueryRow(d.Placeholders(`SELECT data FROM rules WHERE key = ?`), key).Scan(&data)
+	err = db.QueryRow(d.Placeholders(`SELECT data FROM rules WHERE ` + d.Quote("key") + ` = ?`), key).Scan(&data)
 	if err == sql.ErrNoRows {
 		return "", false, nil
 	}

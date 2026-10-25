@@ -54,14 +54,15 @@ func (d Dialect) Placeholders(sql string) string {
 //   - mysql:  REPLACE INTO t (cols) VALUES (?,...)
 //   - postgres: INSERT INTO t (cols) VALUES ($1,...) ON CONFLICT (keys)
 //     DO UPDATE SET col=EXCLUDED.col,...（keyCols 之外的列全部更新）
+// 列名统一经 Quote 处理（MySQL 保留字如 key 需反引号）。
 func (d Dialect) Upsert(table string, cols []string, keyCols []string) string {
-	colList := strings.Join(cols, ", ")
-	phs := make([]string, len(cols))
-	for i := range cols {
-		phs[i] = fmt.Sprintf("$%d", i+1)
-	}
+	colList := strings.Join(d.QuoteAll(cols), ", ")
 	switch d.Driver {
 	case "postgres":
+		phs := make([]string, len(cols))
+		for i := range cols {
+			phs[i] = fmt.Sprintf("$%d", i+1)
+		}
 		var sets []string
 		for _, c := range cols {
 			isKey := false
@@ -72,16 +73,39 @@ func (d Dialect) Upsert(table string, cols []string, keyCols []string) string {
 				}
 			}
 			if !isKey {
-				sets = append(sets, fmt.Sprintf("%s=EXCLUDED.%s", c, c))
+				sets = append(sets, fmt.Sprintf("%s=EXCLUDED.%s", d.Quote(c), d.Quote(c)))
 			}
 		}
 		return fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s) DO UPDATE SET %s",
-			table, colList, strings.Join(phs, ", "), strings.Join(keyCols, ", "), strings.Join(sets, ", "))
-	case "mysql":
-		return fmt.Sprintf("REPLACE INTO %s (%s) VALUES (%s)", table, colList, strings.Join(phs, ", "))
+			table, colList, strings.Join(phs, ", "), strings.Join(d.QuoteAll(keyCols), ", "), strings.Join(sets, ", "))
 	default:
-		return fmt.Sprintf("INSERT OR REPLACE INTO %s (%s) VALUES (%s)", table, colList, strings.Join(phs, ", "))
+		// sqlite / mysql 均使用 ? 占位符
+		qs := make([]string, len(cols))
+		for i := range cols {
+			qs[i] = "?"
+		}
+		if d.Driver == "mysql" {
+			return fmt.Sprintf("REPLACE INTO %s (%s) VALUES (%s)", table, colList, strings.Join(qs, ", "))
+		}
+		return fmt.Sprintf("INSERT OR REPLACE INTO %s (%s) VALUES (%s)", table, colList, strings.Join(qs, ", "))
 	}
+}
+
+// Quote 方言列名引用：MySQL 用反引号（key 等保留字必须转义），sqlite/postgres 原样。
+func (d Dialect) Quote(col string) string {
+	if d.Driver == "mysql" {
+		return "`" + col + "`"
+	}
+	return col
+}
+
+// QuoteAll 批量引用列名。
+func (d Dialect) QuoteAll(cols []string) []string {
+	out := make([]string, len(cols))
+	for i, c := range cols {
+		out[i] = d.Quote(c)
+	}
+	return out
 }
 
 // AutoIncPK 方言自增主键 DDL 片段（攻击日志 id 列）。
@@ -94,6 +118,28 @@ func (d Dialect) AutoIncPK() string {
 	default:
 		return "id INTEGER PRIMARY KEY AUTOINCREMENT"
 	}
+}
+
+// CreateIndex 方言索引 DDL：sqlite/postgres 支持 IF NOT EXISTS；
+// MySQL 不支持该语法（重复创建报 1061 Duplicate key name），且 TEXT/BLOB
+// 列建索引必须带前缀长度——统一加 col(64)（时间/状态列均短定长），调用方
+// 通过 EnsureIndex 忽略 1061。
+func (d Dialect) CreateIndex(name, table, col string) string {
+	if d.Driver == "mysql" {
+		return fmt.Sprintf("CREATE INDEX %s ON %s(%s(64))", name, table, col)
+	}
+	return fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s(%s)", name, table, col)
+}
+
+// EnsureIndex 幂等建索引：MySQL 下索引已存在（错误码 1061）时视为成功。
+func EnsureIndex(db *sql.DB, d Dialect, name, table, col string) error {
+	if _, err := db.Exec(d.CreateIndex(name, table, col)); err != nil {
+		if d.Driver == "mysql" && strings.Contains(err.Error(), "1061") {
+			return nil // 索引已存在
+		}
+		return err
+	}
+	return nil
 }
 
 // Open 按方言打开数据库并初始化连接：

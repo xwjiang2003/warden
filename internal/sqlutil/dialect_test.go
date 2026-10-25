@@ -25,15 +25,16 @@ func TestPlaceholdersSQLiteMySQL(t *testing.T) {
 	}
 }
 
-// TestUpsertSQLite MySQL 校验两方言语句生成。
+// TestUpsertSQLite MySQL 校验两方言语句生成（MySQL 列名反引号引用保留字）。
 func TestUpsertSQLiteMySQL(t *testing.T) {
 	sqlite := DialectFor("sqlite").Upsert("rules", []string{"key", "data", "updated_at"}, []string{"key"})
-	if !strings.HasPrefix(sqlite, "INSERT OR REPLACE INTO rules") {
+	if !strings.HasPrefix(sqlite, "INSERT OR REPLACE INTO rules (key, data, updated_at)") {
 		t.Fatalf("sqlite Upsert 应为 INSERT OR REPLACE: %s", sqlite)
 	}
 	mysql := DialectFor("mysql").Upsert("rules", []string{"key", "data", "updated_at"}, []string{"key"})
-	if !strings.HasPrefix(mysql, "REPLACE INTO rules") {
-		t.Fatalf("mysql Upsert 应为 REPLACE INTO: %s", mysql)
+	wantMySQL := "REPLACE INTO rules (`key`, `data`, `updated_at`) VALUES (?, ?, ?)"
+	if mysql != wantMySQL {
+		t.Fatalf("mysql Upsert 错误:\n got=%s\nwant=%s", mysql, wantMySQL)
 	}
 }
 
@@ -44,6 +45,19 @@ func TestUpsertPostgres(t *testing.T) {
 	want := "INSERT INTO rules (key, data, updated_at) VALUES ($1, $2, $3) ON CONFLICT (key) DO UPDATE SET data=EXCLUDED.data, updated_at=EXCLUDED.updated_at"
 	if got != want {
 		t.Fatalf("PG Upsert 生成错误:\n got=%s\nwant=%s", got, want)
+	}
+}
+
+// TestCreateIndex 校验索引 DDL：MySQL 无 IF NOT EXISTS 且 TEXT 列需前缀长度。
+func TestCreateIndex(t *testing.T) {
+	if got := DialectFor("mysql").CreateIndex("idx_x", "t", "c"); got != "CREATE INDEX idx_x ON t(c(64))" {
+		t.Fatalf("mysql CreateIndex 错误: %s", got)
+	}
+	for _, driver := range []string{"sqlite", "postgres", ""} {
+		want := "CREATE INDEX IF NOT EXISTS idx_x ON t(c)"
+		if got := DialectFor(driver).CreateIndex("idx_x", "t", "c"); got != want {
+			t.Fatalf("driver=%q CreateIndex 错误: got=%s want=%s", driver, got, want)
+		}
 	}
 }
 

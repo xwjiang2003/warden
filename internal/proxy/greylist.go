@@ -226,7 +226,7 @@ func (g *greyList) snapshot() []greyliststore.Entry {
 		if now := time.Now(); now.After(until) {
 			// 过期条目由 status 惰性清理；此处直接按到期处理
 			if st == greyHard {
-				st, lvl = greySoft, lvl
+				st = greySoft
 				until = now.Add(g.ttl)
 				fails = 0
 			} else {

@@ -8,7 +8,23 @@
 
 ### 新增
 
-- 规划中（v1.3.0：Linux iptables 防火墙集成 / 规则批量聚合后续优化等）。
+- **Linux 防火墙集成（v1.3.0 F16）**：`firewall_block` 在 Linux（含容器）下从 no-op 变为
+  真实内核层封禁——`ipset hash:ip` 集合承载拉黑 IP（内核哈希 O(1) 匹配，规则条数不随 IP
+  膨胀）+ 单条 `iptables -I INPUT -m set --match-set warden-block src -j DROP`：
+  - 对齐 Windows 性能治理架构：block() 内存态先行（不触碰 ipset）、周期全量重建
+    （`ipset restore` 批量 add，单进程）、总量上限 8192、unblock 即时重建；
+  - ipset 集合自带内核 timeout（= `firewall_block.expire_min`），IP 到期自动过期，
+    进程崩溃也能自清理；
+  - 幂等初始化（`ipset create -exist` + `iptables -C/-I`），重启自动重建；
+  - **权限要求**：需 root 或 CAP_NET_ADMIN（容器需 `--cap-add=NET_ADMIN` 且宿主机有
+    ipset/iptables 命令）；命令缺失或无权限时**优雅降级为仅日志**（保持 v1.2.0 语义）；
+  - **产品建议与 Windows 一致：默认关闭、不建议在小型个人部署启用**；企业级 Linux
+    网关场景可开启，配合灰名单递进作为纵深防御。
+
+### 规划中
+
+- v1.3.0 后续：Prometheus 指标 / 攻击报表 / 审计日志 / 告警模板 / 调参向导；
+  存储层数据库兼容（MySQL/PG 可选，F17）。
 
 ## [1.2.0] - 2026-10-25
 

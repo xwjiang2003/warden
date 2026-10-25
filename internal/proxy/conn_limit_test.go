@@ -3,6 +3,7 @@ package proxy
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -85,8 +86,42 @@ func TestChunkIPs(t *testing.T) {
 	}
 }
 
+// TestIpSetRestoreScript 验证 Linux ipset restore 脚本生成：create/flush/add 结构、
+// timeout 参数、空列表清空语义。
+func TestIpSetRestoreScript(t *testing.T) {
+	ips := []string{"1.2.3.4", "5.6.7.8"}
+	script := ipsetRestoreScript(ips, 1800)
+	wantLines := []string{
+		"create warden-block hash:ip timeout 1800 -exist",
+		"flush warden-block",
+		"add warden-block 1.2.3.4 timeout 1800",
+		"add warden-block 5.6.7.8 timeout 1800",
+	}
+	for _, w := range wantLines {
+		if !strings.Contains(script, w) {
+			t.Fatalf("脚本缺少 %q\n脚本:\n%s", w, script)
+		}
+	}
+	// 空列表 → create + flush，无 add
+	empty := ipsetRestoreScript(nil, 1800)
+	if strings.Contains(empty, "\nadd ") {
+		t.Fatalf("空列表不应含 add 行:\n%s", empty)
+	}
+	if !strings.Contains(empty, "flush warden-block") {
+		t.Fatalf("空列表应含 flush:\n%s", empty)
+	}
+	// timeout<=0 → add 不带 timeout（create 行 timeout 0 即无过期语义）
+	noT := ipsetRestoreScript([]string{"9.9.9.9"}, 0)
+	if strings.Contains(noT, "add warden-block 9.9.9.9 timeout") {
+		t.Fatalf("timeout<=0 不应写 add timeout 参数:\n%s", noT)
+	}
+	if !strings.Contains(noT, "add warden-block 9.9.9.9\n") {
+		t.Fatalf("应保留裸 add 行:\n%s", noT)
+	}
+}
+
 // TestFirewallBlockerMaxBlocked 验证拉黑总量上限：超限拒绝且不计数。
-// 手工构造 enabled=true 但不启动 syncLoop（block 不触碰 netsh，安全）。
+// 手工构造 enabled=true 但不启动 syncLoop（block 不触碰 netsh/ipset，安全）。
 func TestFirewallBlockerMaxBlocked(t *testing.T) {
 	fb := &FirewallBlocker{
 		blockedIPs: make(map[string]time.Time),

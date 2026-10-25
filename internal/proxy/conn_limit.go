@@ -126,7 +126,7 @@ func NewFirewallBlocker(enabled bool, expireMin int, whitelistCIDRs []string, st
 	fb := &FirewallBlocker{
 		blockedIPs:  make(map[string]time.Time),
 		expireAfter: time.Duration(expireMin) * time.Minute,
-		enabled:     enabled && runtime.GOOS == "windows",
+		enabled:     enabled && (runtime.GOOS == "windows" || runtime.GOOS == "linux"),
 		store:       store,
 		syncNow:     make(chan struct{}, 1),
 		netshSem:    make(chan struct{}, 1),
@@ -210,13 +210,24 @@ func chunkIPs(ips []string, size int) [][]string {
 	return out
 }
 
-// syncRules 全量重建防火墙规则（互斥执行）：
-// 清空全部 warden-block-* 规则（含旧版本逐 IP 遗留与孤儿）→ 按批重建。
-// 规则总数 = ceil(活跃IP/50)，避免逐 IP 规则量无限膨胀拖垮系统防火墙。
+// syncRules 全量重建防火墙规则（互斥执行），按平台分派：
+//   - Windows：清空全部 warden-block-* 规则（含旧版本逐 IP 遗留与孤儿）→ 按批重建
+//     （每批 ≤50 IP 一条规则，规则总数 = ceil(活跃IP/50)）；
+//   - Linux：ipset hash:ip 集合全量重建（flush + restore 批量 add，单进程）+
+//     iptables 单条集合匹配规则（O(1) 匹配，不随 IP 数膨胀）。
 func (fb *FirewallBlocker) syncRules() {
-	if !fb.enabled || runtime.GOOS != "windows" {
+	if !fb.enabled {
 		return
 	}
+	switch runtime.GOOS {
+	case "windows":
+		fb.syncRulesWindows()
+	case "linux":
+		fb.syncRulesLinux()
+	}
+}
+
+func (fb *FirewallBlocker) syncRulesWindows() {
 	fb.mu.Lock()
 	active := make([]string, 0, len(fb.blockedIPs))
 	for ip := range fb.blockedIPs {
@@ -246,6 +257,91 @@ func (fb *FirewallBlocker) syncRules() {
 			log.Printf("[firewall] 规则已清空（无活跃拉黑）")
 		}
 	})
+}
+
+// ---- Linux 防火墙（iptables + ipset） ----
+// 用 ipset hash:ip 集合承载拉黑 IP，iptables 仅一条集合匹配规则：
+//   - 匹配 O(1)（内核哈希表），规则条数不随 IP 数膨胀（对比逐 IP 规则的引擎遍历开销）；
+//   - 集合带内核 timeout，IP 到期自动过期（即使进程崩溃也能自清理）；
+//   - 全量重建 = ipset restore 批量 add（单进程），block() 只更新内存态；
+//   - 依赖 ipset + iptables 命令（需 root 或 CAP_NET_ADMIN；Ubuntu 22.04+ 的
+//     iptables-nft 兼容层同样可用）；命令缺失或无权限时优雅降级为仅日志。
+
+const firewallIpSetName = "warden-block"
+
+// initLinuxFirewall 幂等初始化：创建 ipset 集合 + 确保 iptables 集合匹配规则存在。
+// 任一命令不可用/无权限返回错误，由调用方降级。
+func (fb *FirewallBlocker) initLinuxFirewall() error {
+	timeoutSec := int(fb.expireAfter.Seconds())
+	if timeoutSec < 60 {
+		timeoutSec = 60
+	}
+	// ipset create -exist：集合已存在则直接复用（含 timeout 语义）
+	out, err := exec.Command("ipset", "create", firewallIpSetName, "hash:ip", "timeout",
+		fmt.Sprintf("%d", timeoutSec), "-exist").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ipset create: %v (输出: %s)", err, strings.TrimSpace(string(out)))
+	}
+	// iptables -C 检查规则是否已存在（exit 0 = 存在），不存在则 -I 插入
+	if err := exec.Command("iptables", "-C", "INPUT", "-m", "set", "--match-set",
+		firewallIpSetName, "src", "-j", "DROP").Run(); err != nil {
+		out, err2 := exec.Command("iptables", "-I", "INPUT", "-m", "set", "--match-set",
+			firewallIpSetName, "src", "-j", "DROP").CombinedOutput()
+		if err2 != nil {
+			return fmt.Errorf("iptables -I: %v (输出: %s)", err2, strings.TrimSpace(string(out)))
+		}
+	}
+	return nil
+}
+
+// ipsetRestoreScript 生成 ipset restore 输入脚本：flush 后批量 add（带内核 timeout）。
+// 纯函数便于单测；timeoutSec<=0 时省略 timeout 参数（集合默认）。
+func ipsetRestoreScript(ips []string, timeoutSec int) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "create %s hash:ip timeout %d -exist\n", firewallIpSetName, timeoutSec)
+	sb.WriteString("flush " + firewallIpSetName + "\n")
+	for _, ip := range ips {
+		if timeoutSec > 0 {
+			fmt.Fprintf(&sb, "add %s %s timeout %d\n", firewallIpSetName, ip, timeoutSec)
+		} else {
+			fmt.Fprintf(&sb, "add %s %s\n", firewallIpSetName, ip)
+		}
+	}
+	return sb.String()
+}
+
+// syncRulesLinux ipset 全量重建：initLinuxFirewall 确保集合/规则 → flush+批量 add。
+// 失败（含权限变更）时降级 enabled=false，避免每周期空转。
+func (fb *FirewallBlocker) syncRulesLinux() {
+	if err := fb.initLinuxFirewall(); err != nil {
+		fb.mu.Lock()
+		fb.enabled = false
+		fb.mu.Unlock()
+		log.Printf("[firewall] Linux 防火墙初始化失败，已降级为仅日志（不进行内核封禁）: %v", err)
+		return
+	}
+	fb.mu.Lock()
+	active := make([]string, 0, len(fb.blockedIPs))
+	for ip := range fb.blockedIPs {
+		active = append(active, ip)
+	}
+	fb.mu.Unlock()
+
+	timeoutSec := int(fb.expireAfter.Seconds())
+	if timeoutSec < 60 {
+		timeoutSec = 60
+	}
+	cmd := exec.Command("ipset", "restore", "-exist")
+	cmd.Stdin = strings.NewReader(ipsetRestoreScript(active, timeoutSec))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("[firewall] ipset 全量重建失败: %v (输出: %s)", err, strings.TrimSpace(string(out)))
+		return
+	}
+	if len(active) > 0 {
+		log.Printf("[firewall] ipset 全量重建完成: 活跃=%d 集合=%s timeout=%ds", len(active), firewallIpSetName, timeoutSec)
+	} else {
+		log.Printf("[firewall] ipset 已清空（无活跃拉黑）")
+	}
 }
 
 // syncLoop 周期全量重建 + 响应即时重建唤醒。

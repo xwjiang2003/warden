@@ -427,7 +427,7 @@ curl -I  http://127.0.0.1:81/        # 应转发到后端
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `conn_limit.max_conns_per_sec` / `burst` | `300` / `80` | TCP 层**每秒新连接**上限与突发容量。超限是 `conn.Close()` 优雅关闭、**不返回任何 HTTP 响应**（与验证码 503 症状不同）。注意它限的是"新连接数"而非 QPS：上游 nginx 保持 keepalive 复用时不会成为瓶颈，若客户端/代理大量短连接则直接卡在这个值上 |
-| `firewall_block.enabled` | `false` | 是否启用系统防火墙内核层封禁（**仅 Windows 有效**）。**不建议启用**：Windows 服务器实测大批量拉黑会导致性能明显下降（v1.2.1 已改为异步队列写入缓解，但 netsh 系统级开销仍在），默认保持关闭，依赖 CC 层挑战 + 灰名单递进的应用层拦截 |
+| `firewall_block.enabled` | `false` | 是否启用系统防火墙内核层封禁（**仅 Windows 有效**）。**不建议启用**：Windows 服务器实测，逐 IP 规则量过大（上万条）会严重拖垮整体系统性能——v1.2.1 已改为批量规则聚合（每批 ≤50 IP，8192 上限时约 164 条）+ 周期全量重建缓解，但系统级规则写入开销仍在；默认保持关闭，依赖 CC 层挑战 + 灰名单递进的应用层拦截 |
 | `firewall_block.auto_block` | `false` | 是否自动封禁顽固攻击者 |
 | `firewall_block.expire_min` | `30` | 封禁自动过期时间（分钟） |
 | `firewall_block.whitelist_cidrs` | `[]` | 不参与防火墙封禁的网段 |

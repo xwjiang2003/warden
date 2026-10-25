@@ -1,7 +1,7 @@
 package proxy
 
 import (
-	"context"
+	"fmt"
 	"log"
 	"math/rand"
 	"net"
@@ -88,8 +88,25 @@ var discardCount int64
 
 // ---- Windows Firewall IP 黑名单 (内核层拦截) ----
 // 被确认的攻击 IP 加入系统防火墙，在 TCP 三次握手之前就丢弃
+//
+// 性能治理（v1.2.1）：
+//  1. 原实现逐 IP 新增规则（warden-block-<ip>），Windows 防火墙引擎对每个数据包都要
+//     遍历规则匹配，规则量上万条时实测严重拖垮整体系统性能；
+//  2. 改为「批量规则 + 周期全量重建」：规则按每批 ≤50 个 IP 聚合为一条
+//     warden-block-batch-N（in/out 各一），规则总数 = ceil(活跃IP/50)，8192 个活跃
+//     IP 仅约 164 条规则，引擎负担降两个数量级；
+//  3. 全量重建由独立 goroutine 每 60s 执行一次（单 PowerShell 进程：清空旧规则 →
+//     逐批重建），block() 只更新内存态，不再触碰 netsh；unblock/过期清理触发
+//     syncNow 即时重建，验证通过的用户尽快恢复；
+//  4. 拉黑总量上限 firewallMaxBlocked（8192）防失控膨胀；默认关闭（enabled=false），
+//     不建议启用（系统级 netsh/PowerShell 写规则仍有开销，应用层挑战+灰名单已提供拦截）。
 
-const firewallRulePrefix = "warden-block-"
+const (
+	firewallRulePrefix   = "warden-block-"
+	firewallBatchSize    = 50             // 每条批量规则聚合的 IP 数
+	firewallMaxBlocked   = 8192           // 活跃拉黑 IP 上限（防规则无限膨胀）
+	firewallSyncInterval = 60 * time.Second // 全量重建周期
+)
 
 type FirewallBlocker struct {
 	mu          sync.Mutex
@@ -100,14 +117,9 @@ type FirewallBlocker struct {
 	blockCount  int64
 	store       *fwstore.Store
 
-	// 性能治理（v1.2.1）：netsh 每次调用数百毫秒且无并发安全保证。
-	//  block() 不再持锁同步执行 netsh（大批量拉黑时锁内排队会阻塞全局请求路径，
-	//  实测性能明显下降），改为内存态先行 + 有界队列由 ruleWorker 串行写规则；
-	//  netshSem 保证所有防火墙写操作（block 队列 / 降级 / restore / removeRule /
-	//  cleanOrphans）互斥，避免并发子进程堆积与防火墙引擎锁冲突。
-	ruleQueue chan string   // 待写入规则 IP（有界 512；溢出时 block 同步降级，保证不丢）
-	netshSem  chan struct{} // 容量 1：netsh/powershell 写操作互斥
-	queueDrop atomic.Int64  // 队列溢出同步降级执行次数
+	syncNow   chan struct{} // 容量 1：unblock/过期清理后唤醒立即全量重建
+	netshSem  chan struct{} // 容量 1：PowerShell 写操作互斥
+	maxBlocked int
 }
 
 func NewFirewallBlocker(enabled bool, expireMin int, whitelistCIDRs []string, store *fwstore.Store) *FirewallBlocker {
@@ -116,8 +128,9 @@ func NewFirewallBlocker(enabled bool, expireMin int, whitelistCIDRs []string, st
 		expireAfter: time.Duration(expireMin) * time.Minute,
 		enabled:     enabled && runtime.GOOS == "windows",
 		store:       store,
-		ruleQueue:   make(chan string, 512),
+		syncNow:     make(chan struct{}, 1),
 		netshSem:    make(chan struct{}, 1),
+		maxBlocked:  firewallMaxBlocked,
 	}
 	if fb.enabled && expireMin <= 0 {
 		fb.expireAfter = 30 * time.Minute
@@ -138,28 +151,118 @@ func NewFirewallBlocker(enabled bool, expireMin int, whitelistCIDRs []string, st
 		fb.whitelist = append(fb.whitelist, netw)
 	}
 	if fb.enabled {
-		go fb.restore() // 异步恢复拉黑/清理孤儿规则，不阻塞启动
-		log.Printf("[firewall] enabled, auto-expire=%v whitelist=%d ranges", fb.expireAfter, len(fb.whitelist))
+		go fb.restore() // 异步恢复内存态，不阻塞启动
+		log.Printf("[firewall] enabled, auto-expire=%v whitelist=%d ranges max_blocked=%d batch=%d/IP sync=%v",
+			fb.expireAfter, len(fb.whitelist), fb.maxBlocked, firewallBatchSize, firewallSyncInterval)
 		go fb.reaper()
-		go fb.ruleWorker()
+		go fb.syncLoop()
 	}
 	return fb
 }
 
-// ruleWorker 串行消费 block 队列，逐条写入防火墙规则。
-// netsh 调用天然串行 + 互斥：大批量拉黑时只增加攻击流量自己的排队延迟，
-// 不再阻塞正常请求路径（正常请求不经过本队列）。
-func (fb *FirewallBlocker) ruleWorker() {
-	for ip := range fb.ruleQueue {
-		ruleName := firewallRulePrefix + ip
-		fb.withNetsh(func() {
-			addRule("in", ruleName, ip)
-			addRule("out", ruleName, ip)
-		})
+// restore 启动时从数据库恢复拉黑列表到内存态（不直接写防火墙规则，
+// 由 syncLoop 首轮/启动同步触发全量重建）。
+func (fb *FirewallBlocker) restore() {
+	if fb.store != nil {
+		blocks := fb.store.LoadAll()
+		now := time.Now()
+		var restoreIPs, removeIPs []string
+		restoreAt := make(map[string]time.Time, len(blocks))
+		for _, b := range blocks {
+			if fb.isWhitelisted(b.IP) || now.Sub(b.BlockedAt) > fb.expireAfter {
+				removeIPs = append(removeIPs, b.IP)
+				fb.store.Delete(b.IP)
+				continue
+			}
+			restoreIPs = append(restoreIPs, b.IP)
+			restoreAt[b.IP] = b.BlockedAt
+		}
+		fb.mu.Lock()
+		for _, ip := range restoreIPs {
+			if len(fb.blockedIPs) >= fb.maxBlocked {
+				break
+			}
+			fb.blockedIPs[ip] = restoreAt[ip]
+			fb.blockCount++
+		}
+		fb.mu.Unlock()
+		if len(restoreIPs) > 0 || len(removeIPs) > 0 {
+			log.Printf("[firewall] 启动恢复拉黑: restored=%d cleaned=%d", len(restoreIPs), len(removeIPs))
+		}
+	}
+	// 立即重建一次（含清空旧版本逐 IP 遗留规则）
+	fb.syncRules()
+}
+
+// chunkIPs 将 IP 列表按批切分（每批最多 size 个），用于批量规则聚合。
+func chunkIPs(ips []string, size int) [][]string {
+	if size <= 0 {
+		size = firewallBatchSize
+	}
+	var out [][]string
+	for i := 0; i < len(ips); i += size {
+		end := i + size
+		if end > len(ips) {
+			end = len(ips)
+		}
+		out = append(out, ips[i:end])
+	}
+	return out
+}
+
+// syncRules 全量重建防火墙规则（互斥执行）：
+// 清空全部 warden-block-* 规则（含旧版本逐 IP 遗留与孤儿）→ 按批重建。
+// 规则总数 = ceil(活跃IP/50)，避免逐 IP 规则量无限膨胀拖垮系统防火墙。
+func (fb *FirewallBlocker) syncRules() {
+	if !fb.enabled || runtime.GOOS != "windows" {
+		return
+	}
+	fb.mu.Lock()
+	active := make([]string, 0, len(fb.blockedIPs))
+	for ip := range fb.blockedIPs {
+		active = append(active, ip)
+	}
+	fb.mu.Unlock()
+
+	fb.withNetsh(func() {
+		var ps strings.Builder
+		ps.WriteString("$ErrorActionPreference='SilentlyContinue'\n")
+		ps.WriteString("Get-NetFirewallRule -DisplayName '" + firewallRulePrefix + "*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\n")
+		batches := chunkIPs(active, firewallBatchSize)
+		for i, batch := range batches {
+			name := fmt.Sprintf("%sbatch-%d", firewallRulePrefix, i+1)
+			addr := strings.Join(batch, ",")
+			fmt.Fprintf(&ps, "New-NetFirewallRule -DisplayName '%s' -Direction Inbound -Action Block -RemoteAddress '%s'\n", name, addr)
+			fmt.Fprintf(&ps, "New-NetFirewallRule -DisplayName '%s' -Direction Outbound -Action Block -RemoteAddress '%s'\n", name, addr)
+		}
+		out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps.String()).CombinedOutput()
+		if err != nil {
+			log.Printf("[firewall] 规则全量重建失败: %v (输出: %s)", err, strings.TrimSpace(string(out)))
+			return
+		}
+		if len(batches) > 0 {
+			log.Printf("[firewall] 规则全量重建完成: 活跃=%d 批量规则=%d", len(active), len(batches))
+		} else {
+			log.Printf("[firewall] 规则已清空（无活跃拉黑）")
+		}
+	})
+}
+
+// syncLoop 周期全量重建 + 响应即时重建唤醒。
+func (fb *FirewallBlocker) syncLoop() {
+	ticker := time.NewTicker(firewallSyncInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			fb.syncRules()
+		case <-fb.syncNow:
+			fb.syncRules()
+		}
 	}
 }
 
-// withNetsh 以互斥方式执行一次防火墙写操作（同一时刻至多一个 netsh/powershell 子进程）。
+// withNetsh 以互斥方式执行一次防火墙写操作（同一时刻至多一个 PowerShell 子进程）。
 func (fb *FirewallBlocker) withNetsh(fn func()) {
 	fb.netshSem <- struct{}{}
 	defer func() { <-fb.netshSem }()
@@ -179,122 +282,16 @@ func (fb *FirewallBlocker) isWhitelisted(ip string) bool {
 	return false
 }
 
-// restore 启动时从数据库恢复拉黑列表（异步执行）：
-//   - 仍在有效期内：恢复到内存并补回防火墙规则；
-//   - 已过期：清理孤儿防火墙规则并删除记录；
-//   - 并清理防火墙中不属于当前拉黑列表的孤儿 warden-block-* 规则（旧版本遗留）。
-func (fb *FirewallBlocker) restore() {
-	if fb.store != nil {
-		blocks := fb.store.LoadAll()
-		now := time.Now()
-		var restoreIPs, removeIPs []string
-		restoreAt := make(map[string]time.Time, len(blocks))
-		for _, b := range blocks {
-			if fb.isWhitelisted(b.IP) || now.Sub(b.BlockedAt) > fb.expireAfter {
-				removeIPs = append(removeIPs, b.IP)
-				fb.store.Delete(b.IP)
-				continue
-			}
-			restoreIPs = append(restoreIPs, b.IP)
-			restoreAt[b.IP] = b.BlockedAt
-		}
-
-		// 恢复有效拉黑到内存（加锁，与 block/unblock/reaper 并发安全）
-		fb.mu.Lock()
-		for _, ip := range restoreIPs {
-			fb.blockedIPs[ip] = restoreAt[ip]
-			fb.blockCount++
-		}
-		fb.mu.Unlock()
-
-		// 补回防火墙规则 / 删除过期规则（netsh 慢，放在锁外 + 互斥，避免与 block 队列并发）
-		fb.withNetsh(func() {
-			for _, ip := range restoreIPs {
-				ruleName := firewallRulePrefix + ip
-				// 规则可能已存在（进程重启但防火墙规则仍在），避免重复添加
-				if !ruleExists(ruleName, "in", ip) {
-					addRule("in", ruleName, ip)
-				}
-				if !ruleExists(ruleName, "out", ip) {
-					addRule("out", ruleName, ip)
-				}
-			}
-		})
-		for _, ip := range removeIPs {
-			fb.removeRule(ip)
-		}
-		if len(restoreIPs) > 0 || len(removeIPs) > 0 {
-			log.Printf("[firewall] 启动恢复拉黑: restored=%d cleaned=%d", len(restoreIPs), len(removeIPs))
-		}
-	}
-	fb.cleanOrphans()
-}
-
-// cleanOrphans 清理 Windows 防火墙中不属于当前拉黑列表的 warden-block-* 规则。
-// 这些规则来自旧版本（无持久化）遗留、或进程崩溃前未及删除。
-//
-// 用单条 PowerShell 命令按"活跃列表"过滤删除孤儿：只删孤儿、不动活跃规则（无空窗），
-// 比 netsh 逐条快几个数量级。PowerShell 的退出码不可靠（无匹配/权限等非致命错误也返回非零），
-// 因此忽略退出码，改以删除后重列的剩余数为准。
-func (fb *FirewallBlocker) cleanOrphans() {
-	if runtime.GOOS != "windows" {
-		return
-	}
-	// 快照当前应保留的活跃拉黑 IP
-	fb.mu.Lock()
-	active := make(map[string]bool, len(fb.blockedIPs))
-	for ip := range fb.blockedIPs {
-		active[ip] = true
-	}
-	fb.mu.Unlock()
-
-	keep := make([]string, 0, len(active))
-	for ip := range active {
-		keep = append(keep, "'"+ip+"'")
-	}
-	// 单条命令：列出所有 warden-block-* 规则，删除去掉前缀后不在活跃列表里的孤儿。
-	// 用 -replace 去掉前缀（"warden-block-" 无正则特殊字符，字面匹配即可）。
-	ps := "Get-NetFirewallRule -DisplayName '" + firewallRulePrefix + "*' -ErrorAction SilentlyContinue | " +
-		"Where-Object { ($_.DisplayName -replace '^" + firewallRulePrefix + "','') -notin @(" + strings.Join(keep, ",") + ") } | " +
-		"Remove-NetFirewallRule -ErrorAction SilentlyContinue"
-	fb.withNetsh(func() { exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps).Run() })
-
-	// 重列验证剩余孤儿数（若有剩余，说明部分删除失败，留待下次周期重试）
-	fb.withNetsh(func() {
-		out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
-			"Get-NetFirewallRule -DisplayName '" + firewallRulePrefix + "*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DisplayName").Output()
-		if err != nil {
-			return
-		}
-		seen := map[string]bool{}
-		remaining := 0
-		for _, line := range strings.Split(string(out), "\n") {
-			name := strings.TrimSpace(line)
-			if !strings.HasPrefix(name, firewallRulePrefix) {
-				continue
-		}
-		ip := name[len(firewallRulePrefix):]
-		if seen[ip] {
-			continue
-		}
-		seen[ip] = true
-		if !active[ip] {
-			remaining++
-		}
-	}
-	if remaining > 0 {
-		log.Printf("[firewall] 清理后仍剩余孤儿规则 %d 条（下次周期重试）", remaining)
-	} else {
-		log.Printf("[firewall] 防火墙规则已对齐拉黑列表: 活跃=%d", len(active))
-	}
-	})
-}
-
 func (fb *FirewallBlocker) block(ip, reason string) {
 	if !fb.enabled || ip == "" || ip == "127.0.0.1" || ip == "::1" || fb.isWhitelisted(ip) {
 		return
 	}
-	fb.mu.Lock()
+		fb.mu.Lock()
+	if len(fb.blockedIPs) >= fb.maxBlocked {
+		fb.mu.Unlock()
+		log.Printf("[firewall] 拉黑列表已达上限 %d，拒绝新增 ip=%s", fb.maxBlocked, ip)
+		return
+	}
 	if _, exists := fb.blockedIPs[ip]; exists {
 		fb.mu.Unlock()
 		return
@@ -308,21 +305,9 @@ func (fb *FirewallBlocker) block(ip, reason string) {
 	}
 	fb.mu.Unlock()
 
-	// 性能：内存态先行，防火墙规则异步写入（有界队列，ruleWorker 串行消费）。
-	// 队列满（>512 积压）时同步降级执行，保证拦截规则不丢——该情形请求本来自
-	// 攻击流量，同步排队即限速，不会波及正常路径。
-	select {
-	case fb.ruleQueue <- ip:
-		log.Printf("[firewall] BLOCKED ip=%s reason=%s total=%d (规则排队写入)", ip, reason, fb.blockCount)
-	default:
-		fb.queueDrop.Add(1)
-		log.Printf("[firewall] 规则队列已满(%d) 同步降级写入 ip=%s", fb.queueDrop.Load(), ip)
-		ruleName := firewallRulePrefix + ip
-		fb.withNetsh(func() {
-			addRule("in", ruleName, ip)
-			addRule("out", ruleName, ip)
-		})
-	}
+	// 性能：内存态先行；防火墙规则由 syncLoop 周期全量重建（批量规则聚合），
+	// block() 不触碰 netsh/PowerShell，正常请求路径零阻塞。
+	log.Printf("[firewall] BLOCKED ip=%s reason=%s total=%d (规则周期批量写入)", ip, reason, fb.blockCount)
 }
 
 // unblock 解除一个 IP 的防火墙拉黑（验证码通过时调用）。
@@ -335,81 +320,34 @@ func (fb *FirewallBlocker) unblock(ip string) {
 	delete(fb.blockedIPs, ip)
 	fb.blockCount--
 	fb.mu.Unlock()
-	// netsh 较慢，放在锁外执行，避免阻塞 block()/reaper
-	fb.removeRule(ip)
 	if fb.store != nil {
 		fb.store.Delete(ip)
 	}
+	// 唤醒立即全量重建，验证通过的用户尽快恢复（syncLoop 若非空闲则跳过本次）
+	select {
+	case fb.syncNow <- struct{}{}:
+	default:
+	}
 	log.Printf("[firewall] UNBLOCKED ip=%s (验证码通过)", ip)
-}
-
-func addRule(dir, name, ip string) {
-	if runtime.GOOS != "windows" {
-		return
-	}
-	// 同步执行 + 5 秒超时：避免攻击期间大量拉黑时用 go cmd.Wait() 堆积协程、
-	// 或 netsh 挂起导致协程/句柄泄漏。
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "netsh", "advfirewall", "firewall", "add", "rule",
-		"name="+name,
-		"dir="+dir,
-		"action=block",
-		"remoteip="+ip,
-		"enable=yes")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("[firewall] 添加规则失败 name=%s dir=%s: %v (输出: %s)", name, dir, err, strings.TrimSpace(string(out)))
-	}
-}
-
-// ruleExists 判断指定方向/远端 IP 的防火墙规则是否已存在，供启动恢复时避免重复添加。
-func ruleExists(name, dir, ip string) bool {
-	out, err := exec.Command("netsh", "advfirewall", "firewall", "show", "rule",
-		"name="+name, "dir="+dir, "remoteip="+ip).CombinedOutput()
-	return err == nil && strings.Contains(string(out), name)
-}
-
-func (fb *FirewallBlocker) removeRule(ip string) {
-	if runtime.GOOS != "windows" {
-		return
-	}
-	fb.withNetsh(func() {
-		ruleName := firewallRulePrefix + ip
-		for _, dir := range []string{"in", "out"} {
-			// 用 remoteip= 精确限定目标规则：netsh 的 name= 是前缀匹配，
-			// "warden-block-1.2.3.4" 会同时命中 "warden-block-1.2.3.40" 等，导致删错或漏删；
-			// 加上 remoteip= 后仅命中本 IP 的规则。
-			showOut, _ := exec.Command("netsh", "advfirewall", "firewall", "show", "rule",
-				"name="+ruleName, "dir="+dir, "remoteip="+ip).CombinedOutput()
-			if !strings.Contains(string(showOut), ruleName) {
-				continue
-			}
-			cmd := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule",
-				"name="+ruleName, "dir="+dir, "remoteip="+ip)
-			if out, err := cmd.CombinedOutput(); err != nil {
-				log.Printf("[firewall] 删除规则失败 name=%s dir=%s: %v (输出: %s)", ruleName, dir, err, strings.TrimSpace(string(out)))
-			}
-		}
-	})
 }
 
 func (fb *FirewallBlocker) reaper() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-	orphanTicker := time.NewTicker(30 * time.Minute)
-	defer orphanTicker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			fb.reapExpired()
-		case <-orphanTicker.C:
-			// 定期全量清扫孤儿规则，自愈运行期删除失败/崩溃遗留的规则
-			fb.cleanOrphans()
+	for range ticker.C {
+		if fb.reapExpired() {
+			// 有过期清除，唤醒立即重建
+			select {
+			case fb.syncNow <- struct{}{}:
+			default:
+			}
 		}
 	}
 }
 
-func (fb *FirewallBlocker) reapExpired() {
+// reapExpired 删除内存态中已过期的拉黑，返回是否有清除。
+// 防火墙规则由 syncRules 全量重建同步（孤儿自愈），无需逐条删除。
+func (fb *FirewallBlocker) reapExpired() bool {
 	fb.mu.Lock()
 	now := time.Now()
 	var expired []string
@@ -425,9 +363,7 @@ func (fb *FirewallBlocker) reapExpired() {
 	fb.blockCount -= int64(n)
 	active := fb.blockCount
 	fb.mu.Unlock()
-	// netsh 较慢，放在锁外执行，避免阻塞 block()/unblock()
 	for _, ip := range expired {
-		fb.removeRule(ip)
 		if fb.store != nil {
 			fb.store.Delete(ip)
 		}
@@ -435,6 +371,7 @@ func (fb *FirewallBlocker) reapExpired() {
 	if n > 0 {
 		log.Printf("[firewall] unblocked %d expired IPs, active=%d", n, active)
 	}
+	return n > 0
 }
 
 // ---- TCP 连接优化 ----

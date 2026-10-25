@@ -1,7 +1,8 @@
 package proxy
 
 import (
-	"runtime"
+	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -56,13 +57,49 @@ func TestFirewallBlockerNetshMutex(t *testing.T) {
 	}
 }
 
-// TestFirewallBlockerQueueDropCounter 验证队列溢出降级路径的计数语义：
-// 仅在 enabled && windows 时 block 才可能入队；禁用态下 queueDrop 恒为 0。
-func TestFirewallBlockerQueueDropCounter(t *testing.T) {
-	fb := NewFirewallBlocker(false, 30, nil, nil)
-	fb.block("2.2.2.2", "unit-test")
-	if fb.queueDrop.Load() != 0 {
-		t.Fatalf("禁用态不应有队列溢出, got %d", fb.queueDrop.Load())
+// TestChunkIPs 验证批量规则切分：每批 ≤ size、总数正确、边界正确。
+func TestChunkIPs(t *testing.T) {
+	ips := make([]string, 0, 130)
+	for i := 0; i < 130; i++ {
+		ips = append(ips, "10.0.0.%d")
 	}
-	_ = runtime.GOOS // 保持包级引用，避免误删
+	got := chunkIPs(ips, 50)
+	if len(got) != 3 {
+		t.Fatalf("期望 3 批, got %d", len(got))
+	}
+	if len(got[0]) != 50 || len(got[1]) != 50 || len(got[2]) != 30 {
+		t.Fatalf("批次大小错误: %d/%d/%d", len(got[0]), len(got[1]), len(got[2]))
+	}
+	// 空列表 → 0 批
+	if got := chunkIPs(nil, 50); len(got) != 0 {
+		t.Fatalf("空列表应返回 0 批, got %d", len(got))
+	}
+	// size<=0 → 回退默认
+	if got := chunkIPs(ips[:1], 0); len(got) != 1 || len(got[0]) != 1 {
+		t.Fatalf("size<=0 回退默认失败: %v", got)
+	}
+	// 顺序保持
+	one := chunkIPs(ips[:3], 2)
+	if !reflect.DeepEqual(one[0], ips[:2]) || !reflect.DeepEqual(one[1], ips[2:3]) {
+		t.Fatalf("顺序未保持: %v", one)
+	}
+}
+
+// TestFirewallBlockerMaxBlocked 验证拉黑总量上限：超限拒绝且不计数。
+// 手工构造 enabled=true 但不启动 syncLoop（block 不触碰 netsh，安全）。
+func TestFirewallBlockerMaxBlocked(t *testing.T) {
+	fb := &FirewallBlocker{
+		blockedIPs: make(map[string]time.Time),
+		enabled:    true,
+		maxBlocked: 4,
+	}
+	for i := 1; i <= 5; i++ {
+		fb.block(fmt.Sprintf("1.0.0.%d", i), "unit-test")
+	}
+	if n := fb.blockCount; n != 4 {
+		t.Fatalf("超限应拒绝第 5 个, blockCount=%d", n)
+	}
+	if _, ok := fb.blockedIPs["1.0.0.5"]; ok {
+		t.Fatal("超限 IP 不应进入内存态")
+	}
 }

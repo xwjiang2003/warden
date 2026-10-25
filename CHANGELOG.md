@@ -21,10 +21,23 @@
   - **产品建议与 Windows 一致：默认关闭、不建议在小型个人部署启用**；企业级 Linux
     网关场景可开启，配合灰名单递进作为纵深防御。
 
+- **存储层数据库兼容（v1.3.0 F17）**：SQLite → 可插拔 sqlite/mysql/postgres：
+  - 新增 `internal/sqlutil` 方言层：占位符（PG `$N`）、UPSERT（sqlite `INSERT OR REPLACE` /
+    mysql `REPLACE INTO` / pg `ON CONFLICT DO UPDATE`）、自增主键 DDL 自动适配；
+  - 五个存储（config/rules、attack_log、trusted_ip、grey_ip、firewall_block）全部按
+    `Open(driver, dsn)` 方言签名重构；SQLite 保留 `busy_timeout+WAL+SetMaxOpenConns(1)`，
+    MySQL/PG 用默认连接池；
+  - 新增 `store` 配置块（`store.driver` / `store.dsn`，默认 sqlite/`data/warden.db`）；
+    main 启动逻辑：先以默认库加载并迁移 config.json/rules，若配置了 mysql/postgres 再从
+    目标库二次加载覆盖（配置与规则均「DB 优先」语义不变）；
+  - 建表 SQL 全部方言自适应（主键列统一 `VARCHAR(255)`，规避 MySQL TEXT 不能作 PK）；
+  - 新增方言单测（Placeholders / Upsert / AutoIncPK）；全量回归通过；
+  - docker-compose.yml 提供 MySQL 8.4 / PostgreSQL 16 外部存储示例（含 warden 配置片段）。
+
 ### 规划中
 
 - v1.3.0 后续：Prometheus 指标 / 攻击报表 / 审计日志 / 告警模板 / 调参向导；
-  存储层数据库兼容（MySQL/PG 可选，F17）。
+  迁移工具（SQLite 全量历史数据 → MySQL/PG，当前仅配置与规则自动迁移、临时状态冷启动）。
 
 ## [1.2.0] - 2026-10-25
 

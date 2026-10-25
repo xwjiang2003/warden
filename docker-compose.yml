@@ -19,6 +19,10 @@
 #
 # 管理后台默认不映射端口（安全默认：默认无密码认证）；
 # 需要从宿主机访问时取消下方 9090 映射注释，并务必先设置 admin.password。
+#
+# 存储后端（v1.3.0 F17 起）：默认 SQLite（单文件，零依赖）。
+# 多实例/企业部署可选 MySQL 或 PostgreSQL——取消下方 mysql 或 postgres 服务注释，
+# 并在 docker/config.json 配置 store 块（见文件内示例）。
 # ============================================================
 
 services:
@@ -66,3 +70,51 @@ volumes:
   warden-rules:
   warden-data:
   warden-logs:
+
+# ---- 可选存储后端（v1.3.0 F17）----
+# 需要 MySQL 时取消注释，并把 warden 环境改为依赖本服务：
+#   warden:
+#     depends_on:
+#       - mysql
+#   docker/config.json 中 store 配置：
+#     "store": {"driver": "mysql", "dsn": "warden:warden_pass@tcp(mysql:3306)/warden?charset=utf8mb4&parseTime=true"}
+# 首次启动 warden 会自动建表并从 config.json/rules 迁移配置与规则。
+#  services:
+#   mysql:
+#     image: mysql:8.4
+#     restart: unless-stopped
+#     environment:
+#       MYSQL_ROOT_PASSWORD: root_pass
+#       MYSQL_DATABASE: warden
+#       MYSQL_USER: warden
+#       MYSQL_PASSWORD: warden_pass
+#     volumes:
+#       - mysql-data:/var/lib/mysql
+#     healthcheck:
+#       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot_pass"]
+#       interval: 10s
+#       timeout: 3s
+#       retries: 10
+#
+# 需要 PostgreSQL 时同理：
+#   services:
+#   postgres:
+#     image: postgres:16-alpine
+#     restart: unless-stopped
+#     environment:
+#       POSTGRES_DB: warden
+#       POSTGRES_USER: warden
+#       POSTGRES_PASSWORD: warden_pass
+#     volumes:
+#       - pg-data:/var/lib/postgresql/data
+#     healthcheck:
+#       test: ["CMD-SHELL", "pg_isready -U warden -d warden"]
+#       interval: 10s
+#       timeout: 3s
+#       retries: 10
+#   docker/config.json 中 store 配置：
+#     "store": {"driver": "postgres", "dsn": "postgres://warden:warden_pass@postgres:5432/warden?sslmode=disable"}
+#
+# volumes:
+#   mysql-data:
+#   pg-data:

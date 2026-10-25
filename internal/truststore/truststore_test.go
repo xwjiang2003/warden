@@ -8,7 +8,7 @@ import (
 )
 
 func TestUpsertListDelete(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	s, err := Open("sqlite", filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

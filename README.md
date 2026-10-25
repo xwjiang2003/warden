@@ -214,13 +214,32 @@ X-Forwarded-For 是客户端可自填的头，所以 warden 用「可信代理�
 
 | 数据 | 存储 | 说明 |
 |---|---|---|
-| 运行配置 | SQLite `config` 表 → 回退 `config.json` | DB 优先，管理后台改配置写 DB |
-| 攻击日志 | SQLite `attack_log` 表 | 批量事务写入 + 按天清理 |
-| 可信 IP | SQLite `trusted_ip` 表 | 重启后恢复 |
-| 防火墙封禁 | SQLite `firewall_block` 表 | 重启后恢复 + 清理孤儿规则 |
+| 运行配置 | `config` 表 → 回退 `config.json` | DB 优先，管理后台改配置写 DB |
+| 攻击日志 | `attack_log` 表 | 批量事务写入 + 按天清理 |
+| 可信 IP | `trusted_ip` 表 | 重启后恢复 |
+| 防火墙封禁 | `firewall_block` 表 | 重启后恢复 + 清理孤儿规则 |
 
-> 所有 SQLite 访问统一使用 `busy_timeout=5000` + `WAL` + `sqlutil.Retry`（忙时退避重试），
-> 避免多连接并发写导致的 `SQLITE_BUSY` 丢数据。
+**存储后端可选（v1.3.0 F17）**：默认 SQLite（纯 Go 实现、零依赖、单文件 `data/warden.db`，备份即拷贝）；
+也可通过 `config.json` 的 `store` 块切换 MySQL / PostgreSQL（面向多实例 / 企业部署，需自行准备数据库服务）：
+
+```json
+"store": {
+  "driver": "sqlite",
+  "dsn": ""
+}
+```
+
+- `driver`：`sqlite`（默认）| `mysql` | `postgres`；
+- `dsn`：sqlite 为文件路径（空 = `data/warden.db`，相对可执行目录）；mysql 例
+  `warden:pass@tcp(127.0.0.1:3306)/warden?charset=utf8mb4&parseTime=true`；
+  postgres 例 `postgres://warden:pass@127.0.0.1:5432/warden?sslmode=disable`。
+- 首次启动自动建表（方言自适应：占位符 / UPSERT / 自增主键），并把 `config.json` 与
+  `rules_file` 迁移入库（既有「DB 优先」语义不变）；历史 SQLite 中的可信 IP / 灰名单 /
+  封禁 / 攻击日志为 TTL 临时数据，切换后端后冷启动即可，无需迁移。
+- Docker 部署：取消 `docker-compose.yml` 中 mysql / postgres 服务注释即可（含完整示例）。
+
+> SQLite 访问统一使用 `busy_timeout=5000` + `WAL` + `sqlutil.Retry`（忙时退避重试），
+> 避免多连接并发写导致的 `SQLITE_BUSY` 丢数据；MySQL/PG 使用默认连接池（天然并发）。
 
 ---
 
@@ -245,7 +264,7 @@ warden/
 │   ├── attacklog/         # 攻击日志（批量写入 + 保留期清理）
 │   ├── truststore/        # 可信 IP 持久化
 │   ├── fwstore/           # 防火墙封禁记录持久化
-│   ├── sqlutil/           # SQLite 忙重试工具
+│   ├── sqlutil/           # 存储方言（SQLite/MySQL/PG 占位符、UPSERT、自增主键）+ 忙重试
 │   ├── admin/             # 管理后台 HTTP API（/api/*）
 │   ├── metrics/           # 原子计数器指标
 │   ├── accesslog/         # 访问日志与轮转

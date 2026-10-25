@@ -5,11 +5,7 @@ package fwstore
 import (
 	"database/sql"
 	"log"
-	"os"
-	"path/filepath"
 	"time"
-
-	_ "modernc.org/sqlite"
 
 	"warden/internal/sqlutil"
 )
@@ -23,39 +19,29 @@ type Block struct {
 
 // Store 拉黑持久化（与 warden.db 共用文件，独立连接）。
 type Store struct {
-	db *sql.DB
+	db     *sql.DB
+	driver string
 }
 
-// Open 打开数据库并建表；dbPath 为空时返回 nil（不启用持久化）。
-func Open(dbPath string) (*Store, error) {
-	if dbPath == "" {
+// Open 打开数据库并建表；driver 为 sqlite（默认）/mysql/postgres，dsn 为空时禁用持久化。
+func Open(driver, dsn string) (*Store, error) {
+	if dsn == "" {
 		return nil, nil
 	}
-	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return nil, err
-		}
-	}
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sqlutil.Open(driver, dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
-		log.Printf("[fwstore] 设置 busy_timeout 失败: %v", err)
-	}
-	if _, err := db.Exec(`PRAGMA journal_mode = WAL`); err != nil {
-		log.Printf("[fwstore] 设置 WAL 失败: %v", err)
-	}
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS firewall_block (
-		ip TEXT PRIMARY KEY,
+	d := sqlutil.DialectFor(driver)
+	if _, err := db.Exec(d.Placeholders(`CREATE TABLE IF NOT EXISTS firewall_block (
+		ip VARCHAR(255) PRIMARY KEY,
 		reason TEXT NOT NULL,
 		blocked_at TEXT NOT NULL
-	)`); err != nil {
+	)`)); err != nil {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, driver: driver}, nil
 }
 
 // Save 保存（或覆盖）一条拉黑记录。
@@ -63,8 +49,9 @@ func (s *Store) Save(ip, reason string, blockedAt time.Time) {
 	if s == nil || s.db == nil {
 		return
 	}
+	d := sqlutil.DialectFor(s.driver)
 	err := sqlutil.Retry(func() error {
-		_, err := s.db.Exec(`INSERT OR REPLACE INTO firewall_block (ip, reason, blocked_at) VALUES (?,?,?)`,
+		_, err := s.db.Exec(d.Upsert("firewall_block", []string{"ip", "reason", "blocked_at"}, []string{"ip"}),
 			ip, reason, blockedAt.Format(time.RFC3339))
 		return err
 	})
@@ -78,8 +65,9 @@ func (s *Store) Delete(ip string) {
 	if s == nil || s.db == nil {
 		return
 	}
+	d := sqlutil.DialectFor(s.driver)
 	err := sqlutil.Retry(func() error {
-		_, err := s.db.Exec(`DELETE FROM firewall_block WHERE ip = ?`, ip)
+		_, err := s.db.Exec(d.Placeholders(`DELETE FROM firewall_block WHERE ip = ?`), ip)
 		return err
 	})
 	if err != nil {

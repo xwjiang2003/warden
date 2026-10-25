@@ -23,7 +23,7 @@ SecRule REQUEST_URI "@rx ^/admin" "id:1001,phase:1,deny,status:403,msg:'block ad
 func newRulesTestServer(t *testing.T) (*Server, string, *waf.Holder) {
 	t.Helper()
 	cfg := &config.Config{Listen: ":81", Backend: "http://127.0.0.1:8002"}
-	s := NewServer(cfg, "config.json", "", config.AdminConfig{})
+	s := NewServer(cfg, "config.json", "sqlite", "", config.AdminConfig{})
 
 	dbPath := filepath.Join(t.TempDir(), "rules.db")
 	wr := &config.WAFRulesConfig{}
@@ -40,7 +40,7 @@ func newRulesTestServer(t *testing.T) (*Server, string, *waf.Holder) {
 	}
 	holder.SetEngine(engine)
 
-	s.SetRuleRepo(dbPath, wr, holder)
+	s.SetRuleRepo("sqlite", dbPath, wr, holder)
 	return s, dbPath, holder
 }
 
@@ -89,7 +89,7 @@ SecRule REQUEST_URI "@rx ^/api" "id:1002,phase:1,deny,status:403,msg:'block api'
 	}
 
 	// 落库验证
-	conf, ok, err := store.LoadRule(dbPath, store.KeyCorazaConf)
+	conf, ok, err := store.LoadRule("sqlite", dbPath, store.KeyCorazaConf)
 	if err != nil || !ok {
 		t.Fatalf("规则应已入库（ok=%v err=%v）", ok, err)
 	}
@@ -133,7 +133,7 @@ func TestHandlePutRulesInvalid(t *testing.T) {
 	}
 
 	// 未落库
-	if _, ok, _ := store.LoadRule(dbPath, store.KeyCorazaConf); ok {
+	if _, ok, _ := store.LoadRule("sqlite", dbPath, store.KeyCorazaConf); ok {
 		t.Fatal("非法规则不应落库")
 	}
 	// 引擎未切换：/admin 仍被原引擎拦截

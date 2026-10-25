@@ -17,7 +17,7 @@ import (
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	cfg := &config.Config{Listen: ":81", Backend: "http://127.0.0.1:8002"}
-	return NewServer(cfg, "config.json", "", config.AdminConfig{})
+	return NewServer(cfg, "config.json", "sqlite", "", config.AdminConfig{})
 }
 
 func getJSON(t *testing.T, h http.HandlerFunc, path string) map[string]interface{} {
@@ -136,10 +136,10 @@ func TestPutConfigRejectsBadTrustedProxies(t *testing.T) {
 	dbPath := filepath.Join(dir, "warden.db")
 
 	cfg := &config.Config{Listen: ":81", Backend: "http://127.0.0.1:8002"}
-	if err := store.Save(cfgPath, dbPath, cfg); err != nil {
+	if err := store.Save(cfgPath, "sqlite", dbPath, cfg); err != nil {
 		t.Fatalf("预置配置失败: %v", err)
 	}
-	s := NewServer(cfg, cfgPath, dbPath, config.AdminConfig{})
+	s := NewServer(cfg, cfgPath, "sqlite", dbPath, config.AdminConfig{})
 
 	body := `{"listen":":81","backend":"http://127.0.0.1:8002","trusted_proxies":["0.0.0.0/0"]}`
 	rec := httptest.NewRecorder()
@@ -164,7 +164,7 @@ func TestPutConfigRejectsBadTrustedProxies(t *testing.T) {
 	}
 
 	// 重新加载 DB，确认确实持久化了（而不是只改了内存）
-	reloaded, err := store.Load(cfgPath, dbPath)
+	reloaded, err := store.Load(cfgPath, "sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("重新加载配置失败: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestHandleGreyIPs(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "warden.db")
 	cfg := &config.Config{Listen: ":81", Backend: "http://127.0.0.1:8002"}
-	s := NewServer(cfg, "config.json", dbPath, config.AdminConfig{})
+	s := NewServer(cfg, "config.json", "sqlite", dbPath, config.AdminConfig{})
 
 	// 1) 未注入 store：空列表而非 503/500
 	m := getJSON(t, s.handleGreyIPs, "/api/grey_ips")
@@ -193,7 +193,7 @@ func TestHandleGreyIPs(t *testing.T) {
 	}
 
 	// 2) 注入 store 后：写入两条再查询
-	gstore, err := greyliststore.Open(dbPath)
+	gstore, err := greyliststore.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("open greyliststore: %v", err)
 	}

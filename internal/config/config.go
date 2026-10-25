@@ -23,6 +23,17 @@ func normalizeChallengeKind(v, def string) string {
 	return def
 }
 
+// StoreConfig 存储后端（v1.3.0 F17 起支持 MySQL/PG 可选）。
+// SQLite 为默认与首选（零依赖、单文件、备份即拷贝）；MySQL/PG 面向多实例/企业部署。
+type StoreConfig struct {
+	// Driver 数据库驱动：sqlite（默认）| mysql | postgres
+	Driver string `json:"driver"`
+	// DSN 连接串：sqlite 为文件路径（默认 data/warden.db）；
+	// mysql 例：user:pass@tcp(127.0.0.1:3306)/warden?charset=utf8mb4&parseTime=true；
+	// postgres 例：postgres://user:pass@127.0.0.1:5432/warden?sslmode=disable
+	DSN string `json:"dsn"`
+}
+
 // Config 顶层配置
 type Config struct {
 	Listen              string                `json:"listen"`
@@ -49,6 +60,7 @@ type Config struct {
 	URLAllowlist        []string              `json:"url_allowlist"`
 	URLBlocklist        []string              `json:"url_blocklist"`
 	BlockPage           string                `json:"block_page"` // 自定义拦截页面 HTML
+	Store               StoreConfig           `json:"store"`
 	// TrustedProxies 可信反向代理地址（CIDR 或单个 IP）。
 	// 只有来自这些地址的请求，其 X-Forwarded-For / X-Real-IP 才会被采信。
 	TrustedProxies []string `json:"trusted_proxies"`

@@ -5,11 +5,7 @@ package truststore
 import (
 	"database/sql"
 	"log"
-	"os"
-	"path/filepath"
 	"time"
-
-	_ "modernc.org/sqlite"
 
 	"warden/internal/sqlutil"
 )
@@ -23,42 +19,32 @@ type Entry struct {
 
 // Store 可信 IP 持久化（与 warden.db 共用文件，独立连接）。
 type Store struct {
-	db *sql.DB
+	db     *sql.DB
+	driver string
 }
 
-// Open 打开数据库并建表；dbPath 为空时返回 nil（不启用持久化）。
-func Open(dbPath string) (*Store, error) {
-	if dbPath == "" {
+// Open 打开数据库并建表；driver 为 sqlite（默认）/mysql/postgres，dsn 为空时禁用持久化。
+func Open(driver, dsn string) (*Store, error) {
+	if dsn == "" {
 		return nil, nil
 	}
-	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return nil, err
-		}
-	}
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sqlutil.Open(driver, dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
-		log.Printf("[truststore] 设置 busy_timeout 失败: %v", err)
-	}
-	if _, err := db.Exec(`PRAGMA journal_mode = WAL`); err != nil {
-		log.Printf("[truststore] 设置 WAL 失败: %v", err)
-	}
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS trusted_ip (
-		ip TEXT PRIMARY KEY,
+	d := sqlutil.DialectFor(driver)
+	if _, err := db.Exec(d.Placeholders(`CREATE TABLE IF NOT EXISTS trusted_ip (
+		ip VARCHAR(255) PRIMARY KEY,
 		reason TEXT NOT NULL,
 		since TEXT NOT NULL
-	)`); err != nil {
+	)`)); err != nil {
 		db.Close()
 		return nil, err
 	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_trusted_ip_since ON trusted_ip(since)`); err != nil {
+	if _, err := db.Exec(d.Placeholders(`CREATE INDEX IF NOT EXISTS idx_trusted_ip_since ON trusted_ip(since)`)); err != nil {
 		log.Printf("[truststore] 建索引失败: %v", err)
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, driver: driver}, nil
 }
 
 // Upsert 保存（或覆盖）一条可信 IP 记录。
@@ -66,8 +52,9 @@ func (s *Store) Upsert(ip, reason string, since time.Time) {
 	if s == nil || s.db == nil {
 		return
 	}
+	d := sqlutil.DialectFor(s.driver)
 	err := sqlutil.Retry(func() error {
-		_, err := s.db.Exec(`INSERT OR REPLACE INTO trusted_ip (ip, reason, since) VALUES (?,?,?)`,
+		_, err := s.db.Exec(d.Upsert("trusted_ip", []string{"ip", "reason", "since"}, []string{"ip"}),
 			ip, reason, since.Format(time.RFC3339))
 		return err
 	})
@@ -81,8 +68,9 @@ func (s *Store) Delete(ip string) {
 	if s == nil || s.db == nil {
 		return
 	}
+	d := sqlutil.DialectFor(s.driver)
 	err := sqlutil.Retry(func() error {
-		_, err := s.db.Exec(`DELETE FROM trusted_ip WHERE ip = ?`, ip)
+		_, err := s.db.Exec(d.Placeholders(`DELETE FROM trusted_ip WHERE ip = ?`), ip)
 		return err
 	})
 	if err != nil {
@@ -95,7 +83,8 @@ func (s *Store) DeleteBefore(before time.Time) int {
 	if s == nil || s.db == nil {
 		return 0
 	}
-	res, err := s.db.Exec(`DELETE FROM trusted_ip WHERE since < ?`, before.Format(time.RFC3339))
+	d := sqlutil.DialectFor(s.driver)
+	res, err := s.db.Exec(d.Placeholders(`DELETE FROM trusted_ip WHERE since < ?`), before.Format(time.RFC3339))
 	if err != nil {
 		log.Printf("[truststore] 清理过期可信 IP 失败: %v", err)
 		return 0
@@ -135,12 +124,13 @@ func (s *Store) List(offset, limit int) ([]Entry, int) {
 	if s == nil || s.db == nil {
 		return nil, 0
 	}
+	d := sqlutil.DialectFor(s.driver)
 	var total int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM trusted_ip`).Scan(&total); err != nil {
+	if err := s.db.QueryRow(d.Placeholders(`SELECT COUNT(*) FROM trusted_ip`)).Scan(&total); err != nil {
 		log.Printf("[truststore] 统计可信 IP 失败: %v", err)
 		return nil, 0
 	}
-	rows, err := s.db.Query(`SELECT ip, reason, since FROM trusted_ip ORDER BY since DESC LIMIT ? OFFSET ?`, limit, offset)
+	rows, err := s.db.Query(d.Placeholders(`SELECT ip, reason, since FROM trusted_ip ORDER BY since DESC LIMIT ? OFFSET ?`), limit, offset)
 	if err != nil {
 		log.Printf("[truststore] 分页查询可信 IP 失败: %v", err)
 		return nil, total

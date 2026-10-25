@@ -3,12 +3,8 @@ package attacklog
 import (
 	"database/sql"
 	"log"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
-
-	_ "modernc.org/sqlite"
 
 	"warden/internal/sqlutil"
 )
@@ -29,52 +25,44 @@ var (
 	mu         sync.Mutex
 	events     []Event
 	db         *sql.DB
+	dialect    sqlutil.Dialect
 	ch         = make(chan Event, 2000)
 	retainDays = 90 // 攻击日志保留天数
 )
 
-// Init 打开 SQLite、启动异步写入协程与定期清理。
+// Init 打开数据库、启动异步写入协程与定期清理。
+// driver 为 sqlite（默认）/mysql/postgres；dsn 为空时不启用持久化。
 // days 为攻击日志保留天数；<=0 时使用默认 90 天。
-func Init(dbPath string, days int) {
-	if dbPath == "" {
+func Init(driver, dsn string, days int) {
+	if dsn == "" {
 		return
 	}
 	if days > 0 {
 		retainDays = days
 	}
-	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
-		_ = os.MkdirAll(dir, 0755)
-	}
-	d, err := sql.Open("sqlite", dbPath)
+	d, err := sqlutil.Open(driver, dsn)
 	if err != nil {
 		log.Printf("[attacklog] 打开数据库失败: %v", err)
 		return
 	}
-	d.SetMaxOpenConns(1)
-	// 与配置表共用同一 DB 文件，设置 busy_timeout 避免并发写触发 SQLITE_BUSY
-	if _, err := d.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
-		log.Printf("[attacklog] 设置 busy_timeout 失败: %v", err)
-	}
-	if _, err := d.Exec(`PRAGMA journal_mode = WAL`); err != nil {
-		log.Printf("[attacklog] 设置 WAL 失败: %v", err)
-	}
-	if _, err := d.Exec(`CREATE TABLE IF NOT EXISTS attack_log (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+	dialect = sqlutil.DialectFor(driver)
+	if _, err := d.Exec(dialect.Placeholders(`CREATE TABLE IF NOT EXISTS attack_log (
+		id ` + dialect.AutoIncPK() + `,
 		time TEXT NOT NULL,
 		ip TEXT, host TEXT, path TEXT, category TEXT, detail TEXT
-	)`); err != nil {
+	)`)); err != nil {
 		log.Printf("[attacklog] 建表失败: %v", err)
 		d.Close()
 		return
 	}
-	if _, err := d.Exec(`CREATE INDEX IF NOT EXISTS idx_attack_log_time ON attack_log(time)`); err != nil {
+	if _, err := d.Exec(dialect.Placeholders(`CREATE INDEX IF NOT EXISTS idx_attack_log_time ON attack_log(time)`)); err != nil {
 		log.Printf("[attacklog] 建索引失败: %v", err)
 	}
 	db = d
 	go writer()
 	go pruner()
 	prune()
-	log.Printf("[attacklog] 已启用，保留 %d 天", retainDays)
+	log.Printf("[attacklog] 已启用，保留 %d 天 (driver=%s)", retainDays, driver)
 }
 
 // Record 记录一条攻击事件（非阻塞）
@@ -164,7 +152,7 @@ func writeBatch(events []Event) {
 			return err
 		}
 		defer tx.Rollback()
-		stmt, err := tx.Prepare(`INSERT INTO attack_log (time, ip, host, path, category, detail) VALUES (?,?,?,?,?,?)`)
+		stmt, err := tx.Prepare(dialect.Placeholders(`INSERT INTO attack_log (time, ip, host, path, category, detail) VALUES (?,?,?,?,?,?)`))
 		if err != nil {
 			return err
 		}
@@ -196,7 +184,7 @@ func prune() {
 		return
 	}
 	cutoff := time.Now().AddDate(0, 0, -retainDays).Format("2006-01-02 15:04:05")
-	res, err := db.Exec(`DELETE FROM attack_log WHERE time < ?`, cutoff)
+	res, err := db.Exec(dialect.Placeholders(`DELETE FROM attack_log WHERE time < ?`), cutoff)
 	if err != nil {
 		log.Printf("[attacklog] 清理过期日志失败: %v", err)
 		return

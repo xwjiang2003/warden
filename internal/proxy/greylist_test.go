@@ -149,7 +149,7 @@ func TestGreyListDisabled(t *testing.T) {
 func TestGreyStoreRoundtrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "grey.db")
-	s, err := greyliststore.Open(path)
+	s, err := greyliststore.Open("sqlite", path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestGreyStoreRoundtrip(t *testing.T) {
 func TestGreyListPersistRestore(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "grey.db")
-	s, err := greyliststore.Open(path)
+	s, err := greyliststore.Open("sqlite", path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestGreyListPersistRestore(t *testing.T) {
 	s.Upsert("9.9.9.11", greyliststore.StateHard, 0, now.Add(-time.Second), now, 2)
 	s.Close()
 
-	s2, err := greyliststore.Open(path)
+	s2, err := greyliststore.Open("sqlite", path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

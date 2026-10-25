@@ -25,11 +25,11 @@ import (
 	"warden/internal/blockpage"
 	"warden/internal/config"
 	"warden/internal/fwstore"
+	"warden/internal/greyliststore"
 	"warden/internal/metrics"
 	"warden/internal/proxy"
 	"warden/internal/router"
 	"warden/internal/store"
-	"warden/internal/greyliststore"
 	"warden/internal/truststore"
 	"warden/internal/util"
 	"warden/internal/waf"
@@ -55,12 +55,33 @@ func main() {
 		cfgPath = filepath.Join(exeDir, cfgPath)
 	}
 
-	dbPath := filepath.Join(exeDir, store.DefaultDBPath)
-	cfg, err := store.Load(cfgPath, dbPath)
+	// 存储后端（F17）：默认 sqlite（data/warden.db，相对可执行目录）。
+	// 首次启动先以默认库加载：自动从 config.json 迁移配置与规则入库；
+	// 若 config.json 配置了 store.driver=mysql/postgres，则再从目标库二次加载覆盖。
+	dbDriver := "sqlite"
+	dbDSN := filepath.Join(exeDir, store.DefaultDBPath)
+	cfg, err := store.Load(cfgPath, dbDriver, dbDSN)
 	if err != nil {
 		fatalStartup(exeDir, "config: %v", err)
 	}
-	attacklog.Init(dbPath, cfg.AttackLogRetainDays)
+	if sd := cfg.Store; sd.Driver != "" && sd.Driver != "sqlite" {
+		dbDriver = sd.Driver
+		dbDSN = sd.DSN
+		if dbDSN == "" {
+			fatalStartup(exeDir, "store.dsn 不能为空（driver=%s）", dbDriver)
+		}
+		cfg, err = store.Load(cfgPath, dbDriver, dbDSN)
+		if err != nil {
+			fatalStartup(exeDir, "config(%s): %v", dbDriver, err)
+		}
+	} else if sd.DSN != "" {
+		// sqlite 自定义文件路径：相对路径视为相对可执行目录
+		dbDSN = sd.DSN
+		if !filepath.IsAbs(dbDSN) {
+			dbDSN = filepath.Join(exeDir, dbDSN)
+		}
+	}
+	attacklog.Init(dbDriver, dbDSN, cfg.AttackLogRetainDays)
 	blockpage.Set(cfg.BlockPage)
 
 	// 真实客户端 IP 解析必须在使用任何 IP 的中间件之前配置好：
@@ -78,7 +99,7 @@ func main() {
 		log.Printf("trusted_proxies: 未配置且 trust_local_proxy=false，客户端 IP 一律取直连对端地址（忽略 XFF/X-Real-IP）")
 	}
 
-	adminSrv := admin.NewServer(cfg, cfgPath, dbPath, cfg.Admin)
+	adminSrv := admin.NewServer(cfg, cfgPath, dbDriver, dbDSN, cfg.Admin)
 	adminSrv.Start()
 
 	// 诊断用 pprof 端点：默认关闭，仅 WARDEN_PPROF 设置时启动，且强制绑回环。
@@ -100,7 +121,7 @@ func main() {
 
 	// 规则加载：DB 优先（管理后台在线编辑生效）；首次启动自动从文件迁移入库。
 	// 之后通过 Holder 支持热更新，无需重启。
-	wafEngine, err := waf.LoadOrBuildEngine(dbPath, rulesPath, &cfg.WAFRules)
+	wafEngine, err := waf.LoadOrBuildEngine(dbDriver, dbDSN, rulesPath, &cfg.WAFRules)
 	if err != nil {
 		fatalStartup(exeDir, "waf: %v", err)
 	}
@@ -123,21 +144,21 @@ func main() {
 	})
 	cfg.ConnLimit.Normalize()
 	cfg.FirewallBlock.Normalize()
-	fwStore, fwErr := fwstore.Open(dbPath)
+	fwStore, fwErr := fwstore.Open(dbDriver, dbDSN)
 	if fwErr != nil {
 		log.Printf("[firewall] 打开拉黑持久化失败(%v)，拉黑将不持久化", fwErr)
 	}
 	if fwStore != nil {
 		defer fwStore.Close()
 	}
-	trustStore, trustErr := truststore.Open(dbPath)
+	trustStore, trustErr := truststore.Open(dbDriver, dbDSN)
 	if trustErr != nil {
 		log.Printf("[truststore] 打开可信IP持久化失败(%v)，可信IP将不持久化", trustErr)
 	}
 	if trustStore != nil {
 		defer trustStore.Close()
 	}
-	greyStore, greyErr := greyliststore.Open(dbPath)
+	greyStore, greyErr := greyliststore.Open(dbDriver, dbDSN)
 	if greyErr != nil {
 		log.Printf("[greyliststore] 打开灰名单持久化失败(%v)，灰名单将不持久化", greyErr)
 	}
@@ -157,7 +178,7 @@ func main() {
 	ccDef = proxy.NewCCDefense(cfg.CCDefense, cfg.IPCheck, fwBlocker, handler, trustStore, greyStore)
 	adminSrv.SetTrustStore(trustStore)
 	adminSrv.SetGreyStore(greyStore)
-	adminSrv.SetRuleRepo(dbPath, &cfg.WAFRules, wafHolder)
+	adminSrv.SetRuleRepo(dbDriver, dbDSN, &cfg.WAFRules, wafHolder)
 	whitelist := proxy.NewIPWhitelist(cfg.IPWhitelist.CIDRs)
 	blocklist := proxy.NewIPWhitelist(cfg.IPBlacklist.CIDRs)
 	mux.Handle("/", proxy.BlocklistMiddleware(blocklist, cfg.IPBlacklist.Enabled,

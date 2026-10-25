@@ -17,7 +17,7 @@ func TestRuleCRUD(t *testing.T) {
 	dbPath := tempDB(t)
 
 	// 1) 无记录 → ok=false
-	_, ok, err := LoadRule(dbPath, KeyCorazaConf)
+	_, ok, err := LoadRule("sqlite", dbPath, KeyCorazaConf)
 	if err != nil {
 		t.Fatalf("LoadRule 空库报错: %v", err)
 	}
@@ -27,10 +27,10 @@ func TestRuleCRUD(t *testing.T) {
 
 	// 2) 写入后读取
 	text := "SecRuleEngine On\n"
-	if err := SaveRule(dbPath, KeyCorazaConf, text); err != nil {
+	if err := SaveRule("sqlite", dbPath, KeyCorazaConf, text); err != nil {
 		t.Fatalf("SaveRule: %v", err)
 	}
-	got, ok, err := LoadRule(dbPath, KeyCorazaConf)
+	got, ok, err := LoadRule("sqlite", dbPath, KeyCorazaConf)
 	if err != nil || !ok {
 		t.Fatalf("写入后应可读取（ok=%v err=%v）", ok, err)
 	}
@@ -40,16 +40,16 @@ func TestRuleCRUD(t *testing.T) {
 
 	// 3) 覆盖（INSERT OR REPLACE）
 	text2 := "SecRuleEngine DetectionOnly\n"
-	if err := SaveRule(dbPath, KeyCorazaConf, text2); err != nil {
+	if err := SaveRule("sqlite", dbPath, KeyCorazaConf, text2); err != nil {
 		t.Fatalf("SaveRule 覆盖: %v", err)
 	}
-	got, _, _ = LoadRule(dbPath, KeyCorazaConf)
+	got, _, _ = LoadRule("sqlite", dbPath, KeyCorazaConf)
 	if got != text2 {
 		t.Fatalf("覆盖后内容应更新: got %q", got)
 	}
 
 	// 4) 不同 key 互不影响
-	if _, ok, _ := LoadRule(dbPath, KeyWAFRules); ok {
+	if _, ok, _ := LoadRule("sqlite", dbPath, KeyWAFRules); ok {
 		t.Fatal("waf_rules 不应被 coraza.conf 的写入影响")
 	}
 }
@@ -57,10 +57,10 @@ func TestRuleCRUD(t *testing.T) {
 // TestRulePersistenceAcrossOpen 验证跨连接持久化（每次 openDB 后数据仍在）。
 func TestRulePersistenceAcrossOpen(t *testing.T) {
 	dbPath := tempDB(t)
-	if err := SaveRule(dbPath, KeyWAFRules, `{"block_script_ua":true}`); err != nil {
+	if err := SaveRule("sqlite", dbPath, KeyWAFRules, `{"block_script_ua":true}`); err != nil {
 		t.Fatalf("SaveRule: %v", err)
 	}
-	got, ok, err := LoadRule(dbPath, KeyWAFRules)
+	got, ok, err := LoadRule("sqlite", dbPath, KeyWAFRules)
 	if err != nil || !ok {
 		t.Fatalf("重新打开后应读到记录（ok=%v err=%v）", ok, err)
 	}

@@ -103,5 +103,9 @@
     "password": ""
   },
   "trusted_proxies": [],
-  "trust_local_proxy": false
+  "trust_local_proxy": false,
+  "store": {
+    "driver": "sqlite",
+    "dsn": ""
+  }
 }

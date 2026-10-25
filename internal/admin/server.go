@@ -35,7 +35,8 @@ import (
 type Server struct {
 	cfg           *config.Config
 	cfgPath       string
-	dbPath        string
+	dbDriver      string
+	dbDSN         string
 	adminCfg      config.AdminConfig
 	startTime     time.Time
 	mux           *http.ServeMux
@@ -43,17 +44,19 @@ type Server struct {
 	greyStore     *greyliststore.Store
 	restartNeeded atomic.Bool // 保存配置后置位，重启进程后清零
 	// 规则在线管理（F3）：注入后 GET/PUT /api/rules 可用
-	ruleDBPath string
+	ruleDriver string
+	ruleDSN    string
 	wafRules   *config.WAFRulesConfig
 	holder     *waf.Holder
 }
 
-func NewServer(cfg *config.Config, cfgPath, dbPath string, adminCfg config.AdminConfig) *Server {
+func NewServer(cfg *config.Config, cfgPath, dbDriver, dbDSN string, adminCfg config.AdminConfig) *Server {
 	adminCfg.Normalize()
 	s := &Server{
 		cfg:       cfg,
 		cfgPath:   cfgPath,
-		dbPath:    dbPath,
+		dbDriver:  dbDriver,
+		dbDSN:     dbDSN,
 		adminCfg:  adminCfg,
 		startTime: time.Now(),
 		mux:       http.NewServeMux(),
@@ -225,7 +228,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := store.Save(s.cfgPath, s.dbPath, &newCfg); err != nil {
+	if err := store.Save(s.cfgPath, s.dbDriver, s.dbDSN, &newCfg); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "写入配置文件失败: " + err.Error(),
 		})
@@ -317,24 +320,25 @@ func (s *Server) SetGreyStore(store *greyliststore.Store) {
 	s.greyStore = store
 }
 
-// SetRuleRepo 注入规则仓库（F3 规则在线管理）：dbPath 为 SQLite 路径、
+// SetRuleRepo 注入规则仓库（F3 规则在线管理）：driver/dsn 指定规则库（sqlite/mysql/postgres）、
 // wr 指向进程内生效的 WAFRules 配置、holder 为热更新引擎容器。
 // main.go 启动时注入；未注入时 /api/rules 返回 503。
-func (s *Server) SetRuleRepo(dbPath string, wr *config.WAFRulesConfig, holder *waf.Holder) {
-	s.ruleDBPath = dbPath
+func (s *Server) SetRuleRepo(driver, dsn string, wr *config.WAFRulesConfig, holder *waf.Holder) {
+	s.ruleDriver = driver
+	s.ruleDSN = dsn
 	s.wafRules = wr
 	s.holder = holder
 }
 
 // handleGetRules 返回当前生效的规则（coraza.conf 文本 + waf_rules 结构化配置）。
 func (s *Server) handleGetRules(w http.ResponseWriter, r *http.Request) {
-	if s.holder == nil || s.wafRules == nil || s.ruleDBPath == "" {
+	if s.holder == nil || s.wafRules == nil || s.ruleDSN == "" {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "规则仓库未就绪（进程启动中）",
 		})
 		return
 	}
-	conf, _, _ := store.LoadRule(s.ruleDBPath, store.KeyCorazaConf)
+	conf, _, _ := store.LoadRule(s.ruleDriver, s.ruleDSN, store.KeyCorazaConf)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"coraza_conf":  conf,
 		"waf_rules":    s.wafRules,
@@ -346,7 +350,7 @@ func (s *Server) handleGetRules(w http.ResponseWriter, r *http.Request) {
 // handlePutRules 保存规则并热加载（无需重启）。
 // 保存前先编译验证：不合法 → 400 且不落库、不切换，保证线上引擎不被坏规则破坏。
 func (s *Server) handlePutRules(w http.ResponseWriter, r *http.Request) {
-	if s.holder == nil || s.wafRules == nil || s.ruleDBPath == "" {
+	if s.holder == nil || s.wafRules == nil || s.ruleDSN == "" {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "规则仓库未就绪（进程启动中）",
 		})
@@ -354,7 +358,7 @@ func (s *Server) handlePutRules(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		CorazaConf *string                `json:"coraza_conf"` // 缺省/空 = 保持现有
-		WAFRules   *config.WAFRulesConfig `json:"waf_rules"`  // 缺省 = 保持现有
+		WAFRules   *config.WAFRulesConfig `json:"waf_rules"`   // 缺省 = 保持现有
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
@@ -364,7 +368,7 @@ func (s *Server) handlePutRules(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 合并请求与当前生效内容
-	conf, _, _ := store.LoadRule(s.ruleDBPath, store.KeyCorazaConf)
+	conf, _, _ := store.LoadRule(s.ruleDriver, s.ruleDSN, store.KeyCorazaConf)
 	if req.CorazaConf != nil && *req.CorazaConf != "" {
 		conf = *req.CorazaConf
 	}
@@ -388,14 +392,14 @@ func (s *Server) handlePutRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := store.SaveRule(s.ruleDBPath, store.KeyCorazaConf, conf); err != nil {
+	if err := store.SaveRule(s.ruleDriver, s.ruleDSN, store.KeyCorazaConf, conf); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "规则保存失败: " + err.Error(),
 		})
 		return
 	}
 	wafRulesJSON, _ := json.Marshal(wr)
-	if err := store.SaveRule(s.ruleDBPath, store.KeyWAFRules, string(wafRulesJSON)); err != nil {
+	if err := store.SaveRule(s.ruleDriver, s.ruleDSN, store.KeyWAFRules, string(wafRulesJSON)); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "waf_rules 保存失败: " + err.Error(),
 		})

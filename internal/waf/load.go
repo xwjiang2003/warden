@@ -20,12 +20,13 @@ import (
 //  3. rules 表 waf_rules 有记录 → 覆盖 wr（动态规则同样可在线编辑）。
 //
 // 任何规则变更都必须先经 NewFromText 编译验证，成功后才落库/切换。
-func LoadOrBuildEngine(dbPath, rulesFile string, wr *config.WAFRulesConfig) (coraza.WAF, error) {
+// driver/dsn 指定规则库（sqlite/mysql/postgres）。
+func LoadOrBuildEngine(driver, dsn, rulesFile string, wr *config.WAFRulesConfig) (coraza.WAF, error) {
 	if wr == nil {
 		wr = &config.WAFRulesConfig{}
 	}
 	// 动态 waf_rules 在线覆盖
-	if js, ok, err := store.LoadRule(dbPath, store.KeyWAFRules); err == nil && ok {
+	if js, ok, err := store.LoadRule(driver, dsn, store.KeyWAFRules); err == nil && ok {
 		var wrDB config.WAFRulesConfig
 		if uerr := json.Unmarshal([]byte(js), &wrDB); uerr == nil {
 			*wr = wrDB
@@ -33,7 +34,7 @@ func LoadOrBuildEngine(dbPath, rulesFile string, wr *config.WAFRulesConfig) (cor
 		}
 	}
 	// Coraza 规则文本
-	rulesText, fromDB, err := loadRulesText(dbPath, rulesFile)
+	rulesText, fromDB, err := loadRulesText(driver, dsn, rulesFile)
 	if err != nil {
 		return nil, err
 	}
@@ -44,15 +45,15 @@ func LoadOrBuildEngine(dbPath, rulesFile string, wr *config.WAFRulesConfig) (cor
 }
 
 // loadRulesText 读取规则文本：DB 优先；DB 无记录则读文件并迁移入库。
-func loadRulesText(dbPath, rulesFile string) (text string, fromDB bool, err error) {
-	if txt, ok, rerr := store.LoadRule(dbPath, store.KeyCorazaConf); rerr == nil && ok {
+func loadRulesText(driver, dsn, rulesFile string) (text string, fromDB bool, err error) {
+	if txt, ok, rerr := store.LoadRule(driver, dsn, store.KeyCorazaConf); rerr == nil && ok {
 		return txt, true, nil
 	}
 	data, rerr := os.ReadFile(rulesFile)
 	if rerr != nil {
 		return "", false, fmt.Errorf("rules file missing: %s", rulesFile)
 	}
-	if serr := store.SaveRule(dbPath, store.KeyCorazaConf, string(data)); serr == nil {
+	if serr := store.SaveRule(driver, dsn, store.KeyCorazaConf, string(data)); serr == nil {
 		log.Printf("[waf] 规则已从 %s 迁移入库（rules 表）", rulesFile)
 	}
 	return string(data), false, nil

@@ -7,7 +7,7 @@ import (
 )
 
 func TestSaveDeleteLoad(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	s, err := Open("sqlite", filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestSaveDeleteLoad(t *testing.T) {
 }
 
 func TestOpenEmptyPathDisabled(t *testing.T) {
-	s, err := Open("")
+	s, err := Open("sqlite", "")
 	if err != nil || s != nil {
 		t.Fatalf("空路径应返回 (nil, nil), 实际 (%v, %v)", s, err)
 	}

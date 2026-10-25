@@ -407,7 +407,7 @@ curl -I  http://127.0.0.1:81/        # 应转发到后端
 | `firewall_offender_limit` | `20` | 违规次数阈值 |
 | `offender_persist_sec` | `60` | **持续违规时长**：与次数阈值同时满足才升级 |
 | `offender_ttl_sec` | `1800` | 违规记录内存保留时长 |
-| `greylist.enabled` | `false` | **挑战失败灰名单递进**（v1.2.0 F8）：开启后，挑战提交失败的 IP 进入递进路径——累计失败 `escalate_after_failures` 次 → 灰名单（限速档，超 `grey_limit_qps` 弹挑战，未超限放行但不参与可信晋升）→ 灰名单内再失败 → 顽固灰名单（必弹挑战）→ 顽固内持续失败且满足违规双条件（`firewall_offender_limit` + `offender_persist_sec`）→ 防火墙封禁。每级 TTL 到期自动降级恢复（顽固→灰名单→正常）；挑战通过（grantTrust）立即解除。默认关闭保持既有行为 |
+| `greylist.enabled` | `false` | **挑战失败灰名单递进**（v1.2.0 F8）：开启后，挑战提交失败的 IP 进入递进路径——累计失败 `escalate_after_failures` 次 → 灰名单（限速档，超 `grey_limit_qps` 弹挑战，未超限放行但不参与可信晋升）→ 灰名单内再失败 → 顽固灰名单（必弹挑战）→ 顽固内持续失败且满足违规双条件（`firewall_offender_limit` + `offender_persist_sec`）→ 防火墙封禁候选。每级 TTL 到期自动降级恢复（顽固→灰名单→正常）；挑战通过（grantTrust）立即解除。默认关闭保持既有行为。**平台说明**：违规双条件判定（`ReportOffender` → candidate）全平台生效；实际拉黑规则仅 Windows（netsh），Linux/macOS 下 `firewall_block` 为 no-op（candidate 仅记日志与内存计数），iptables 集成列入后续规划 |
 | `greylist.grey_limit_qps` | `5` | 灰名单（限速档）每 IP 请求速率上限 |
 | `greylist.grey_ttl_sec` | `3600` | 灰名单档 TTL（秒）；顽固灰名单档为其 2 倍 |
 | `greylist.escalate_after_failures` | `3` | 各档位内升级所需连续失败次数 |

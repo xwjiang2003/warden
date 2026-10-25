@@ -23,6 +23,9 @@
   - **判定位置**：慢速路径「失败冷却」之后、泛洪检测之前——顽固档必弹挑战，
     灰名单限速档放行（不晋升）；与 F7 的失败冷却（60s）协同：冷却期内重发同档
     挑战，冷却过后进入灰名单限速判定。
+  - **平台说明**：违规双条件判定（`ReportOffender` → candidate）全平台生效；
+    实际拉黑规则仅 Windows（netsh），Linux/macOS 下 `firewall_block` 为 no-op
+    （candidate 仅记日志与内存计数），iptables 集成列入后续规划。
   - **行为变更**：默认关闭（`greylist.enabled=false`），开启不影响既有挑战矩阵。
 
 - **无感验证 + 滑动验证码（三档挑战矩阵，v1.2.0 F7）**：`cc_defense.challenge_by_risk`

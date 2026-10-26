@@ -48,9 +48,25 @@ func TestUpsertPostgres(t *testing.T) {
 	}
 }
 
+// TestSubstrExpr 验证跨库取前缀表达式：sqlite 用 substr、mysql/pg 用 LEFT。
+func TestSubstrExpr(t *testing.T) {
+	cases := []struct {
+		driver, want string
+	}{
+		{"", `substr(time,1,10)`},
+		{"sqlite", `substr(time,1,10)`},
+		{"mysql", `LEFT(time,10)`},
+		{"postgres", `LEFT(time,10)`},
+	}
+	for _, c := range cases {
+		if got := DialectFor(c.driver).SubstrExpr("time", 10); got != c.want {
+			t.Fatalf("driver=%q SubstrExpr 应 %q，实际 %q", c.driver, c.want, got)
+		}
+	}
+}
+
 // TestCreateIndex 校验索引 DDL：MySQL 无 IF NOT EXISTS 且 TEXT 列需前缀长度。
-func TestCreateIndex(t *testing.T) {
-	if got := DialectFor("mysql").CreateIndex("idx_x", "t", "c"); got != "CREATE INDEX idx_x ON t(c(64))" {
+func TestCreateIndex(t *testing.T) {	if got := DialectFor("mysql").CreateIndex("idx_x", "t", "c"); got != "CREATE INDEX idx_x ON t(c(64))" {
 		t.Fatalf("mysql CreateIndex 错误: %s", got)
 	}
 	for _, driver := range []string{"sqlite", "postgres", ""} {

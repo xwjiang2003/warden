@@ -49,6 +49,16 @@ func (d Dialect) Placeholders(sql string) string {
 	return sb.String()
 }
 
+// SubstrExpr 返回取列前 n 个字符的表达式（跨库一致）：
+// sqlite 用 substr(col,1,n)（标准 SQLite 无 LEFT 函数，CGO=0 也不带 math 扩展）；
+// mysql/postgres 用 LEFT(col,n)。
+func (d Dialect) SubstrExpr(col string, n int) string {
+	if d.Driver == "sqlite" {
+		return fmt.Sprintf("substr(%s,1,%d)", col, n)
+	}
+	return fmt.Sprintf("LEFT(%s,%d)", col, n)
+}
+
 // Upsert 生成方言 UPSERT 语句：
 //   - sqlite: INSERT OR REPLACE INTO t (cols) VALUES (?,...)
 //   - mysql:  REPLACE INTO t (cols) VALUES (?,...)

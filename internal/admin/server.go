@@ -75,6 +75,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/logs", s.handleLogs)
 	s.mux.HandleFunc("GET /api/attack_logs", s.handleAttackLogs)
 	s.mux.HandleFunc("POST /api/attack_logs/clear", s.handleAttackLogsClear)
+	s.mux.HandleFunc("GET /api/reports/attack", s.handleAttackReport)
+	s.mux.HandleFunc("GET /api/reports/attack.csv", s.handleAttackReportCSV)
 	s.mux.HandleFunc("GET /api/trusted_ips", s.handleTrustedIPs)
 	s.mux.HandleFunc("GET /api/grey_ips", s.handleGreyIPs)
 	s.mux.HandleFunc("GET /api/metrics", s.handleMetrics)
@@ -310,6 +312,56 @@ func (s *Server) handleAttackLogsClear(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message": "攻击日志已清空",
 	})
+}
+
+// reportRange 把报表时间范围换算为起算时刻与聚合粒度。
+// range 支持 h24（近 24 小时，按小时）/ d7（近 7 天，按天，默认）/ d30（近 30 天，按天）。
+func reportRange(r string) (start, granularity string) {
+	now := time.Now()
+	switch r {
+	case "h24":
+		return now.Add(-24 * time.Hour).Format("2006-01-02 15:04:05"), "hour"
+	case "d30":
+		return now.AddDate(0, 0, -30).Format("2006-01-02 15:04:05"), "day"
+	default:
+		return now.AddDate(0, 0, -7).Format("2006-01-02 15:04:05"), "day"
+	}
+}
+
+// handleAttackReport 返回攻击报表聚合（F12）：趋势、拦截类型分布、TOP IP/路径/UA。
+func (s *Server) handleAttackReport(w http.ResponseWriter, r *http.Request) {
+	start, gran := reportRange(r.URL.Query().Get("range"))
+	rep, err := attacklog.QueryReport(start, gran, 10)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "报表聚合失败: " + err.Error(),
+		})
+		return
+	}
+	rep.Range = r.URL.Query().Get("range")
+	if rep.Range == "" {
+		rep.Range = "d7"
+	}
+	rep.Granularity = gran
+	writeJSON(w, http.StatusOK, rep)
+}
+
+// handleAttackReportCSV 导出报表时间范围内的攻击日志明细（UTF-8 BOM，Excel 可直接打开）。
+func (s *Server) handleAttackReportCSV(w http.ResponseWriter, r *http.Request) {
+	start, _ := reportRange(r.URL.Query().Get("range"))
+	csv, err := attacklog.QueryRangeCSV(start)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "CSV 导出失败: " + err.Error(),
+		})
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="attack_report.csv"`)
+	w.Header().Set("Cache-Control", "no-store")
+	// Excel 识别 UTF-8 需要 BOM
+	w.Write([]byte{0xEF, 0xBB, 0xBF})
+	io.WriteString(w, csv)
 }
 
 // SetTrustStore 注入可信 IP 持久化存储（用于分页查询）。

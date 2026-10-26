@@ -62,6 +62,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
       <el-menu-item index="ipprotection">🌐 IP 防护</el-menu-item>
       <el-menu-item index="alert">📧 告警通知</el-menu-item>
       <el-menu-item index="attacklogs">🛡️ 攻击日志</el-menu-item>
+      <el-menu-item index="attackreport">📈 攻击报表</el-menu-item>
       <el-menu-item index="trustedips">✅ 可信 IP</el-menu-item>
       <el-menu-item index="greyips">⚠️ 灰名单</el-menu-item>
       <el-menu-item index="logs">📋 访问日志</el-menu-item>
@@ -986,6 +987,47 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         </div>
       </template>
 
+      <!-- 攻击报表 -->
+      <template v-if="currentRoute==='attackreport'">
+        <div class="page-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+            <h3 style="margin:0;padding:0;border:none">攻击报表</h3>
+            <div style="display:flex;align-items:center;gap:10px">
+              <el-radio-group v-model="reportRange" size="small" @change="loadReport">
+                <el-radio-button label="h24">近 24 小时</el-radio-button>
+                <el-radio-button label="d7">近 7 天</el-radio-button>
+                <el-radio-button label="d30">近 30 天</el-radio-button>
+              </el-radio-group>
+              <el-button @click="exportReportCSV" size="small" type="primary" plain>📥 导出 CSV</el-button>
+            </div>
+          </div>
+          <div class="stats-row" style="margin-bottom:16px">
+            <div class="stat-item"><span class="label">区间拦截总数</span><span class="value orange" style="font-size:30px">{{ report.total }}</span></div>
+            <div class="stat-item"><span class="label">拦截类型</span><span class="value blue" style="font-size:24px">{{ report.categories.length }}</span></div>
+            <div class="stat-item"><span class="label">TOP 攻击 IP</span><span class="value" style="font-size:18px">{{ (report.top_ips && report.top_ips[0]) ? report.top_ips[0].key : '—' }}</span></div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start">
+            <div>
+              <div style="font-size:13px;color:#606266;font-weight:600;margin-bottom:8px">攻击趋势（{{ reportRangeLabel }}）</div>
+              <div id="rep-trend" style="height:230px"></div>
+            </div>
+            <div>
+              <div style="font-size:13px;color:#606266;font-weight:600;margin-bottom:8px">拦截类型分布</div>
+              <div id="rep-cat" style="height:230px"></div>
+            </div>
+            <div>
+              <div style="font-size:13px;color:#606266;font-weight:600;margin-bottom:8px">TOP 攻击 IP</div>
+              <div id="rep-ips" style="height:230px"></div>
+            </div>
+            <div>
+              <div style="font-size:13px;color:#606266;font-weight:600;margin-bottom:8px">TOP 拦截原因</div>
+              <div id="rep-details" style="height:230px"></div>
+            </div>
+          </div>
+          <el-empty v-if="report.total === 0" description="所选区间暂无攻击记录" style="margin-top:8px" />
+        </div>
+      </template>
+
       <!-- 访问日志 -->
       <template v-if="currentRoute==='logs'">
         <div class="page-card">
@@ -1082,6 +1124,9 @@ const app = createApp({
     const greyIPsTotal = ref(0)
     const greyIPsPage = ref(1)
     const greyIPsPageSize = ref(20)
+    const reportRange = ref('d7')
+    const report = reactive({ total: 0, trend: [], categories: [], top_ips: [], top_paths: [], top_details: [] })
+    const reportRangeLabel = ref('近 7 天')
     let prevReq = 0
     let prevTs = 0
     const currentRoute = ref('dashboard')
@@ -1127,7 +1172,7 @@ const app = createApp({
     const emailTesting = ref(false)
 
     const pageTitle = computed(() => {
-      const m = { dashboard:'仪表盘', basic:'基本设置', ratelimit:'频率限制', ccdefense:'CC 防御', wafrules:'WAF 规则', connlimit:'连接限制', sites:'代理站点', ipprotection:'IP 防护', trustedips:'可信 IP', greyips:'灰名单', alert:'告警通知', attacklogs:'攻击日志', logs:'访问日志' }
+      const m = { dashboard:'仪表盘', basic:'基本设置', ratelimit:'频率限制', ccdefense:'CC 防御', wafrules:'WAF 规则', connlimit:'连接限制', sites:'代理站点', ipprotection:'IP 防护', trustedips:'可信 IP', greyips:'灰名单', alert:'告警通知', attacklogs:'攻击日志', attackreport:'攻击报表', logs:'访问日志' }
       return m[currentRoute.value] || '管理后台'
     })
     const blockType = computed(() => config.block_requests ? 'danger' : 'success')
@@ -1530,8 +1575,96 @@ const app = createApp({
       return d
     }
 
-    async function loadAttackLogs() {
+    let repCharts = {}
+
+    function disposeRepCharts() {
+      for (const k in repCharts) {
+        if (repCharts[k]) { repCharts[k].dispose(); delete repCharts[k] }
+      }
+    }
+
+    // 报表图表：切页时容器被 v-if 卸载，与仪表盘相同处理——按需重建
+    function repChart(elId, option) {
+      const el = document.getElementById(elId)
+      if (!el) return null
+      let c = repCharts[elId]
+      if (c && c.getDom() !== el) { c.dispose(); c = null }
+      if (!c) c = echarts.init(el)
+      c.setOption(option, true)
+      repCharts[elId] = c
+      return c
+    }
+
+    async function loadReport() {
+      const labels = { h24: '近 24 小时', d7: '近 7 天', d30: '近 30 天' }
+      reportRangeLabel.value = labels[reportRange.value] || '近 7 天'
       try {
+        const { data } = await api.get('/reports/attack', { params: { range: reportRange.value } })
+        Object.assign(report, { total: data.total || 0, trend: data.trend || [], categories: data.categories || [], top_ips: data.top_ips || [], top_paths: data.top_paths || [], top_details: data.top_details || [] })
+        renderReportCharts()
+      } catch (e) {
+        ElementPlus.ElMessage.error('加载报表失败: ' + (e.response?.data?.error || e.message))
+      }
+    }
+
+    function renderReportCharts() {
+      const trendOpt = {
+        grid: { left: 40, right: 16, top: 24, bottom: 28, containLabel: true },
+        tooltip: { trigger: 'axis', triggerOn: 'click', confine: true },
+        xAxis: { type: 'category', data: report.trend.map(p => p.bucket), axisLabel: { fontSize: 10, interval: Math.ceil(report.trend.length / 8) - 1, rotate: report.trend.length > 16 ? 30 : 0 } },
+        yAxis: { type: 'value', minInterval: 1 },
+        series: [{ type: 'line', smooth: true, symbolSize: 5, areaStyle: { opacity: 0.12 }, data: report.trend.map(p => p.count) }]
+      }
+      repChart('rep-trend', trendOpt)
+
+      const catOpt = {
+        grid: { left: 8, right: 16, top: 20, bottom: 8, containLabel: true },
+        tooltip: { trigger: 'item', triggerOn: 'click', confine: true },
+        series: [{
+          type: 'pie', radius: ['32%', '68%'], center: ['50%', '55%'],
+          data: report.categories.map(c => ({ name: c.key, value: c.count })),
+          label: { fontSize: 10 }
+        }]
+      }
+      repChart('rep-cat', catOpt)
+
+      const ipOpt = {
+        grid: { left: 8, right: 24, top: 16, bottom: 8, containLabel: true },
+        tooltip: { trigger: 'axis', triggerOn: 'click', confine: true },
+        xAxis: { type: 'value', minInterval: 1 },
+        yAxis: { type: 'category', inverse: true, data: report.top_ips.map(x => x.key), axisLabel: { fontSize: 10 } },
+        series: [{ type: 'bar', barMaxWidth: 18, data: report.top_ips.map(x => x.count) }]
+      }
+      repChart('rep-ips', ipOpt)
+
+      const pathOpt = {
+        grid: { left: 8, right: 24, top: 16, bottom: 8, containLabel: true },
+        tooltip: { trigger: 'axis', triggerOn: 'click', confine: true },
+        xAxis: { type: 'value', minInterval: 1 },
+        yAxis: { type: 'category', inverse: true, data: report.top_details.map(x => x.key), axisLabel: { fontSize: 10, width: 120, overflow: 'truncate' } },
+        series: [{ type: 'bar', barMaxWidth: 18, data: report.top_details.map(x => x.count) }]
+      }
+      repChart('rep-details', pathOpt)
+    }
+
+    async function exportReportCSV() {
+      try {
+        const res = await api.get('/reports/attack.csv', { params: { range: reportRange.value }, responseType: 'blob' })
+        const url = URL.createObjectURL(res.data)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = 'attack_report_' + reportRange.value + '.csv'
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        URL.revokeObjectURL(url)
+        ElementPlus.ElMessage.success('已导出 CSV')
+      } catch (e) {
+        ElementPlus.ElMessage.error('导出失败: ' + (e.response?.data?.error || e.message))
+      }
+    }
+
+    async function loadAttackLogs() {      try {
         const { data } = await api.get('/attack_logs')
         attackLogs.value = data.logs || []
       } catch (e) { /* 静默失败 */ }
@@ -1585,6 +1718,9 @@ const app = createApp({
       }
       if (index === 'logs') loadLogs()
       if (index === 'trustedips') loadTrustedIPs(1)
+      // 攻击报表：进入时加载并渲染，离开时销毁图表避免泄漏
+      if (index === 'attackreport') loadReport()
+      else disposeRepCharts()
     }
 
     // 各图表容器的 DOM 节点在切换菜单时会被 v-if 卸载并重新创建，

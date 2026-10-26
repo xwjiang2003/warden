@@ -2,7 +2,9 @@ package attacklog
 
 import (
 	"database/sql"
+	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -204,4 +206,199 @@ func Clear() {
 			log.Printf("[attacklog] 清空失败: %v", err)
 		}
 	}
+}
+
+// ---- F12 攻击报表聚合 ----
+
+// KV 报表排行项（key=维度值，count=次数）
+type KV struct {
+	Key   string `json:"key"`
+	Count int64  `json:"count"`
+}
+
+// TrendPoint 时间桶趋势点
+type TrendPoint struct {
+	Bucket string `json:"bucket"`
+	Count  int64  `json:"count"`
+}
+
+// Report 一次攻击报表聚合结果
+type Report struct {
+	Total       int64        `json:"total"`
+	Trend       []TrendPoint `json:"trend"`
+	Categories  []KV         `json:"categories"`
+	TopIPs      []KV         `json:"top_ips"`
+	TopPaths    []KV         `json:"top_paths"`
+	TopDetails  []KV         `json:"top_details"`
+	Range       string       `json:"range,omitempty"`
+	Granularity string       `json:"granularity,omitempty"`
+}
+
+// QueryReport 按起始时间聚合攻击日志（F12）。
+// start 为 "2006-01-02 15:04:05" 起算时刻（含）；granularity 为 "hour"|"day"。
+// 分桶用 LEFT(time,13)/(LEFT(time,10))：time 列是定长文本格式，跨 sqlite/mysql/pg
+// 行为一致，避免 DATE_FORMAT / to_char / strftime 方言差异。
+// 桶序列在 Go 侧生成并补零，保证趋势图连续（无攻击时段显示 0）。
+// 未启用持久化（db==nil）时返回空报表。
+func QueryReport(start string, granularity string, topN int) (*Report, error) {
+	rep := &Report{Trend: []TrendPoint{}, Categories: []KV{}, TopIPs: []KV{}, TopPaths: []KV{}, TopDetails: []KV{}}
+	if db == nil {
+		return rep, nil
+	}
+	if topN <= 0 {
+		topN = 10
+	}
+
+	bucketLen := 10
+	if granularity == "hour" {
+		bucketLen = 13
+	}
+	expr := dialect.SubstrExpr("time", bucketLen)
+	where := "WHERE time >= " + dialect.Placeholders("?")
+
+	// 总拦截量
+	if err := db.QueryRow(dialect.Placeholders(`SELECT COUNT(*) FROM attack_log `+where), start).Scan(&rep.Total); err != nil {
+		return nil, err
+	}
+
+	// 趋势：按桶分组
+	rows, err := db.Query(dialect.Placeholders(`SELECT `+expr+`, COUNT(*) FROM attack_log `+where+` GROUP BY `+expr+` ORDER BY 1`), start)
+	if err != nil {
+		return nil, err
+	}
+	trend := map[string]int64{}
+	for rows.Next() {
+		var b string
+		var c int64
+		if err := rows.Scan(&b, &c); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		trend[b] = c
+	}
+	rows.Close()
+	rep.Trend = fillBuckets(start, granularity, trend)
+
+	// 分类分布 / TOP IP / TOP 路径 / TOP 拦截原因（各 topN 条，排除空值）
+	for _, q := range []struct {
+		name string
+		col  string
+	}{
+		{"categories", "category"},
+		{"top_ips", "ip"},
+		{"top_paths", "path"},
+		{"top_details", "detail"},
+	} {
+		rows, err := db.Query(dialect.Placeholders(`SELECT `+q.col+`, COUNT(*) FROM attack_log `+where+` AND `+q.col+` != '' GROUP BY `+q.col+` ORDER BY 2 DESC LIMIT `+itoa(topN)), start)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var k string
+			var c int64
+			if err := rows.Scan(&k, &c); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			item := KV{Key: k, Count: c}
+			switch q.name {
+			case "categories":
+				rep.Categories = append(rep.Categories, item)
+			case "top_ips":
+				rep.TopIPs = append(rep.TopIPs, item)
+			case "top_paths":
+				rep.TopPaths = append(rep.TopPaths, item)
+			case "top_details":
+				rep.TopDetails = append(rep.TopDetails, item)
+			}
+		}
+		rows.Close()
+	}
+	return rep, nil
+}
+
+// QueryRangeCSV 导出起始时间之后的攻击日志明细（CSV 内容，UTF-8 无 BOM；
+// 调用方如需 Excel 直接打开可加 BOM）。列：time,ip,host,path,category,detail。
+func QueryRangeCSV(start string) (string, error) {
+	if db == nil {
+		return "", nil
+	}
+	rows, err := db.Query(dialect.Placeholders(`SELECT time, ip, host, path, category, detail FROM attack_log WHERE time >= ? ORDER BY time DESC`), start)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var b strings.Builder
+	b.WriteString("time,ip,host,path,category,detail\n")
+	for rows.Next() {
+		var t, ip, host, path, cat, det string
+		if err := rows.Scan(&t, &ip, &host, &path, &cat, &det); err != nil {
+			return "", err
+		}
+		fmt.Fprintf(&b, "%s,%s,%s,%s,%s,%s\n",
+			csvEscape(t), csvEscape(ip), csvEscape(host), csvEscape(path), csvEscape(cat), csvEscape(det))
+	}
+	return b.String(), rows.Err()
+}
+
+// fillBuckets 从 start 截断到粒度边界，逐桶生成直到当前时刻，缺失桶补 0。
+func fillBuckets(start, granularity string, got map[string]int64) []TrendPoint {
+	layout := "2006-01-02 15:04:05"
+	t, err := time.Parse(layout, start)
+	if err != nil {
+		return []TrendPoint{}
+	}
+	now := time.Now()
+	if granularity == "day" {
+		t = time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
+	} else {
+		t = t.Truncate(time.Hour)
+	}
+	out := []TrendPoint{}
+	for !t.After(now) {
+		var key string
+		if granularity == "day" {
+			key = t.Format("2006-01-02")
+		} else {
+			key = t.Format("2006-01-02 15")
+		}
+		out = append(out, TrendPoint{Bucket: key, Count: got[key]})
+		if granularity == "day" {
+			t = t.AddDate(0, 0, 1)
+		} else {
+			t = t.Add(time.Hour)
+		}
+	}
+	return out
+}
+
+// csvEscape 按 RFC 4180 转义字段（含逗号/引号/换行时用双引号包裹）。
+func csvEscape(s string) string {
+	if strings.ContainsAny(s, ",\"\n") {
+		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+	}
+	return s
+}
+
+// itoa 最小 int→string 转换，避免导入 strconv 仅为此处。
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
+	return string(b[i:])
 }

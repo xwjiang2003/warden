@@ -4,6 +4,17 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- **Prometheus 格式指标（v1.4.0 F11）**：新增 `GET /metrics` 端点（admin 端口，复用 Basic Auth），
+  输出 Prometheus 文本格式（`text/plain; version=0.0.4`）——20 项计数器（total_requests /
+  waf_blocked / cc_blocked / cc_challenged / captcha / pow / silent / slider 三态 /
+  rate_limit_blocked / conn_limit_dropped / ip_check_blocked / firewall_blocked / whitelist_pass）
+  全部带 `# HELP` / `# TYPE` 注释；零依赖纯标准库实现；Prometheus 抓取可配 `basic_auth`。
+  与既有 `/api/metrics`（JSON）同一数据源，可无缝接入现有监控栈。
+
 ## [1.3.0] - 2026-10-25
 
 ### 新增

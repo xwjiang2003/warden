@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"warden/internal/auditlog"
 	"warden/internal/sqlutil"
 )
 
@@ -30,7 +31,15 @@ var (
 	dialect    sqlutil.Dialect
 	ch         = make(chan Event, 2000)
 	retainDays = 90 // 攻击日志保留天数
+	auditHook  func(auditlog.Event)
 )
+
+// SetAuditHook 注册审计钩子（v1.4.0 F13）：每条攻击事件同步写一行审计日志
+// （JSON 文件，复用 accesslog 轮转），与落库互不阻塞。
+// 类型取攻击分类原文（CC挑战 / IP归属 / 频率限制 …），详情取原始 detail。
+func SetAuditHook(hook func(auditlog.Event)) {
+	auditHook = hook
+}
 
 // Init 打开数据库、启动异步写入协程与定期清理。
 // driver 为 sqlite（默认）/mysql/postgres；dsn 为空时不启用持久化。
@@ -86,6 +95,17 @@ func Record(ip, host, path, category, detail string) {
 	select {
 	case ch <- e:
 	default:
+	}
+	// F13 审计：同事件写审计日志（JSON 文件，旁路，失败不影响请求路径）。
+	// 放在内存队列之后、锁之外，保证攻击日志优先、审计不拖慢拦截链路。
+	if auditHook != nil {
+		auditHook(auditlog.Event{
+			Type:   category,
+			IP:     ip,
+			Host:   host,
+			Path:   path,
+			Detail: detail,
+		})
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"warden/internal/auditlog"
 	"warden/internal/fwstore"
 	"warden/internal/metrics"
 )
@@ -403,6 +404,12 @@ func (fb *FirewallBlocker) block(ip, reason string) {
 
 	// 性能：内存态先行；防火墙规则由 syncLoop 周期全量重建（批量规则聚合），
 	// block() 不触碰 netsh/PowerShell，正常请求路径零阻塞。
+	// F13 审计：防火墙拉黑事件（真实 IP + 原因 + 总计数）
+	auditlog.Record(auditlog.Event{
+		Type:   "firewall_block",
+		IP:     ip,
+		Detail: fmt.Sprintf("reason=%s total=%d", reason, fb.blockCount),
+	})
 	log.Printf("[firewall] BLOCKED ip=%s reason=%s total=%d (规则周期批量写入)", ip, reason, fb.blockCount)
 }
 
@@ -424,6 +431,12 @@ func (fb *FirewallBlocker) unblock(ip string) {
 	case fb.syncNow <- struct{}{}:
 	default:
 	}
+	// F13 审计：防火墙解封事件
+	auditlog.Record(auditlog.Event{
+		Type:   "firewall_unblock",
+		IP:     ip,
+		Detail: "验证码通过",
+	})
 	log.Printf("[firewall] UNBLOCKED ip=%s (验证码通过)", ip)
 }
 

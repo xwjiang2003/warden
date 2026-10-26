@@ -45,6 +45,7 @@ type Config struct {
 	AccessLog           string                `json:"access_log"`
 	AccessLogRotate     AccessLogRotateConfig `json:"access_log_rotate"`
 	AttackLogRetainDays int                   `json:"attack_log_retain_days"` // 攻击日志保留天数，0 用默认值
+	AuditLog            AuditLogConfig        `json:"audit_log"`
 	BlockRequests       bool                  `json:"block_requests"`
 	RateLimit           RateLimitConfig       `json:"rate_limit"`
 	CCDefense           CCDefenseConfig       `json:"cc_defense"`
@@ -130,9 +131,21 @@ type IPBlacklistConfig struct {
 	CIDRs   []string `json:"cidrs"`
 }
 
+// AuditLogConfig 审计日志配置（v1.4.0 F13）。
+// 审计日志为 JSON 行文件（logs/audit.log），记录拦截/挑战/封禁/配置变更事件，供取证。
+type AuditLogConfig struct {
+	Enabled bool   `json:"enabled"`
+	Path    string `json:"path"` // 默认 logs/audit.log
+}
+
+func (c *AuditLogConfig) Normalize() {
+	if c.Path == "" {
+		c.Path = "logs/audit.log"
+	}
+}
+
 // AlertConfig 邮件告警配置
-type AlertConfig struct {
-	Enabled            bool     `json:"enabled"`
+type AlertConfig struct {	Enabled            bool     `json:"enabled"`
 	SMTPHost           string   `json:"smtp_host"`
 	SMTPPort           int      `json:"smtp_port"`
 	SMTPUsername       string   `json:"smtp_username"`

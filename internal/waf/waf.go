@@ -10,6 +10,7 @@ import (
 	"github.com/corazawaf/coraza/v3"
 	"github.com/corazawaf/coraza/v3/types"
 
+	"warden/internal/auditlog"
 	"warden/internal/config"
 	"warden/internal/metrics"
 )
@@ -44,6 +45,17 @@ func NewFromText(rulesText string, wr *config.WAFRulesConfig) (coraza.WAF, error
 			WithDirectives(dynamic).
 			WithErrorCallback(func(mr types.MatchedRule) {
 				metrics.WAFBlocked.Inc()
+				// F13 审计：只有产生实际阻断动作（disruptive）的规则命中才写审计日志。
+				// MatchedRule 携带 ClientIPAddress / URI / 规则 ID / 严重度 / 消息，
+				// 一次攻击事件（IP → 规则 → 请求）可在 audit.log 中完整还原。
+				if mr.Disruptive() {
+					auditlog.Record(auditlog.Event{
+						Type:   "waf_blocked",
+						IP:     mr.ClientIPAddress(),
+						Path:   mr.URI(),
+						Detail: fmt.Sprintf("rule=%d severity=%s %s", mr.Rule().ID(), mr.Rule().Severity(), mr.Message()),
+					})
+				}
 				log.Printf("[coraza][%s] %s", mr.Rule().Severity(), mr.ErrorLog())
 			}),
 	)

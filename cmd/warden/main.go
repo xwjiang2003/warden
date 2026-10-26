@@ -22,6 +22,7 @@ import (
 	"warden/internal/admin"
 	"warden/internal/alert"
 	"warden/internal/attacklog"
+	"warden/internal/auditlog"
 	"warden/internal/blockpage"
 	"warden/internal/config"
 	"warden/internal/fwstore"
@@ -82,6 +83,11 @@ func main() {
 		}
 	}
 	attacklog.Init(dbDriver, dbDSN, cfg.AttackLogRetainDays)
+	// F13 审计日志：拦截/挑战/封禁/配置变更事件 JSON 行文件，复用 accesslog 轮转。
+	cfg.AuditLog.Normalize()
+	auditlog.Init(cfg.AuditLog.Enabled, cfg.AuditLog.Path, cfg.AccessLogRotate)
+	// 攻击事件（CC 挑战/IP归属/限速/黑名单等）同步写审计日志
+	attacklog.SetAuditHook(auditlog.Record)
 	blockpage.Set(cfg.BlockPage)
 
 	// 真实客户端 IP 解析必须在使用任何 IP 的中间件之前配置好：
@@ -221,6 +227,7 @@ func main() {
 	log.Printf("ip_check: block_foreign=%v block_cloud=%v", cfg.IPCheck.BlockForeignEnabled(), cfg.IPCheck.BlockCloudEnabled())
 	log.Printf("access_log: %s rotate=%s max_size_mb=%d",
 		cfg.AccessLog, cfg.AccessLogRotate.Mode, cfg.AccessLogRotate.MaxSizeMB)
+	log.Printf("audit_log: enabled=%v path=%s", cfg.AuditLog.Enabled, cfg.AuditLog.Path)
 	log.Printf("health: http://127.0.0.1%s/healthz", util.TrimHost(cfg.Listen))
 	if cfg.EnabledTLS() {
 		log.Printf("tls: enabled=true cert_file=%q key_file=%q acme=%v domains=%v staging=%v",

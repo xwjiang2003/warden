@@ -21,6 +21,7 @@ import (
 	"warden"
 	"warden/internal/alert"
 	"warden/internal/attacklog"
+	"warden/internal/auditlog"
 	"warden/internal/config"
 	"warden/internal/greyliststore"
 	"warden/internal/metrics"
@@ -242,6 +243,15 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	*s.cfg = newCfg
 	s.restartNeeded.Store(true)
 
+	// F13 审计：配置变更事件（含触发方 IP）
+	auditlog.Record(auditlog.Event{
+		Type:   "config_changed",
+		IP:     util.ClientIP(r),
+		Method: r.Method,
+		Path:   r.URL.Path,
+		Detail: "配置已更新并保存（部分更改需重启生效）",
+	})
+
 	log.Printf("[admin] 配置已更新并保存 (部分更改需重启生效)")
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message":          "配置已保存",
@@ -462,6 +472,15 @@ func (s *Server) handlePutRules(w http.ResponseWriter, r *http.Request) {
 
 	*s.wafRules = wr
 	s.holder.SetEngine(engine) // 原子切换，下一请求即用新引擎
+
+	// F13 审计：规则变更事件（热加载，无需重启）
+	auditlog.Record(auditlog.Event{
+		Type:   "rules_changed",
+		IP:     util.ClientIP(r),
+		Method: r.Method,
+		Path:   r.URL.Path,
+		Detail: fmt.Sprintf("规则已更新并热加载（coraza 文本 %d 字节）", len(conf)),
+	})
 
 	log.Printf("[admin] 规则已更新并热加载（无需重启；coraza 文本 %d 字节）", len(conf))
 	writeJSON(w, http.StatusOK, map[string]interface{}{

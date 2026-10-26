@@ -25,6 +25,15 @@
     时间范围切换 + 一键导出 CSV；
   - 单测覆盖日/时粒度聚合、桶补零、CSV 转义、空库分支及 4 方言 SubstrExpr。
 
+- **审计日志文件化（v1.4.0 F13）**：新增 `logs/audit.log`（JSON 行，可取证）：
+  - 四类事件全覆盖：WAF 拦截（`waf_blocked`，含 IP / URI / 规则 ID / 严重度 / 消息）、
+    攻击事件（CC 挑战 / IP 归属 / 限速 / 黑名单，经 attacklog 钩子一处接入）、防火墙封禁/解封
+    （`firewall_block/unblock`）、配置与规则变更（`config_changed/rules_changed`，含操作方 IP 与方法）；
+  - 复用 `access_log_rotate` 的按天/大小轮转（新增 `accesslog.WriteLine`）；`Record` 为旁路：
+    未启用零开销、写失败仅日志不阻塞请求路径；
+  - 新增配置 `audit_log.enabled / audit_log.path`（默认 `logs/audit.log`）；
+  - 后台「攻击日志」页增加分类下拉过滤；单测覆盖 JSON 行字段、禁用 no-op 与轮转路径。
+
 ## [1.3.0] - 2026-10-25
 
 ### 新增

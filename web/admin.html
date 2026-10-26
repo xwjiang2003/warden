@@ -955,13 +955,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
       <template v-if="currentRoute==='attacklogs'">
         <div class="page-card">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-            <h3 style="margin:0;padding:0;border:none">攻击日志（最近 {{ attackLogs.length }} 条，每 3 秒刷新）</h3>
-            <div>
+            <h3 style="margin:0;padding:0;border:none">攻击日志（{{ filteredAttackLogs.length }} 条，每 3 秒刷新）</h3>
+            <div style="display:flex;align-items:center;gap:8px">
+              <el-select v-model="attackLogFilter" size="small" placeholder="全部分类" clearable style="width:150px">
+                <el-option v-for="c in attackCategories" :key="c" :label="c" :value="c" />
+              </el-select>
               <el-button @click="clearAttackLogs" size="small" type="danger" plain>🗑 清空</el-button>
               <el-button @click="loadAttackLogs" size="small">🔄 刷新</el-button>
             </div>
           </div>
-          <el-table :data="attackLogs" size="small" border style="width:100%">
+          <el-table :data="filteredAttackLogs" size="small" border style="width:100%">
             <el-table-column label="时间" width="150">
               <template #default="{ row }">{{ row.time || '-' }}</template>
             </el-table-column>
@@ -983,7 +986,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
               <template #default="{ row }">{{ fmtDetail(row.detail) }}</template>
             </el-table-column>
           </el-table>
-          <el-empty v-if="attackLogs.length === 0" description="暂无攻击日志" />
+          <el-empty v-if="filteredAttackLogs.length === 0" description="暂无攻击日志" />
         </div>
       </template>
 
@@ -1169,11 +1172,27 @@ const app = createApp({
     const urlBlocklistText = ref('')
     const alertToText = ref('')
     const attackLogs = ref([])
+    const attackLogFilter = ref('')
     const emailTesting = ref(false)
 
     const pageTitle = computed(() => {
       const m = { dashboard:'仪表盘', basic:'基本设置', ratelimit:'频率限制', ccdefense:'CC 防御', wafrules:'WAF 规则', connlimit:'连接限制', sites:'代理站点', ipprotection:'IP 防护', trustedips:'可信 IP', greyips:'灰名单', alert:'告警通知', attacklogs:'攻击日志', attackreport:'攻击报表', logs:'访问日志' }
       return m[currentRoute.value] || '管理后台'
+    })
+    // 攻击日志：分类下拉选项（按出现次数去重排序）
+    const attackCategories = computed(() => {
+      const seen = new Set()
+      const out = []
+      for (const row of attackLogs.value) {
+        const c = row.category || '未知'
+        if (!seen.has(c)) { seen.add(c); out.push(c) }
+      }
+      return out
+    })
+    // 攻击日志：按所选分类过滤（空 = 全部）
+    const filteredAttackLogs = computed(() => {
+      if (!attackLogFilter.value) return attackLogs.value
+      return attackLogs.value.filter(row => (row.category || '未知') === attackLogFilter.value)
     })
     const blockType = computed(() => config.block_requests ? 'danger' : 'success')
     const cpuPercent = computed(() => Math.round(Number(stats.cpu_percent || 0) * 10) / 10)
@@ -1795,7 +1814,7 @@ const app = createApp({
       hotPathsText, ccPathsText, scannerPathsText, scannerUAsText, customScriptUAsText, customBlockPathsText,
       whitelistCIDRsText, firewallWhitelistCIDRsText, blacklistCIDRsText, urlAllowlistText, urlBlocklistText, alertToText, emailTesting, trustedProxiesText, trustedProxyWarnings,
       pageTitle, blockType, cpuColor, memColor, cpuPercent, memPercent,
-      navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, sendTestEmail, loadLogs, loadAttackLogs, clearAttackLogs, attackLogs,
+      navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, sendTestEmail, loadLogs, loadAttackLogs, clearAttackLogs, attackLogs, attackLogFilter, attackCategories, filteredAttackLogs,
       categoryType, fmtDetail, loadTrustedIPs, onTrustedPageSize, fmtTime
     }
   }

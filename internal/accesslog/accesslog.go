@@ -188,3 +188,38 @@ func (al *Logger) Log(r *http.Request, status int, bytes int64) {
 	}
 	al.curSize += int64(n)
 }
+
+// WriteLine 写一行原始文本（自动补换行），复用同一轮转机制。
+// 供审计日志（internal/auditlog）等结构化行日志使用。
+func (al *Logger) WriteLine(line string) {
+	if al == nil {
+		return
+	}
+	now := time.Now()
+	if !strings.HasSuffix(line, "\n") {
+		line += "\n"
+	}
+
+	al.mu.Lock()
+	defer al.mu.Unlock()
+
+	if al.f == nil {
+		log.Print(strings.TrimSuffix(line, "\n"))
+		return
+	}
+
+	if err := al.rotateIfNeeded(len(line), now); err != nil {
+		log.Printf("access log rotate: %v", err)
+	}
+	if al.f == nil {
+		log.Print(strings.TrimSuffix(line, "\n"))
+		return
+	}
+
+	n, err := io.WriteString(al.f, line)
+	if err != nil {
+		log.Printf("access log write: %v", err)
+		return
+	}
+	al.curSize += int64(n)
+}

@@ -1,6 +1,10 @@
 package metrics
 
-import "sync/atomic"
+import (
+	"fmt"
+	"strings"
+	"sync/atomic"
+)
 
 // Counter 原子计数器
 type Counter struct{ v int64 }
@@ -62,4 +66,45 @@ func Snapshot() map[string]int64 {
 func BlockedTotal() int64 {
 	return WAFBlocked.Value() + CCBlocked.Value() + CCChallenged.Value() + RateLimitBlocked.Value() +
 		IPCheckBlocked.Value() + FirewallBlocked.Value() + ConnLimitDropped.Value()
+}
+
+// promMetric 描述一个计数器的 Prometheus 展示名与帮助文本。
+type promMetric struct {
+	name, help string
+	get        func() int64
+}
+
+var promMetrics = []promMetric{
+	{"warden_total_requests", "Total requests seen by the proxy.", func() int64 { return TotalRequests.Value() }},
+	{"warden_waf_blocked", "Requests blocked by WAF rules.", func() int64 { return WAFBlocked.Value() }},
+	{"warden_cc_blocked", "Requests hard-blocked by CC defense (no challenge).", func() int64 { return CCBlocked.Value() }},
+	{"warden_cc_challenged", "Requests that got a CC challenge page.", func() int64 { return CCChallenged.Value() }},
+	{"warden_captcha_passed", "Captcha challenges passed.", func() int64 { return CaptchaPassed.Value() }},
+	{"warden_captcha_failed", "Captcha challenges failed.", func() int64 { return CaptchaFailed.Value() }},
+	{"warden_pow_challenged", "PoW challenges issued.", func() int64 { return PoWChallenged.Value() }},
+	{"warden_pow_passed", "PoW challenges passed.", func() int64 { return PoWPassed.Value() }},
+	{"warden_pow_failed", "PoW challenges failed.", func() int64 { return PoWFailed.Value() }},
+	{"warden_silent_challenged", "Silent challenges issued.", func() int64 { return SilentChallenged.Value() }},
+	{"warden_silent_passed", "Silent challenges passed.", func() int64 { return SilentPassed.Value() }},
+	{"warden_silent_failed", "Silent challenges failed.", func() int64 { return SilentFailed.Value() }},
+	{"warden_slider_challenged", "Slider challenges issued.", func() int64 { return SliderChallenged.Value() }},
+	{"warden_slider_passed", "Slider challenges passed.", func() int64 { return SliderPassed.Value() }},
+	{"warden_slider_failed", "Slider challenges failed.", func() int64 { return SliderFailed.Value() }},
+	{"warden_rate_limit_blocked", "Requests rate-limited (429).", func() int64 { return RateLimitBlocked.Value() }},
+	{"warden_conn_limit_dropped", "Connections dropped by L4 connection limit.", func() int64 { return ConnLimitDropped.Value() }},
+	{"warden_ip_check_blocked", "Requests blocked by IP geo/cloud check.", func() int64 { return IPCheckBlocked.Value() }},
+	{"warden_firewall_blocked", "IPs blocked by firewall (cumulative).", func() int64 { return FirewallBlocked.Value() }},
+	{"warden_whitelist_pass", "Requests passed via trusted IP whitelist.", func() int64 { return WhitelistPass.Value() }},
+}
+
+// PrometheusText 输出 Prometheus 文本格式（text/plain; version=0.0.4，无需外部库）。
+// 所有指标类型为 counter，带 TYPE/HELP 注释，可直接被 Prometheus / PromQL 消费。
+func PrometheusText() string {
+	var b strings.Builder
+	for _, m := range promMetrics {
+		fmt.Fprintf(&b, "# HELP %s %s\n", m.name, m.help)
+		fmt.Fprintf(&b, "# TYPE %s counter\n", m.name)
+		fmt.Fprintf(&b, "%s %d\n", m.name, m.get())
+	}
+	return b.String()
 }

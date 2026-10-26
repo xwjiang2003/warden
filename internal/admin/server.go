@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -77,6 +78,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/trusted_ips", s.handleTrustedIPs)
 	s.mux.HandleFunc("GET /api/grey_ips", s.handleGreyIPs)
 	s.mux.HandleFunc("GET /api/metrics", s.handleMetrics)
+	s.mux.HandleFunc("GET /metrics", s.handlePrometheus)
 	s.mux.HandleFunc("POST /api/restart", s.handleRestart)
 	s.mux.HandleFunc("POST /api/alert/test", s.handleAlertTest)
 	s.mux.HandleFunc("GET /api/license", s.handleLegal("LICENSE"))
@@ -473,6 +475,20 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	snap := metrics.Snapshot()
 	snap["total_blocked"] = metrics.BlockedTotal()
 	writeJSON(w, http.StatusOK, snap)
+}
+
+// handlePrometheus 暴露 Prometheus 文本格式指标（F11）。
+// 路径与 admin 其它端点共用 Basic Auth：Prometheus 抓取时配置
+// basic_auth 即可（scrape_configs → basic_auth: {username, password}）。
+func (s *Server) handlePrometheus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	// 返回体的渲染成本（纯字符串拼接）在纳秒级，无需缓存。
+	// 显式写入直到成功，避免中间件吞掉部分写入。
+	body := metrics.PrometheusText()
+	if _, err := io.WriteString(w, body); err != nil {
+		log.Printf("[admin] /metrics 写响应失败: %v", err)
+	}
 }
 
 // readRuntimeStats 通过 runtime/metrics 读取堆内存与协程数。

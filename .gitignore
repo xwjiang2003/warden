@@ -63,5 +63,6 @@ _pkg*
 .gocache/
 .appdata/
 
-# F17 验收二进制
-warden-f17
+# 验收交叉编译二进制（F11/F12/F17…）
+warden-f1*
+warden-f2*

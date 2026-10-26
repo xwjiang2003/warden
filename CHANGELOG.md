@@ -15,6 +15,16 @@
   全部带 `# HELP` / `# TYPE` 注释；零依赖纯标准库实现；Prometheus 抓取可配 `basic_auth`。
   与既有 `/api/metrics`（JSON）同一数据源，可无缝接入现有监控栈。
 
+- **攻击报表（v1.4.0 F12）**：新增 `GET /api/reports/attack`（range=h24|d7|d30）与
+  `GET /api/reports/attack.csv`（UTF-8 BOM，Excel 直接打开）：
+  - 聚合维度：时间趋势（day/hour 分桶、Go 侧补零）、拦截分类分布、TOP IP、TOP 路径、
+    TOP 拦截原因（detail 列语义）各 topN=10，全部排除空值；
+  - 方言化分桶：`sqlutil.SubstrExpr` 输出 sqlite `substr(col,1,N)` / mysql·pg `LEFT(col,N)`，
+    三库同一套聚合 SQL 均可执行（MySQL/PG 后端完整验证）；
+  - 管理后台新增「📈 攻击报表」页：统计卡 + 趋势折线 + 分类饼图 + TOP 排行横向柱 +
+    时间范围切换 + 一键导出 CSV；
+  - 单测覆盖日/时粒度聚合、桶补零、CSV 转义、空库分支及 4 方言 SubstrExpr。
+
 ## [1.3.0] - 2026-10-25
 
 ### 新增

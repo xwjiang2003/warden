@@ -945,6 +945,35 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
             </el-row>
           </el-form>
         </div>
+
+        <!-- F14 告警模板库 -->
+        <div class="page-card" style="margin-top:16px">
+          <h3>告警模板（内置）</h3>
+          <div class="field-help">每个模板按默认/自定义阈值每 60 秒评估一次，命中后经上方已配置通道（SMTP/Webhook/钉钉/企业微信/飞书）发送；冷却时间复用上方设置，防刷屏。保存模板立即生效，无需重启。</div>
+          <el-row :gutter="16">
+            <el-col :span="12" v-for="t in alertTemplates" :key="t.id" style="margin-bottom:12px">
+              <div style="border:1px solid #ebeef5;border-radius:6px;padding:12px;height:100%">
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                  <b>{{ t.name }}</b>
+                  <el-switch v-model="t.enabled"></el-switch>
+                </div>
+                <div class="field-help" style="margin-top:4px">{{ t.desc }}</div>
+                <div class="field-help" style="margin-top:2px;opacity:.85">数据源：{{ t.data_source }}</div>
+                <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:8px">
+                  <div v-for="(v, k) in t.thresholds" :key="k" style="width:145px">
+                    <label style="font-size:12px;color:#606266">{{ k }}</label>
+                    <el-input-number v-model="t.thresholds[k]" :min="0" :max="1000000" size="small" style="width:100%"></el-input-number>
+                    <div style="font-size:11px;color:#909399;line-height:1.4">{{ t.param_desc[k] }}</div>
+                  </div>
+                </div>
+              </div>
+            </el-col>
+          </el-row>
+          <div style="text-align:right;margin-top:8px">
+            <el-button type="primary" @click="saveAlertTemplates" :loading="savingTemplates">保存模板</el-button>
+          </div>
+        </div>
+
         <div style="text-align:right;margin-top:8px">
           <el-button @click="sendTestEmail" :loading="emailTesting" style="margin-right:8px">发送测试邮件</el-button>
           <el-button type="primary" @click="saveConfig" :loading="saving">保存配置</el-button>
@@ -1174,6 +1203,8 @@ const app = createApp({
     const attackLogs = ref([])
     const attackLogFilter = ref('')
     const emailTesting = ref(false)
+    const alertTemplates = ref([])
+    const savingTemplates = ref(false)
 
     const pageTitle = computed(() => {
       const m = { dashboard:'仪表盘', basic:'基本设置', ratelimit:'频率限制', ccdefense:'CC 防御', wafrules:'WAF 规则', connlimit:'连接限制', sites:'代理站点', ipprotection:'IP 防护', trustedips:'可信 IP', greyips:'灰名单', alert:'告警通知', attacklogs:'攻击日志', attackreport:'攻击报表', logs:'访问日志' }
@@ -1400,8 +1431,35 @@ const app = createApp({
         if (config.url_blocklist == null) config.url_blocklist = []
         syncFromConfig()
         configLoaded.value = true
+        loadAlertTemplates()
       } catch (e) {
         ElementPlus.ElMessage.error('加载配置失败: ' + (e.response?.data?.error || e.message))
+      }
+    }
+
+    // F14 告警模板：加载（默认阈值 + 用户覆盖）
+    async function loadAlertTemplates() {
+      try {
+        const { data } = await api.get('/alert_templates')
+        alertTemplates.value = data.templates || []
+      } catch (e) { /* 静默失败 */ }
+    }
+
+    // F14 告警模板：保存（热生效，无需重启）
+    async function saveAlertTemplates() {
+      savingTemplates.value = true
+      try {
+        const payload = {
+          templates: alertTemplates.value.map(t => ({ id: t.id, enabled: t.enabled, thresholds: t.thresholds })),
+          cooldown_min: config.alert.cooldown_min || 10
+        }
+        const { data } = await api.put('/alert_templates', payload)
+        ElementPlus.ElMessage.success(data.message || '模板已保存')
+        loadAlertTemplates()
+      } catch (e) {
+        ElementPlus.ElMessage.error('保存模板失败: ' + (e.response?.data?.error || e.message))
+      } finally {
+        savingTemplates.value = false
       }
     }
 
@@ -1814,7 +1872,7 @@ const app = createApp({
       hotPathsText, ccPathsText, scannerPathsText, scannerUAsText, customScriptUAsText, customBlockPathsText,
       whitelistCIDRsText, firewallWhitelistCIDRsText, blacklistCIDRsText, urlAllowlistText, urlBlocklistText, alertToText, emailTesting, trustedProxiesText, trustedProxyWarnings,
       pageTitle, blockType, cpuColor, memColor, cpuPercent, memPercent,
-      navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, sendTestEmail, loadLogs, loadAttackLogs, clearAttackLogs, attackLogs, attackLogFilter, attackCategories, filteredAttackLogs,
+      navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, sendTestEmail, loadLogs, loadAttackLogs, clearAttackLogs, attackLogs, attackLogFilter, attackCategories, filteredAttackLogs, alertTemplates, saveAlertTemplates,
       categoryType, fmtDetail, loadTrustedIPs, onTrustedPageSize, fmtTime
     }
   }

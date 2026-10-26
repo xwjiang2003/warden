@@ -11,6 +11,7 @@ import (
 
 	"warden/internal/accesslog"
 	"warden/internal/config"
+	"warden/internal/metrics"
 	"warden/internal/util"
 )
 
@@ -117,6 +118,10 @@ func newReverseProxy(target *url.URL, al *accesslog.Logger) http.Handler {
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		al.Log(resp.Request, resp.StatusCode, resp.ContentLength)
+		// F14 后端异常检测：5xx 计数（后端摘除/异常模板数据源）
+		if resp.StatusCode >= 500 {
+			metrics.Backend5xx.Inc()
+		}
 		return nil
 	}
 	return proxy

@@ -34,6 +34,7 @@ var (
 	IPCheckBlocked   Counter // IP 归属拦截（国外/云厂商）
 	FirewallBlocked  Counter // 防火墙拉黑
 	WhitelistPass    Counter // 白名单放行
+	Backend5xx       Counter // 后端响应 5xx（摘除/异常检测，v1.4.0 F14）
 )
 
 // Snapshot 返回当前所有计数快照
@@ -59,6 +60,7 @@ func Snapshot() map[string]int64 {
 		"ip_check_blocked":   IPCheckBlocked.Value(),
 		"firewall_blocked":   FirewallBlocked.Value(),
 		"whitelist_pass":     WhitelistPass.Value(),
+		"backend_5xx":        Backend5xx.Value(),
 	}
 }
 
@@ -95,6 +97,7 @@ var promMetrics = []promMetric{
 	{"warden_ip_check_blocked", "Requests blocked by IP geo/cloud check.", func() int64 { return IPCheckBlocked.Value() }},
 	{"warden_firewall_blocked", "IPs blocked by firewall (cumulative).", func() int64 { return FirewallBlocked.Value() }},
 	{"warden_whitelist_pass", "Requests passed via trusted IP whitelist.", func() int64 { return WhitelistPass.Value() }},
+	{"warden_backend_5xx", "Responses from backend with 5xx status.", func() int64 { return Backend5xx.Value() }},
 }
 
 // PrometheusText 输出 Prometheus 文本格式（text/plain; version=0.0.4，无需外部库）。

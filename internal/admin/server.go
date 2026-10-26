@@ -84,6 +84,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /metrics", s.handlePrometheus)
 	s.mux.HandleFunc("POST /api/restart", s.handleRestart)
 	s.mux.HandleFunc("POST /api/alert/test", s.handleAlertTest)
+	s.mux.HandleFunc("GET /api/alert_templates", s.handleGetAlertTemplates)
+	s.mux.HandleFunc("PUT /api/alert_templates", s.handlePutAlertTemplates)
 	s.mux.HandleFunc("GET /api/license", s.handleLegal("LICENSE"))
 	s.mux.HandleFunc("GET /api/notice", s.handleLegal("NOTICE"))
 	s.mux.HandleFunc("GET /api/rules", s.handleGetRules)
@@ -308,6 +310,102 @@ func (s *Server) handleAlertTest(w http.ResponseWriter, r *http.Request) {
 	alert.NotifyAll(a, "[沃盾] 测试告警",
 		"这是一条来自沃盾 WAF 的测试告警。\n时间："+time.Now().Format(time.RFC3339))
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "message": "测试告警已发送（邮件 + Webhook 渠道）"})
+}
+
+// alertTplResp 模板详情（spec 元信息 + 用户覆盖值）
+type alertTplResp struct {
+	ID         string             `json:"id"`
+	Name       string             `json:"name"`
+	Desc       string             `json:"desc"`
+	DataSource string             `json:"data_source"`
+	Enabled    bool               `json:"enabled"`
+	Thresholds map[string]float64 `json:"thresholds"` // 生效阈值（默认 + 覆盖）
+	ParamDesc  map[string]string  `json:"param_desc"`
+}
+
+func (s *Server) handleGetAlertTemplates(w http.ResponseWriter, r *http.Request) {
+	merged := alert.MergeTemplates(s.cfg.Alert.Templates)
+	byID := make(map[string]config.AlertTemplateConfig, len(merged))
+	for _, t := range merged {
+		byID[t.ID] = t
+	}
+	specs := alert.DefaultTemplates()
+	resp := make([]alertTplResp, 0, len(specs))
+	for _, sp := range specs {
+		t := byID[sp.ID]
+		thr := make(map[string]float64, len(sp.Thresholds))
+		for k, v := range sp.Thresholds {
+			thr[k] = v
+		}
+		for k, v := range t.Thresholds {
+			if v > 0 {
+				thr[k] = v
+			}
+		}
+		resp = append(resp, alertTplResp{
+			ID: sp.ID, Name: sp.Name, Desc: sp.Desc, DataSource: sp.DataSource,
+			Enabled: t.Enabled, Thresholds: thr, ParamDesc: sp.ParamDesc,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"templates":    resp,
+		"cooldown_min": s.cfg.Alert.CooldownMin,
+	})
+}
+
+func (s *Server) handlePutAlertTemplates(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Templates    []config.AlertTemplateConfig `json:"templates"`
+		CooldownMin  int                          `json:"cooldown_min"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "JSON 解析失败: " + err.Error()})
+		return
+	}
+	// 白名单校验：只接受已知模板 ID
+	known := map[string]bool{}
+	for _, sp := range alert.DefaultTemplates() {
+		known[sp.ID] = true
+	}
+	clean := make([]config.AlertTemplateConfig, 0, len(req.Templates))
+	for _, t := range req.Templates {
+		if !known[t.ID] {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "未知模板: " + t.ID})
+			return
+		}
+		clean = append(clean, t)
+	}
+	if req.CooldownMin <= 0 {
+		req.CooldownMin = 10
+	}
+	// 合并（未启用的模板不再保留阈值覆盖）
+	merged := alert.MergeTemplates(clean)
+	for i := range merged {
+		for _, t := range clean {
+			if merged[i].ID == t.ID && t.Enabled {
+				merged[i] = t
+			}
+		}
+	}
+	s.cfg.Alert.Templates = merged
+	s.cfg.Alert.CooldownMin = req.CooldownMin
+	if err := store.Save(s.cfgPath, s.dbDriver, s.dbDSN, s.cfg); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入配置失败: " + err.Error()})
+		return
+	}
+	// F13 审计：告警模板变更（配置变更类，热生效无需重启）
+	auditlog.Record(auditlog.Event{
+		Type:   "config_changed",
+		IP:     util.ClientIP(r),
+		Method: r.Method,
+		Path:   r.URL.Path,
+		Detail: "告警模板配置已更新（热生效，无需重启）",
+	})
+	log.Printf("[admin] 告警模板已保存（热生效）")
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"message":          "告警模板已保存",
+		"restart_required": false,
+	})
 }
 
 func (s *Server) handleAttackLogs(w http.ResponseWriter, r *http.Request) {

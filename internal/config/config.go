@@ -144,6 +144,14 @@ func (c *AuditLogConfig) Normalize() {
 	}
 }
 
+// AlertTemplateConfig 单个告警模板的启用状态与阈值覆盖（v1.4.0 F14）。
+// 模板的元信息与默认阈值在 internal/alert/templates.go 定义；此处仅存用户改过的值。
+type AlertTemplateConfig struct {
+	ID         string             `json:"id"`          // 模板标识（flood/block_rule/captcha_rate/backend_down/attack_surge）
+	Enabled    bool               `json:"enabled"`     // 是否启用
+	Thresholds map[string]float64 `json:"thresholds"`  // 覆盖默认阈值（缺省用模板默认值）
+}
+
 // AlertConfig 邮件告警配置
 type AlertConfig struct {	Enabled            bool     `json:"enabled"`
 	SMTPHost           string   `json:"smtp_host"`
@@ -159,6 +167,7 @@ type AlertConfig struct {	Enabled            bool     `json:"enabled"`
 	DingTalkURL        string   `json:"dingtalk_url"`         // 钉钉机器人
 	WeComURL           string   `json:"wecom_url"`            // 企业微信机器人
 	FeishuURL          string   `json:"feishu_url"`           // 飞书机器人
+	Templates          []AlertTemplateConfig `json:"templates"` // 告警模板列表（F14）
 }
 
 func (c *AlertConfig) Normalize() {

@@ -86,6 +86,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/alert/test", s.handleAlertTest)
 	s.mux.HandleFunc("GET /api/alert_templates", s.handleGetAlertTemplates)
 	s.mux.HandleFunc("PUT /api/alert_templates", s.handlePutAlertTemplates)
+	s.mux.HandleFunc("GET /api/diagnostics", s.handleDiagnostics)
+	s.mux.HandleFunc("POST /api/diagnostics/apply", s.handleDiagnosticsApply)
 	s.mux.HandleFunc("GET /api/license", s.handleLegal("LICENSE"))
 	s.mux.HandleFunc("GET /api/notice", s.handleLegal("NOTICE"))
 	s.mux.HandleFunc("GET /api/rules", s.handleGetRules)
@@ -405,6 +407,81 @@ func (s *Server) handlePutAlertTemplates(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message":          "告警模板已保存",
 		"restart_required": false,
+	})
+}
+
+// handleDiagnostics 返回调参向导诊断（F15）：读取指标/CPU/攻击日志/配置 → 静态映射建议。
+func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
+	in := &DiagInput{
+		Snap: metrics.Snapshot(),
+		CPU:  util.SystemCPUPercent(),
+		Logs: attacklog.List(100),
+		Cfg:  s.cfg,
+	}
+	diags := buildDiagnostics(in)
+	// 摘要数据（前端展示）
+	snap := in.Snap
+	chal := challengeTotal(snap)
+	pass, fail := snap["captcha_passed"], snap["captcha_failed"]
+	passRate := 0.0
+	if pass+fail > 0 {
+		passRate = float64(pass) / float64(pass+fail) * 100
+	}
+	categoryCount := map[string]int64{}
+	for _, e := range in.Logs {
+		categoryCount[e.Category]++
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"diagnostics": diags,
+		"summary": map[string]interface{}{
+			"cpu_percent":     in.CPU,
+			"total_requests":  snap["total_requests"],
+			"block_total":     blockTotal(snap),
+			"challenge_total": chal,
+			"captcha_pass_rate": passRate,
+			"attack_log_count": len(in.Logs),
+			"top_categories":  categoryCount,
+		},
+		"restart_needed": s.restartNeeded.Load(),
+	})
+}
+
+// handleDiagnosticsApply 应用诊断建议到配置（写 DB + 审计，按既有"需重启"流程生效）。
+func (s *Server) handleDiagnosticsApply(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "JSON 解析失败: " + err.Error()})
+		return
+	}
+	if len(req.IDs) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请至少选择一条建议"})
+		return
+	}
+	applied := applyDiagnostics(s.cfg, req.IDs)
+	if len(applied) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "所选建议均不可一键应用（如 IP 归属拦截为人工决策项）"})
+		return
+	}
+	if err := store.Save(s.cfgPath, s.dbDriver, s.dbDSN, s.cfg); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入配置失败: " + err.Error()})
+		return
+	}
+	s.restartNeeded.Store(true)
+	// F13 审计：诊断应用（配置变更类）
+	auditlog.Record(auditlog.Event{
+		Type:   "config_changed",
+		IP:     util.ClientIP(r),
+		Method: r.Method,
+		Path:   r.URL.Path,
+		Detail: "调参向导应用建议: " + strings.Join(applied, ","),
+	})
+	log.Printf("[admin] 调参向导已应用: %v（需重启生效）", applied)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"message":          "建议已应用（部分更改需重启生效）",
+		"applied":          applied,
+		"restart_required": true,
 	})
 }
 

@@ -61,6 +61,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
       <el-menu-item index="sites">🌐 代理站点</el-menu-item>
       <el-menu-item index="ipprotection">🌐 IP 防护</el-menu-item>
       <el-menu-item index="alert">📧 告警通知</el-menu-item>
+      <el-menu-item index="diagnostic">🧭 调参向导</el-menu-item>
       <el-menu-item index="attacklogs">🛡️ 攻击日志</el-menu-item>
       <el-menu-item index="attackreport">📈 攻击报表</el-menu-item>
       <el-menu-item index="trustedips">✅ 可信 IP</el-menu-item>
@@ -980,6 +981,44 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         </div>
       </template>
 
+      <!-- 调参向导（F15） -->
+      <template v-if="currentRoute==='diagnostic'">
+        <div class="page-card">
+          <h3>调参向导</h3>
+          <div class="field-help">根据当前运行指标与攻击日志自动诊断问题并给出调参建议；每条建议说明「为什么改 / 改了影响什么」。点击「应用」将写入配置（部分更改需重启生效），建议规则为内置静态表，可随版本扩展。</div>
+          <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:12px">
+            <div class="stat-chip">CPU 使用率 <b>{{ diagSummary.cpu_percent != null ? diagSummary.cpu_percent.toFixed(1) + '%' : '—' }}</b></div>
+            <div class="stat-chip">累计请求 <b>{{ diagSummary.total_requests ?? '—' }}</b></div>
+            <div class="stat-chip">累计拦截 <b>{{ diagSummary.block_total ?? '—' }}</b></div>
+            <div class="stat-chip">挑战下发 <b>{{ diagSummary.challenge_total ?? '—' }}</b></div>
+            <div class="stat-chip">验证码通过率 <b>{{ diagSummary.captcha_pass_rate != null ? diagSummary.captcha_pass_rate.toFixed(1) + '%' : '—' }}</b></div>
+            <div class="stat-chip">攻击日志(近) <b>{{ diagSummary.attack_log_count ?? '—' }} 条</b></div>
+          </div>
+          <div style="margin-top:12px">
+            <el-button size="small" @click="loadDiagnostics" :loading="diagLoading" style="margin-right:8px">🔄 重新诊断</el-button>
+            <el-button size="small" type="primary" plain @click="applyDiagnostics" :disabled="diagApplicableCount === 0">全部应用（{{ diagApplicableCount }}）</el-button>
+          </div>
+        </div>
+
+        <div v-if="diagList.length === 0" class="page-card" style="margin-top:16px">
+          <el-empty description="当前运行状态良好，暂无调参建议" />
+        </div>
+
+        <div v-for="d in diagList" :key="d.id" class="page-card" style="margin-top:16px;border-left:3px solid #e6a23c">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <h4 style="margin:0;padding:0;border:none">{{ d.title }}</h4>
+            <el-button v-if="d.can_apply" size="small" type="primary" @click="applyDiagnostic(d.id)" :loading="applyingDiag===d.id">应用此建议</el-button>
+            <el-tag v-else size="small" type="info">人工决策</el-tag>
+          </div>
+          <div class="diag-row"><b>为什么：</b>{{ d.reason }}</div>
+          <div class="diag-row"><b>建议：</b>{{ d.action }}</div>
+          <div class="diag-row"><b>影响：</b>{{ d.impact }}</div>
+          <div v-if="d.target" class="diag-row" style="opacity:.85">
+            <b>将应用：</b><code>{{ JSON.stringify(d.target) }}</code>
+          </div>
+        </div>
+      </template>
+
       <!-- 攻击日志 -->
       <template v-if="currentRoute==='attacklogs'">
         <div class="page-card">
@@ -1205,9 +1244,14 @@ const app = createApp({
     const emailTesting = ref(false)
     const alertTemplates = ref([])
     const savingTemplates = ref(false)
+    const diagList = ref([])
+    const diagSummary = ref({})
+    const diagLoading = ref(false)
+    const applyingDiag = ref('')
+    const diagApplicableCount = computed(() => diagList.value.filter(d => d.can_apply).length)
 
     const pageTitle = computed(() => {
-      const m = { dashboard:'仪表盘', basic:'基本设置', ratelimit:'频率限制', ccdefense:'CC 防御', wafrules:'WAF 规则', connlimit:'连接限制', sites:'代理站点', ipprotection:'IP 防护', trustedips:'可信 IP', greyips:'灰名单', alert:'告警通知', attacklogs:'攻击日志', attackreport:'攻击报表', logs:'访问日志' }
+      const m = { dashboard:'仪表盘', basic:'基本设置', ratelimit:'频率限制', ccdefense:'CC 防御', wafrules:'WAF 规则', connlimit:'连接限制', sites:'代理站点', ipprotection:'IP 防护', trustedips:'可信 IP', greyips:'灰名单', alert:'告警通知', diagnostic:'调参向导', attacklogs:'攻击日志', attackreport:'攻击报表', logs:'访问日志' }
       return m[currentRoute.value] || '管理后台'
     })
     // 攻击日志：分类下拉选项（按出现次数去重排序）
@@ -1460,6 +1504,52 @@ const app = createApp({
         ElementPlus.ElMessage.error('保存模板失败: ' + (e.response?.data?.error || e.message))
       } finally {
         savingTemplates.value = false
+      }
+    }
+
+    // F15 调参向导：加载诊断
+    async function loadDiagnostics() {
+      diagLoading.value = true
+      try {
+        const { data } = await api.get('/diagnostics')
+        diagList.value = data.diagnostics || []
+        diagSummary.value = data.summary || {}
+      } catch (e) {
+        ElementPlus.ElMessage.error('诊断失败: ' + (e.response?.data?.error || e.message))
+      } finally {
+        diagLoading.value = false
+      }
+    }
+
+    // F15 调参向导：应用单条建议
+    async function applyDiagnostic(id) {
+      applyingDiag.value = id
+      try {
+        const { data } = await api.post('/diagnostics/apply', { ids: [id] })
+        ElementPlus.ElMessage.success((data.message || '已应用') + '，仪表盘将提示重启')
+        loadDiagnostics()
+      } catch (e) {
+        ElementPlus.ElMessage.error('应用失败: ' + (e.response?.data?.error || e.message))
+      } finally {
+        applyingDiag.value = ''
+      }
+    }
+
+    // F15 调参向导：全部应用
+    async function applyDiagnostics() {
+      const ids = diagList.value.filter(d => d.can_apply).map(d => d.id)
+      if (ids.length === 0) return
+      try {
+        await ElementPlus.ElMessageBox.confirm('将应用 ' + ids.length + ' 条可应用建议并写入配置（部分更改需重启生效），继续？', '应用确认', {
+          confirmButtonText: '应用', cancelButtonText: '取消', type: 'warning'
+        })
+      } catch (e) { return }
+      try {
+        const { data } = await api.post('/diagnostics/apply', { ids })
+        ElementPlus.ElMessage.success((data.message || '已应用') + '：' + (data.applied || []).join('、'))
+        loadDiagnostics()
+      } catch (e) {
+        ElementPlus.ElMessage.error('应用失败: ' + (e.response?.data?.error || e.message))
       }
     }
 
@@ -1795,6 +1885,7 @@ const app = createApp({
       }
       if (index === 'logs') loadLogs()
       if (index === 'trustedips') loadTrustedIPs(1)
+      if (index === 'diagnostic') loadDiagnostics()
       // 攻击报表：进入时加载并渲染，离开时销毁图表避免泄漏
       if (index === 'attackreport') loadReport()
       else disposeRepCharts()
@@ -1872,7 +1963,7 @@ const app = createApp({
       hotPathsText, ccPathsText, scannerPathsText, scannerUAsText, customScriptUAsText, customBlockPathsText,
       whitelistCIDRsText, firewallWhitelistCIDRsText, blacklistCIDRsText, urlAllowlistText, urlBlocklistText, alertToText, emailTesting, trustedProxiesText, trustedProxyWarnings,
       pageTitle, blockType, cpuColor, memColor, cpuPercent, memPercent,
-      navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, sendTestEmail, loadLogs, loadAttackLogs, clearAttackLogs, attackLogs, attackLogFilter, attackCategories, filteredAttackLogs, alertTemplates, saveAlertTemplates,
+      navigate, saveConfig, saveRateLimit, saveWAFRules, addSite, removeSite, restartService, sendTestEmail, loadLogs, loadAttackLogs, clearAttackLogs, attackLogs, attackLogFilter, attackCategories, filteredAttackLogs, alertTemplates, saveAlertTemplates, loadDiagnostics, applyDiagnostic, applyDiagnostics, diagList, diagSummary, diagApplicableCount,
       categoryType, fmtDetail, loadTrustedIPs, onTrustedPageSize, fmtTime
     }
   }

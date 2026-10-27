@@ -32,9 +32,28 @@ func TestUpsertSQLiteMySQL(t *testing.T) {
 		t.Fatalf("sqlite Upsert 应为 INSERT OR REPLACE: %s", sqlite)
 	}
 	mysql := DialectFor("mysql").Upsert("rules", []string{"key", "data", "updated_at"}, []string{"key"})
-	wantMySQL := "REPLACE INTO rules (`key`, `data`, `updated_at`) VALUES (?, ?, ?)"
+	wantMySQL := "INSERT INTO rules (`key`, `data`, `updated_at`) VALUES (?, ?, ?) " +
+		"ON DUPLICATE KEY UPDATE `data`=VALUES(`data`), `updated_at`=VALUES(`updated_at`)"
 	if mysql != wantMySQL {
 		t.Fatalf("mysql Upsert 错误:\n got=%s\nwant=%s", mysql, wantMySQL)
+	}
+}
+
+// TestPlaceholdersSkipsQuoted 校验引号内的 ? 不被当作占位符：
+// 值内自带问号（如 '<script>alert(?)</script>'）或标识符含 ? 时，
+// PG 不应多生成占位符导致参数个数不匹配。
+func TestPlaceholdersSkipsQuoted(t *testing.T) {
+	d := DialectFor("postgres")
+	got := d.Placeholders(`SELECT * FROM t WHERE detail = 'why?' AND "a?b" = ? AND c = ?`)
+	want := `SELECT * FROM t WHERE detail = 'why?' AND "a?b" = $1 AND c = $2`
+	if got != want {
+		t.Fatalf("引号内的 ? 不应替换:\n got=%s\nwant=%s", got, want)
+	}
+	// SQL 转义写法 '' 内部的 ? 同样跳过
+	got = d.Placeholders(`SELECT 'it''s ?' , ?`)
+	want = `SELECT 'it''s ?' , $1`
+	if got != want {
+		t.Fatalf("转义引号内的 ? 不应替换:\n got=%s\nwant=%s", got, want)
 	}
 }
 

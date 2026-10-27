@@ -18,13 +18,14 @@ import (
 
 // ---- TCP 连接限流器 (L4 层) ----
 // 在 TCP accept 阶段就丢弃过量连接，避免进入 HTTP 处理
+//
+// 复用 cc_defense.go 的 tokenBucket：此前的无锁 CAS 实现存在并发下
+// "退还令牌"的缺陷（实测约 4.7 倍超发），CC 限速与连接限流共用同一问题。
+// 这里只保留一个桶，锁争用可忽略。
 
 type ConnLimitListener struct {
 	net.Listener
-	rate       float64
-	burst      float64
-	tokens     int64
-	lastUpdate int64
+	limiter *tokenBucket
 }
 
 func NewConnLimitListener(inner net.Listener, maxConnsPerSec, burst int) net.Listener {
@@ -32,11 +33,8 @@ func NewConnLimitListener(inner net.Listener, maxConnsPerSec, burst int) net.Lis
 		return inner
 	}
 	return &ConnLimitListener{
-		Listener:   inner,
-		rate:       float64(maxConnsPerSec),
-		burst:      float64(burst),
-		tokens:     int64(burst) * 1e9,
-		lastUpdate: time.Now().UnixNano(),
+		Listener: inner,
+		limiter:  newTokenBucket(maxConnsPerSec, burst),
 	}
 }
 
@@ -63,26 +61,7 @@ func (l *ConnLimitListener) Accept() (net.Conn, error) {
 }
 
 func (l *ConnLimitListener) allow() bool {
-	now := time.Now().UnixNano()
-	for {
-		last := atomic.LoadInt64(&l.lastUpdate)
-		if last > now {
-			last = now
-		}
-		elapsed := float64(now-last) / 1e9
-		newTokens := atomic.LoadInt64(&l.tokens) + int64(elapsed*l.rate*1e9)
-		burstNano := int64(l.burst * 1e9)
-		if newTokens > burstNano {
-			newTokens = burstNano
-		}
-		if newTokens < 1e9 {
-			return false
-		}
-		if atomic.CompareAndSwapInt64(&l.tokens, atomic.LoadInt64(&l.tokens), newTokens-1e9) {
-			atomic.StoreInt64(&l.lastUpdate, now)
-			return true
-		}
-	}
+	return l.limiter.allow()
 }
 
 var discardCount int64
@@ -103,10 +82,13 @@ var discardCount int64
 //     不建议启用（系统级 netsh/PowerShell 写规则仍有开销，应用层挑战+灰名单已提供拦截）。
 
 const (
-	firewallRulePrefix   = "warden-block-"
-	firewallBatchSize    = 50             // 每条批量规则聚合的 IP 数
-	firewallMaxBlocked   = 8192           // 活跃拉黑 IP 上限（防规则无限膨胀）
-	firewallSyncInterval = 60 * time.Second // 全量重建周期
+	firewallRulePrefix = "warden-block-"
+	firewallBatchSize  = 50                  // 每条批量规则聚合的 IP 数
+	firewallMaxBlocked = 8192                // 活跃拉黑 IP 上限（防规则无限膨胀）
+	firewallSyncInterval = 60 * time.Second  // 全量重建周期
+	// Windows 规则重建节流：unblock 会唤醒即时重建，验证通过高峰时
+	// 每个 IP 都触发一次 PowerShell 全量重建会拖垮系统；窗口内合并为一次。
+	firewallSyncMinInterval = 10 * time.Second
 )
 
 type FirewallBlocker struct {
@@ -114,9 +96,11 @@ type FirewallBlocker struct {
 	blockedIPs  map[string]time.Time
 	whitelist   []*net.IPNet
 	expireAfter time.Duration
-	enabled     bool
-	blockCount  int64
-	store       *fwstore.Store
+	// enabled 运行期可能降级为 false（如 Linux ipset 初始化失败），
+	// 其他 goroutine 会并发读取，必须用原子变量而非普通 bool。
+	enabled    atomic.Bool
+	blockCount int64
+	store      *fwstore.Store
 
 	syncNow   chan struct{} // 容量 1：unblock/过期清理后唤醒立即全量重建
 	netshSem  chan struct{} // 容量 1：PowerShell 写操作互斥
@@ -127,13 +111,13 @@ func NewFirewallBlocker(enabled bool, expireMin int, whitelistCIDRs []string, st
 	fb := &FirewallBlocker{
 		blockedIPs:  make(map[string]time.Time),
 		expireAfter: time.Duration(expireMin) * time.Minute,
-		enabled:     enabled && (runtime.GOOS == "windows" || runtime.GOOS == "linux"),
 		store:       store,
 		syncNow:     make(chan struct{}, 1),
 		netshSem:    make(chan struct{}, 1),
 		maxBlocked:  firewallMaxBlocked,
 	}
-	if fb.enabled && expireMin <= 0 {
+	fb.enabled.Store(enabled && (runtime.GOOS == "windows" || runtime.GOOS == "linux"))
+	if fb.enabled.Load() && expireMin <= 0 {
 		fb.expireAfter = 30 * time.Minute
 	}
 	for _, cidr := range whitelistCIDRs {
@@ -151,7 +135,7 @@ func NewFirewallBlocker(enabled bool, expireMin int, whitelistCIDRs []string, st
 		}
 		fb.whitelist = append(fb.whitelist, netw)
 	}
-	if fb.enabled {
+	if fb.enabled.Load() {
 		go fb.restore() // 异步恢复内存态，不阻塞启动
 		log.Printf("[firewall] enabled, auto-expire=%v whitelist=%d ranges max_blocked=%d batch=%d/IP sync=%v",
 			fb.expireAfter, len(fb.whitelist), fb.maxBlocked, firewallBatchSize, firewallSyncInterval)
@@ -217,7 +201,7 @@ func chunkIPs(ips []string, size int) [][]string {
 //   - Linux：ipset hash:ip 集合全量重建（flush + restore 批量 add，单进程）+
 //     iptables 单条集合匹配规则（O(1) 匹配，不随 IP 数膨胀）。
 func (fb *FirewallBlocker) syncRules() {
-	if !fb.enabled {
+	if !fb.enabled.Load() {
 		return
 	}
 	switch runtime.GOOS {
@@ -315,9 +299,7 @@ func ipsetRestoreScript(ips []string, timeoutSec int) string {
 // 失败（含权限变更）时降级 enabled=false，避免每周期空转。
 func (fb *FirewallBlocker) syncRulesLinux() {
 	if err := fb.initLinuxFirewall(); err != nil {
-		fb.mu.Lock()
-		fb.enabled = false
-		fb.mu.Unlock()
+		fb.enabled.Store(false)
 		log.Printf("[firewall] Linux 防火墙初始化失败，已降级为仅日志（不进行内核封禁）: %v", err)
 		return
 	}
@@ -346,15 +328,32 @@ func (fb *FirewallBlocker) syncRulesLinux() {
 }
 
 // syncLoop 周期全量重建 + 响应即时重建唤醒。
+// Windows 下 PowerShell 全量重建开销大：unblock 唤醒的即时重建按
+// firewallSyncMinInterval 合并节流（窗口内的多次唤醒只补建一次），
+// 避免验证通过高峰时每个 IP 都拉起一次 PowerShell 拖垮系统；
+// Linux ipset 是单进程批量 add，开销低，不做延迟。
 func (fb *FirewallBlocker) syncLoop() {
 	ticker := time.NewTicker(firewallSyncInterval)
 	defer ticker.Stop()
+	var lastSync time.Time
 	for {
 		select {
 		case <-ticker.C:
 			fb.syncRules()
+			lastSync = time.Now()
 		case <-fb.syncNow:
+			if runtime.GOOS == "windows" {
+				if wait := firewallSyncMinInterval - time.Since(lastSync); wait > 0 {
+					time.Sleep(wait)
+					// 合并等待期间到达的唤醒，避免紧接着再重建一次
+					select {
+					case <-fb.syncNow:
+					default:
+					}
+				}
+			}
 			fb.syncRules()
+			lastSync = time.Now()
 		}
 	}
 }
@@ -380,10 +379,10 @@ func (fb *FirewallBlocker) isWhitelisted(ip string) bool {
 }
 
 func (fb *FirewallBlocker) block(ip, reason string) {
-	if !fb.enabled || ip == "" || ip == "127.0.0.1" || ip == "::1" || fb.isWhitelisted(ip) {
+	if !fb.enabled.Load() || ip == "" || ip == "127.0.0.1" || ip == "::1" || fb.isWhitelisted(ip) {
 		return
 	}
-		fb.mu.Lock()
+	fb.mu.Lock()
 	if len(fb.blockedIPs) >= fb.maxBlocked {
 		fb.mu.Unlock()
 		log.Printf("[firewall] 拉黑列表已达上限 %d，拒绝新增 ip=%s", fb.maxBlocked, ip)
@@ -396,11 +395,15 @@ func (fb *FirewallBlocker) block(ip, reason string) {
 	now := time.Now()
 	fb.blockedIPs[ip] = now
 	fb.blockCount++
+	total := fb.blockCount
 	metrics.FirewallBlocked.Inc()
+	fb.mu.Unlock()
+
+	// 持久化放在锁外：SQLite 写库（繁忙时 sqlutil.Retry 最长退避 1.5s）
+	// 若持锁执行，会阻塞所有并发 block/unblock/syncRules。
 	if fb.store != nil {
 		fb.store.Save(ip, reason, now)
 	}
-	fb.mu.Unlock()
 
 	// 性能：内存态先行；防火墙规则由 syncLoop 周期全量重建（批量规则聚合），
 	// block() 不触碰 netsh/PowerShell，正常请求路径零阻塞。
@@ -408,9 +411,9 @@ func (fb *FirewallBlocker) block(ip, reason string) {
 	auditlog.Record(auditlog.Event{
 		Type:   "firewall_block",
 		IP:     ip,
-		Detail: fmt.Sprintf("reason=%s total=%d", reason, fb.blockCount),
+		Detail: fmt.Sprintf("reason=%s total=%d", reason, total),
 	})
-	log.Printf("[firewall] BLOCKED ip=%s reason=%s total=%d (规则周期批量写入)", ip, reason, fb.blockCount)
+	log.Printf("[firewall] BLOCKED ip=%s reason=%s total=%d (规则周期批量写入)", ip, reason, total)
 }
 
 // unblock 解除一个 IP 的防火墙拉黑（验证码通过时调用）。

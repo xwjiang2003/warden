@@ -229,14 +229,27 @@ func TrustLocalProxy() bool { return defaultClientIPResolver.localProxy }
 //
 // 必须挂在整个中间件链的最外层，WAF 与所有以 IP 为判据的中间件都在它下游。
 // 端口沿用原始对端的真实端口（Coraza 会解析它做 ProcessConnection）。
+//
+// 解析完成后立即删除转发头：RemoteAddr 已经是最终答案，下游再调 ClientIP
+// （如反代 Rewrite、日志中间件）时不应再看到 XFF。若保留，一旦改写后的
+// 对端地址本身落在 trusted_proxies 网段内，下游会把陈旧的转发头二次解析，
+// 取到客户端自填的链首地址——同一请求在不同层得到不同 IP。
+// 转发给后端的 X-Forwarded-For / X-Real-IP 由 reverse proxy 用 RemoteAddr 重建。
 func RealIPMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if ip := ClientIP(r); ip != "" {
-			if i := strings.LastIndex(r.RemoteAddr, ":"); i >= 0 {
-				r.RemoteAddr = ip + r.RemoteAddr[i:]
+			// IPv6 必须用 JoinHostPort 生成 "[ip]:port"：直接拼接会让
+			// "2001:db8::99" + ":51000" 变成 "2001:db8::99:51000"，
+			// 下游 SplitHostPort 解析失败（端口 5 位）或把端口并进地址
+			// （端口 1~4 位仍是合法 IPv6 字面量），导致 IPv6 客户端 IP
+			// 变成空串/错误值，限流与转发头全部失真。
+			if _, port, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+				r.RemoteAddr = net.JoinHostPort(ip, port)
 			} else {
-				r.RemoteAddr = ip
+				r.RemoteAddr = ip // 无端口的内部调用/测试
 			}
+			r.Header.Del("X-Forwarded-For")
+			r.Header.Del("X-Real-IP")
 		}
 		next.ServeHTTP(w, r)
 	})

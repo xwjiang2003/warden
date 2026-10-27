@@ -2,14 +2,15 @@ package proxy
 
 import (
 	"bytes"
-	crand "crypto/rand"
 	"crypto/hmac"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"hash/adler32"
 	"hash/crc32"
+	"html"
 	"image"
 	"image/color"
 	"image/png"
@@ -37,19 +38,30 @@ import (
 // 不接任何第三方服务，全部标准库实现。
 
 const (
-	sliderWidth    = 320
-	sliderHeight   = 120
-	sliderBlock    = 42 // 拼图块边长
-	sliderYRange   = 28 // 缺口纵坐标随机范围（距顶偏移 30..30+range）
-	sliderTolerance = 4 // 偏移容差（px）
-	sliderTTL      = 60 * time.Second
-	sliderMinDurMs = 300 // 拖动时长下限（ms）
-	sliderMinTrail = 6   // 轨迹点数下限
-	sliderFormPath = "/__cc_slider_verify"
+	sliderWidth     = 320
+	sliderHeight    = 120
+	sliderBlock     = 42 // 拼图块边长
+	sliderYRange    = 28 // 缺口纵坐标随机范围（距顶偏移 30..30+range）
+	sliderTolerance = 4  // 偏移容差（px）
+	sliderTTL       = 60 * time.Second
+	sliderMinDurMs  = 300 // 拖动时长下限（ms）
+	sliderMinTrail  = 6   // 轨迹点数下限
+	sliderFormPath  = "/__cc_slider_verify"
 
 	// 产能上限复用点选验证码语义：滑动生成同样走 PNG 编码，防 OOM。
 	sliderMaxEntries = 100000
+
+	// 每 IP 失败尝试上限：失败后重发挑战页面会让攻击者无限刷验证，
+	// 这里按窗口计数，超限直接 429（不再重发页面）。
+	sliderFailWindow   = 10 * time.Minute
+	sliderMaxFailPerIP = 10
 )
+
+// slideFail 单个 IP 的滑动验证失败计数（滑动窗口）。
+type slideFail struct {
+	count int
+	reset time.Time
+}
 
 type slideItem struct {
 	id        string
@@ -62,6 +74,8 @@ type slideItem struct {
 type slideStore struct {
 	mu sync.Mutex
 	m  map[string]*slideItem
+	// fails 每 IP 失败计数（窗口内），防失败重发被无限刷。
+	fails map[string]*slideFail
 	// 生成节流：每秒生成数（复用 captcha 的产能语义）
 	genWindowStart time.Time
 	genCount       int
@@ -74,8 +88,42 @@ func newSlideStore(genMaxPerSec int) *slideStore {
 	}
 	return &slideStore{
 		m:            make(map[string]*slideItem),
+		fails:        make(map[string]*slideFail),
 		genMaxPerSec: genMaxPerSec,
 	}
+}
+
+// recordFail 记录一次失败；返回 true 表示该 IP 已超过窗口内允许的失败次数。
+func (s *slideStore) recordFail(ip string) bool {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, ok := s.fails[ip]
+	if !ok || now.After(f.reset) {
+		f = &slideFail{reset: now.Add(sliderFailWindow)}
+		s.fails[ip] = f
+	}
+	f.count++
+	return f.count > sliderMaxFailPerIP
+}
+
+// clearFail 验证通过后清除该 IP 的失败计数。
+func (s *slideStore) clearFail(ip string) {
+	s.mu.Lock()
+	delete(s.fails, ip)
+	s.mu.Unlock()
+}
+
+// failExceeded 只读判断该 IP 是否已超限（不增加计数）。
+func (s *slideStore) failExceeded(ip string) bool {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, ok := s.fails[ip]
+	if !ok || now.After(f.reset) {
+		return false
+	}
+	return f.count > sliderMaxFailPerIP
 }
 
 func (s *slideStore) sweep(now time.Time) int {
@@ -86,6 +134,12 @@ func (s *slideStore) sweep(now time.Time) int {
 		if now.After(v.expiresAt) {
 			delete(s.m, k)
 			removed++
+		}
+	}
+	// 失败计数窗口已过的条目一并回收，避免无界增长。
+	for ip, f := range s.fails {
+		if now.After(f.reset) {
+			delete(s.fails, ip)
 		}
 	}
 	if len(s.m) > sliderMaxEntries {
@@ -150,7 +204,7 @@ func (h *CCDefenseHandler) serveSlider(w http.ResponseWriter, r *http.Request, i
 
 	metrics.SliderChallenged.Inc()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(sliderHTML(id, sig, targetX, expires, bgB64, blockB64, r.URL.String())))
+	w.Write([]byte(sliderHTML(id, sig, targetX, gapY, expires, bgB64, blockB64, r.URL.String())))
 }
 
 // handleSliderVerify 校验滑动提交：签名/过期/偏移/时长/轨迹 → 签发可信会话。
@@ -177,6 +231,15 @@ func (h *CCDefenseHandler) handleSliderVerify(w http.ResponseWriter, r *http.Req
 		// 失败重发滑动验证页（保留原目标地址），并进入失败冷却：
 		// 窗口内该 IP 的后续请求直接重发挑战，防止 flooding 窗口稀释后按 per-IP 放行。
 		h.markChallengeFail(ip, ChallengeHigh)
+		// 每 IP 失败上限：超过窗口内允许次数后不再重发页面（否则等于免费无限刷验证）。
+		if h.slide.recordFail(ip) {
+			metrics.CCBlocked.Inc()
+			if h.throttle.allow("slider:" + ip) {
+				log.Printf("[cc_defense] slider ip=%s too many failed attempts, denying", ip)
+			}
+			util.DenyConnection(w, http.StatusTooManyRequests, "429 验证失败次数过多，请稍后重试\n")
+			return
+		}
 		h.serveSlider(w, r, ip)
 	}
 	if id == "" || sig == "" || errX != nil || errE != nil || errD != nil || errT != nil {
@@ -198,8 +261,9 @@ func (h *CCDefenseHandler) handleSliderVerify(w http.ResponseWriter, r *http.Req
 		fail()
 		return
 	}
-	// 签名校验（sid/ip/targetX/expires 任一被改 → 拒绝）
-	if sig != h.sliderSign(sid, ip, it.targetX, expires) {
+	// 签名校验（sid/ip/targetX/expires 任一被改 → 拒绝）。
+	// 用 hmac.Equal 常数时间比较，避免逐字节比较泄露签名前缀。
+	if !hmac.Equal([]byte(sig), []byte(h.sliderSign(sid, ip, it.targetX, expires))) {
 		fail()
 		return
 	}
@@ -400,7 +464,9 @@ func drawRectBorder(dst *image.RGBA, x, y, size int, col color.RGBA) {
 }
 
 // sliderHTML 滑动验证页：背景图 + 拼图块 + 原生拖拽（mouse + touch）。
-func sliderHTML(id, sig string, targetX int, expires int64, bgB64, blockB64, targetURL string) string {
+// gapY 是缺口在背景图中的纵坐标：拼图块必须初始就位于同一高度，
+// 否则用户只能横向拖动、块却始终贴在顶部，视觉上与缺口错位（看起来无法拼合）。
+func sliderHTML(id, sig string, targetX, gapY int, expires int64, bgB64, blockB64, targetURL string) string {
 	page := `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -413,7 +479,7 @@ body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background
 h3{margin:0 0 12px;font-size:16px}
 .wrap{position:relative;margin:0 auto 16px;width:320px;height:120px;overflow:hidden;border-radius:6px;border:1px solid #e3e8ef}
 .bg{width:320px;height:120px;display:block}
-.block{position:absolute;top:0;left:0;width:42px;height:42px;cursor:pointer;box-shadow:0 0 0 2px #fff}
+.block{position:absolute;top:__Y__px;left:0;width:42px;height:42px;cursor:pointer;box-shadow:0 0 0 2px #fff}
 .track{position:relative;width:320px;height:44px;margin:0 auto;background:#eef1f5;border-radius:22px;border:1px solid #dde3ea}
 .fill{position:absolute;left:0;top:0;bottom:0;width:0;background:#3b82f6;border-radius:22px;opacity:.2}
 .btn{position:absolute;left:0;top:0;width:44px;height:44px;background:#fff;border:1px solid #cbd5e1;border-radius:22px;cursor:pointer;font-size:18px;line-height:44px;color:#3b82f6;text-align:center;user-select:none;-webkit-user-select:none}
@@ -464,6 +530,7 @@ p.msg{font-size:13px;color:#888;margin:10px 0 0}
 		"__ID__", id,
 		"__SIG__", sig,
 		"__EXP__", strconv.FormatInt(expires, 10),
-		"__URL__", targetURL,
+		"__Y__", strconv.Itoa(gapY),
+		"__URL__", html.EscapeString(targetURL),
 	).Replace(page)
 }

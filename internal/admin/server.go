@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	rtmetrics "runtime/metrics"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,26 +35,63 @@ import (
 	"warden/internal/waf"
 )
 
+// authCred Basic Auth 凭据快照。empty 为真表示当前未设置密码（管理后台不可用）。
+// 保存配置后原子替换，因此修改 admin.password 无需重启进程即可生效。
+type authCred struct {
+	user  string
+	hash  [sha256.Size]byte
+	empty bool
+}
+
+func newAuthCred(c config.AdminConfig) *authCred {
+	return &authCred{
+		user:  c.Username,
+		hash:  sha256.Sum256([]byte(c.Password)),
+		empty: c.Password == "",
+	}
+}
+
+// Basic Auth 失败限速参数：同一客户端在窗口内连续输错达上限后锁定一段时间。
+// 管理后台默认只监听回环，但不应把安全性建立在"没人能连上"这个前提上。
+const (
+	adminAuthMaxFails   = 10
+	adminAuthFailWindow = 10 * time.Minute
+	adminAuthLockout    = 5 * time.Minute
+)
+
+type authFailState struct {
+	fails       int
+	windowStart time.Time
+	until       time.Time
+}
+
 // Server 管理后台服务
 type Server struct {
-	cfg           *config.Config
+	// cfg 当前生效配置的并发安全容器：读取一律 Load()，更新一律
+	// 复制-修改-替换（见 handlePutConfig / publish），避免 *cfg = newCfg
+	// 与告警循环、其他 API 的并发读产生数据竞争。
+	cfg           *config.Holder
 	cfgPath       string
 	dbDriver      string
 	dbDSN         string
 	adminCfg      config.AdminConfig
-	startTime     time.Time
-	mux           *http.ServeMux
+	// auth 当前生效的 Basic Auth 凭据；保存配置后原子替换（密码热生效）。
+	auth      atomic.Pointer[authCred]
+	startTime time.Time
+	mux       *http.ServeMux
+	// Basic Auth 失败计数（按客户端地址），防暴力破解。
+	authFailsMu sync.Mutex
+	authFails   map[string]*authFailState
 	trustStore    *truststore.Store
 	greyStore     *greyliststore.Store
 	restartNeeded atomic.Bool // 保存配置后置位，重启进程后清零
 	// 规则在线管理（F3）：注入后 GET/PUT /api/rules 可用
 	ruleDriver string
 	ruleDSN    string
-	wafRules   *config.WAFRulesConfig
 	holder     *waf.Holder
 }
 
-func NewServer(cfg *config.Config, cfgPath, dbDriver, dbDSN string, adminCfg config.AdminConfig) *Server {
+func NewServer(cfg *config.Holder, cfgPath, dbDriver, dbDSN string, adminCfg config.AdminConfig) *Server {
 	adminCfg.Normalize()
 	s := &Server{
 		cfg:       cfg,
@@ -63,6 +102,7 @@ func NewServer(cfg *config.Config, cfgPath, dbDriver, dbDSN string, adminCfg con
 		startTime: time.Now(),
 		mux:       http.NewServeMux(),
 	}
+	s.auth.Store(newAuthCred(adminCfg))
 	s.registerRoutes()
 	return s
 }
@@ -96,17 +136,32 @@ func (s *Server) registerRoutes() {
 }
 
 func (s *Server) handler() http.Handler {
-	if s.adminCfg.Password != "" {
-		return s.authMiddleware(s.mux)
+	// 空密码 = 无任何认证，而管理后台可改规则/配置/告警，
+	// 因此绝不能以裸 mux 对外提供服务。Start 会直接拒绝启动；
+	// 这里再兜底一层，防止将来有调用方绕过 Start 直接使用 handler。
+	if c := s.auth.Load(); c == nil || c.empty {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "admin: password not configured", http.StatusServiceUnavailable)
+		})
 	}
-	return s.mux
+	return s.authMiddleware(s.mux)
 }
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
-	expectedUser := s.adminCfg.Username
-	expectedHash := sha256.Sum256([]byte(s.adminCfg.Password))
-
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 每次请求取最新凭据：保存配置改了密码后立即生效，无需重启。
+		c := s.auth.Load()
+		if c == nil || c.empty {
+			http.Error(w, "admin: password not configured", http.StatusServiceUnavailable)
+			return
+		}
+		key := authFailKey(r)
+		now := time.Now()
+		if s.authLockedOut(key, now) {
+			w.Header().Set("Retry-After", "60")
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return
+		}
 		user, pass, ok := r.BasicAuth()
 		if !ok {
 			w.Header().Set("WWW-Authenticate", `Basic realm="WAF Admin"`)
@@ -114,20 +169,91 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		passHash := sha256.Sum256([]byte(pass))
-		if subtle.ConstantTimeCompare([]byte(user), []byte(expectedUser)) != 1 ||
-			subtle.ConstantTimeCompare(passHash[:], expectedHash[:]) != 1 {
+		if subtle.ConstantTimeCompare([]byte(user), []byte(c.user)) != 1 ||
+			subtle.ConstantTimeCompare(passHash[:], c.hash[:]) != 1 {
+			s.recordAuthFail(key, now)
 			w.Header().Set("WWW-Authenticate", `Basic realm="WAF Admin"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+		s.clearAuthFails(key)
 		next.ServeHTTP(w, r)
 	})
+}
+
+// authFailKey 取客户端地址（去掉端口）作为失败计数键。
+func authFailKey(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+// authLockedOut 判断该客户端是否仍在锁定窗口内。
+func (s *Server) authLockedOut(key string, now time.Time) bool {
+	s.authFailsMu.Lock()
+	defer s.authFailsMu.Unlock()
+	st, ok := s.authFails[key]
+	if !ok {
+		return false
+	}
+	if now.Before(st.until) {
+		return true
+	}
+	if now.Sub(st.windowStart) >= adminAuthFailWindow {
+		delete(s.authFails, key)
+	}
+	return false
+}
+
+// recordAuthFail 记录一次凭据错误；窗口内累计达上限后锁定一段时间。
+func (s *Server) recordAuthFail(key string, now time.Time) {
+	s.authFailsMu.Lock()
+	defer s.authFailsMu.Unlock()
+	if s.authFails == nil {
+		s.authFails = make(map[string]*authFailState)
+	}
+	// 惰性清理：条目过多时回收已过窗口的记录，避免无界增长。
+	if len(s.authFails) > 256 {
+		for k, st := range s.authFails {
+			if now.After(st.until) && now.Sub(st.windowStart) >= adminAuthFailWindow {
+				delete(s.authFails, k)
+			}
+		}
+	}
+	st, ok := s.authFails[key]
+	if !ok || now.Sub(st.windowStart) >= adminAuthFailWindow {
+		st = &authFailState{windowStart: now}
+		s.authFails[key] = st
+	}
+	st.fails++
+	if st.fails >= adminAuthMaxFails {
+		st.fails = 0
+		st.windowStart = now
+		st.until = now.Add(adminAuthLockout)
+	}
+}
+
+// clearAuthFails 认证成功后清零该客户端的失败计数。
+func (s *Server) clearAuthFails(key string) {
+	s.authFailsMu.Lock()
+	delete(s.authFails, key)
+	s.authFailsMu.Unlock()
 }
 
 // Start 启动管理后台服务（非阻塞，goroutine 内监听）
 func (s *Server) Start() {
 	if !s.adminCfg.Enabled {
 		log.Printf("[admin] 管理后台已禁用")
+		return
+	}
+	// 空密码等于无认证：管理后台能改 WAF 规则、放行 IP、调整告警，
+	// 裸奔监听（尤其 docker 默认的 0.0.0.0:9090）等于把防护交给攻击者。
+	// 这里拒绝启动而不是自动生成密码——自动生成的密码用户看不到，
+	// 只是把"无认证"伪装成"有认证"。请显式配置 admin.password 后重启。
+	if s.adminCfg.Password == "" {
+		log.Printf("[admin] 已启用但 admin.password 为空：拒绝启动管理后台。" +
+			"空密码等于无认证，请设置密码后重启；若不需要管理后台请设 admin.enabled=false")
 		return
 	}
 
@@ -177,7 +303,7 @@ func (s *Server) handleLegal(name string) http.HandlerFunc {
 }
 
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
-	cfgCopy := *s.cfg
+	cfgCopy := *s.cfg.Load()
 	if cfgCopy.CCDefense.ChallengeCookieKey != "" {
 		cfgCopy.CCDefense.ChallengeCookieKey = "***"
 	}
@@ -191,22 +317,35 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
-	var newCfg config.Config
-	if err := json.NewDecoder(r.Body).Decode(&newCfg); err != nil {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "读取请求体失败: " + err.Error(),
+		})
+		return
+	}
+	cur := s.cfg.Load()
+	// 浅合并：请求中出现的顶层块整体覆盖，缺失的块沿用当前生效配置。
+	// 这样"只 PUT 少数字段"不会把未提交的块（如 admin）静默关掉。
+	merged, err := mergeConfigJSON(cur, body)
+	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "JSON 解析失败: " + err.Error(),
 		})
 		return
 	}
-
+	newCfg := *merged
 	if newCfg.CCDefense.ChallengeCookieKey == "***" || newCfg.CCDefense.ChallengeCookieKey == "" {
-		newCfg.CCDefense.ChallengeCookieKey = s.cfg.CCDefense.ChallengeCookieKey
+		newCfg.CCDefense.ChallengeCookieKey = cur.CCDefense.ChallengeCookieKey
 	}
-	if newCfg.Admin.Password == "***" {
-		newCfg.Admin.Password = s.cfg.Admin.Password
+	// 空密码等于关闭认证，而管理后台不再允许以无认证方式运行：
+	// 前端回显的是 "***"，但部分 PUT 直接省略该字段时也会是空串——
+	// 两种都按"保持原密码"处理，避免一次保存就把认证静默清空。
+	if newCfg.Admin.Password == "***" || newCfg.Admin.Password == "" {
+		newCfg.Admin.Password = cur.Admin.Password
 	}
 	if newCfg.Alert.SMTPPassword == "***" {
-		newCfg.Alert.SMTPPassword = s.cfg.Alert.SMTPPassword
+		newCfg.Alert.SMTPPassword = cur.Alert.SMTPPassword
 	}
 
 	if newCfg.Listen == "" {
@@ -221,11 +360,17 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	if newCfg.AccessLog == "" {
 		newCfg.AccessLog = "logs/access.log"
 	}
+	// 与 config.ApplyDefaults 保持一致：所有子结构都要归一，
+	// 否则部分字段缺失时会留下"关闭/零值"的生效配置。
 	newCfg.AccessLogRotate.Normalize()
+	newCfg.RateLimit.Normalize()
+	newCfg.CCDefense.Normalize()
+	newCfg.WAFRules.Normalize()
 	newCfg.ConnLimit.Normalize()
 	newCfg.FirewallBlock.Normalize()
-	newCfg.CCDefense.Normalize()
 	newCfg.Alert.Normalize()
+	newCfg.Admin.Normalize()
+	newCfg.TLS.Normalize()
 
 	// 可信代理写错会导致"日志里全是 nginx 的 IP"或"IP 可被伪造"，
 	// 这里在保存前就拦下来，避免用户只能靠重启日志排查。
@@ -244,7 +389,10 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	*s.cfg = newCfg
+	s.publish(&newCfg)
+	// 凭据热生效：改了 admin.username/password 后下一次请求即按新凭据校验，
+	// 监听地址等仍需重启。
+	s.auth.Store(newAuthCred(newCfg.Admin))
 	s.restartNeeded.Store(true)
 
 	// F13 审计：配置变更事件（含触发方 IP）
@@ -261,6 +409,36 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		"message":          "配置已保存",
 		"restart_required": true,
 	})
+}
+
+// mergeConfigJSON 把 PUT 请求体按顶层字段浅合并到当前配置上：
+// 请求中出现的块整体覆盖，缺失的块沿用当前生效值。
+// 换句话说，部分 PUT（只改 listen 等个别字段）不会把 admin/告警等块清零。
+func mergeConfigJSON(cur *config.Config, body []byte) (*config.Config, error) {
+	var incoming map[string]json.RawMessage
+	if err := json.Unmarshal(body, &incoming); err != nil {
+		return nil, err
+	}
+	b, err := json.Marshal(config.Clone(cur))
+	if err != nil {
+		return nil, err
+	}
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(b, &merged); err != nil {
+		return nil, err
+	}
+	for k, v := range incoming {
+		merged[k] = v
+	}
+	out, err := json.Marshal(merged)
+	if err != nil {
+		return nil, err
+	}
+	var cfg config.Config
+	if err := json.Unmarshal(out, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
 }
 
 // validateTrustedProxies 校验可信代理列表，返回问题描述（空表示通过）。
@@ -304,7 +482,7 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAlertTest(w http.ResponseWriter, r *http.Request) {
-	a := &s.cfg.Alert
+	a := &s.cfg.Load().Alert
 	if a.SMTPHost == "" && a.WebhookURL == "" && a.DingTalkURL == "" && a.WeComURL == "" && a.FeishuURL == "" {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": false, "error": "尚未配置任何通知渠道（SMTP/Webhook/钉钉/企业微信/飞书）"})
 		return
@@ -326,7 +504,8 @@ type alertTplResp struct {
 }
 
 func (s *Server) handleGetAlertTemplates(w http.ResponseWriter, r *http.Request) {
-	merged := alert.MergeTemplates(s.cfg.Alert.Templates)
+	cur := s.cfg.Load()
+	merged := alert.MergeTemplates(cur.Alert.Templates)
 	byID := make(map[string]config.AlertTemplateConfig, len(merged))
 	for _, t := range merged {
 		byID[t.ID] = t
@@ -351,16 +530,16 @@ func (s *Server) handleGetAlertTemplates(w http.ResponseWriter, r *http.Request)
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"templates":    resp,
-		"cooldown_min": s.cfg.Alert.CooldownMin,
+		"cooldown_min": cur.Alert.CooldownMin,
 	})
 }
 
 func (s *Server) handlePutAlertTemplates(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Templates    []config.AlertTemplateConfig `json:"templates"`
-		CooldownMin  int                          `json:"cooldown_min"`
+		Templates   []config.AlertTemplateConfig `json:"templates"`
+		CooldownMin int                          `json:"cooldown_min"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "JSON 解析失败: " + err.Error()})
 		return
 	}
@@ -389,12 +568,15 @@ func (s *Server) handlePutAlertTemplates(w http.ResponseWriter, r *http.Request)
 			}
 		}
 	}
-	s.cfg.Alert.Templates = merged
-	s.cfg.Alert.CooldownMin = req.CooldownMin
-	if err := store.Save(s.cfgPath, s.dbDriver, s.dbDSN, s.cfg); err != nil {
+	// 热生效：复制当前配置后替换告警模板，再原子发布（不修改已发布的只读对象）。
+	next := config.Clone(s.cfg.Load())
+	next.Alert.Templates = merged
+	next.Alert.CooldownMin = req.CooldownMin
+	if err := store.Save(s.cfgPath, s.dbDriver, s.dbDSN, next); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入配置失败: " + err.Error()})
 		return
 	}
+	s.publish(next)
 	// F13 审计：告警模板变更（配置变更类，热生效无需重启）
 	auditlog.Record(auditlog.Event{
 		Type:   "config_changed",
@@ -416,7 +598,7 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 		Snap: metrics.Snapshot(),
 		CPU:  util.SystemCPUPercent(),
 		Logs: attacklog.List(100),
-		Cfg:  s.cfg,
+		Cfg:  s.cfg.Load(),
 	}
 	diags := buildDiagnostics(in)
 	// 摘要数据（前端展示）
@@ -434,13 +616,13 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"diagnostics": diags,
 		"summary": map[string]interface{}{
-			"cpu_percent":     in.CPU,
-			"total_requests":  snap["total_requests"],
-			"block_total":     blockTotal(snap),
-			"challenge_total": chal,
+			"cpu_percent":       in.CPU,
+			"total_requests":    snap["total_requests"],
+			"block_total":       blockTotal(snap),
+			"challenge_total":   chal,
 			"captcha_pass_rate": passRate,
-			"attack_log_count": len(in.Logs),
-			"top_categories":  categoryCount,
+			"attack_log_count":  len(in.Logs),
+			"top_categories":    categoryCount,
 		},
 		"restart_needed": s.restartNeeded.Load(),
 	})
@@ -451,7 +633,7 @@ func (s *Server) handleDiagnosticsApply(w http.ResponseWriter, r *http.Request) 
 	var req struct {
 		IDs []string `json:"ids"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "JSON 解析失败: " + err.Error()})
 		return
 	}
@@ -459,15 +641,18 @@ func (s *Server) handleDiagnosticsApply(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请至少选择一条建议"})
 		return
 	}
-	applied := applyDiagnostics(s.cfg, req.IDs)
+	// 复制-修改-替换：诊断调参写入新配置对象，避免与原对象的并发读冲突。
+	next := config.Clone(s.cfg.Load())
+	applied := applyDiagnostics(next, req.IDs)
 	if len(applied) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "所选建议均不可一键应用（如 IP 归属拦截为人工决策项）"})
 		return
 	}
-	if err := store.Save(s.cfgPath, s.dbDriver, s.dbDSN, s.cfg); err != nil {
+	if err := store.Save(s.cfgPath, s.dbDriver, s.dbDSN, next); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入配置失败: " + err.Error()})
 		return
 	}
+	s.publish(next)
 	s.restartNeeded.Store(true)
 	// F13 审计：诊断应用（配置变更类）
 	auditlog.Record(auditlog.Event{
@@ -560,27 +745,37 @@ func (s *Server) SetGreyStore(store *greyliststore.Store) {
 }
 
 // SetRuleRepo 注入规则仓库（F3 规则在线管理）：driver/dsn 指定规则库（sqlite/mysql/postgres）、
-// wr 指向进程内生效的 WAFRules 配置、holder 为热更新引擎容器。
+// holder 为热更新引擎容器。生效中的 WAFRules 一律从 s.cfg.Load() 读取。
 // main.go 启动时注入；未注入时 /api/rules 返回 503。
-func (s *Server) SetRuleRepo(driver, dsn string, wr *config.WAFRulesConfig, holder *waf.Holder) {
+func (s *Server) SetRuleRepo(driver, dsn string, holder *waf.Holder) {
 	s.ruleDriver = driver
 	s.ruleDSN = dsn
-	s.wafRules = wr
 	s.holder = holder
+}
+
+// publish 发布新配置快照：先落库成功后调用，读取方（各 API / 告警循环）立即可见。
+func (s *Server) publish(next *config.Config) {
+	s.cfg.Store(next)
 }
 
 // handleGetRules 返回当前生效的规则（coraza.conf 文本 + waf_rules 结构化配置）。
 func (s *Server) handleGetRules(w http.ResponseWriter, r *http.Request) {
-	if s.holder == nil || s.wafRules == nil || s.ruleDSN == "" {
+	if s.holder == nil || s.ruleDSN == "" {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "规则仓库未就绪（进程启动中）",
 		})
 		return
 	}
-	conf, _, _ := store.LoadRule(s.ruleDriver, s.ruleDSN, store.KeyCorazaConf)
+	conf, _, err := store.LoadRule(s.ruleDriver, s.ruleDSN, store.KeyCorazaConf)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "读取规则失败: " + err.Error(),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"coraza_conf":  conf,
-		"waf_rules":    s.wafRules,
+		"waf_rules":    s.cfg.Load().WAFRules,
 		"hot_reload":   true,
 		"rules_source": "db", // DB 优先；启动时已自动从 rules_file 迁移入库
 	})
@@ -589,7 +784,7 @@ func (s *Server) handleGetRules(w http.ResponseWriter, r *http.Request) {
 // handlePutRules 保存规则并热加载（无需重启）。
 // 保存前先编译验证：不合法 → 400 且不落库、不切换，保证线上引擎不被坏规则破坏。
 func (s *Server) handlePutRules(w http.ResponseWriter, r *http.Request) {
-	if s.holder == nil || s.wafRules == nil || s.ruleDSN == "" {
+	if s.holder == nil || s.ruleDSN == "" {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "规则仓库未就绪（进程启动中）",
 		})
@@ -599,7 +794,7 @@ func (s *Server) handlePutRules(w http.ResponseWriter, r *http.Request) {
 		CorazaConf *string                `json:"coraza_conf"` // 缺省/空 = 保持现有
 		WAFRules   *config.WAFRulesConfig `json:"waf_rules"`   // 缺省 = 保持现有
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "JSON 解析失败: " + err.Error(),
 		})
@@ -607,7 +802,13 @@ func (s *Server) handlePutRules(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 合并请求与当前生效内容
-	conf, _, _ := store.LoadRule(s.ruleDriver, s.ruleDSN, store.KeyCorazaConf)
+	conf, _, err := store.LoadRule(s.ruleDriver, s.ruleDSN, store.KeyCorazaConf)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "读取现有规则失败: " + err.Error(),
+		})
+		return
+	}
 	if req.CorazaConf != nil && *req.CorazaConf != "" {
 		conf = *req.CorazaConf
 	}
@@ -617,7 +818,8 @@ func (s *Server) handlePutRules(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	wr := *s.wafRules
+	cur := s.cfg.Load()
+	wr := cur.WAFRules
 	if req.WAFRules != nil {
 		wr = *req.WAFRules
 	}
@@ -645,7 +847,10 @@ func (s *Server) handlePutRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	*s.wafRules = wr
+	// 复制-修改-替换：新 WAFRules 写入新配置对象后发布，读取方不会读到半更新状态。
+	next := config.Clone(cur)
+	next.WAFRules = wr
+	s.publish(next)
 	s.holder.SetEngine(engine) // 原子切换，下一请求即用新引擎
 
 	// F13 审计：规则变更事件（热加载，无需重启）
@@ -764,6 +969,7 @@ func readRuntimeStats() (alloc, sys, goroutines uint64) {
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	alloc, sys, goroutines := readRuntimeStats()
+	cur := s.cfg.Load()
 
 	stats := map[string]interface{}{
 		"uptime":              formatUptime(time.Since(s.startTime)),
@@ -776,11 +982,11 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"system_total_mb":     util.SystemMemoryMB(),
 		"memory_used_percent": util.SystemMemoryUsedPercent(),
 		"cpu_percent":         util.SystemCPUPercent(),
-		"proxy_listen":        s.cfg.Listen,
-		"proxy_backend":       s.cfg.Backend,
-		"cc_defense_enabled":  s.cfg.CCDefense.Enabled,
-		"rate_limit_enabled":  s.cfg.RateLimit.Enabled,
-		"block_requests":      s.cfg.BlockRequests,
+		"proxy_listen":        cur.Listen,
+		"proxy_backend":       cur.Backend,
+		"cc_defense_enabled":  cur.CCDefense.Enabled,
+		"rate_limit_enabled":  cur.RateLimit.Enabled,
+		"block_requests":      cur.BlockRequests,
 		"restart_needed":      s.restartNeeded.Load(),
 		"version":             version.Version,
 		"license":             version.License,
@@ -802,19 +1008,23 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
-	lines := r.URL.Query().Get("lines")
-	if lines == "" {
-		lines = "100"
+	maxLines := 200
+	if v := r.URL.Query().Get("lines"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxLines = n
+			if maxLines > 2000 {
+				maxLines = 2000
+			}
+		}
 	}
-	_ = lines
 
-	logPath := s.cfg.AccessLog
+	logPath := s.cfg.Load().AccessLog
 	dailyPath := logPath + "." + time.Now().Format("2006-01-02")
 	if _, err := os.Stat(dailyPath); err == nil {
 		logPath = dailyPath
 	}
 
-	data, err := os.ReadFile(logPath)
+	recent, err := tailLines(logPath, maxLines)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"logs": []string{},
@@ -823,20 +1033,59 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	allLines := strings.Split(string(data), "\n")
-	var recent []string
-	maxLines := 200
-	for i := len(allLines) - 1; i >= 0 && len(recent) < maxLines; i-- {
-		line := strings.TrimSpace(allLines[i])
-		if line != "" {
-			recent = append([]string{line}, recent...)
-		}
-	}
-
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"logs": recent,
 		"file": logPath,
 	})
+}
+
+// tailLines 从文件末尾按行读取最后 n 个非空行。
+// 访问日志在攻击期可达数百 MB，原来整文件 ReadFile + Split 会在管理后台
+// 预览时把整个日志读进内存；这里按 64KB 块从尾部回读，只解析需要的行。
+func tailLines(path string, n int) ([]string, error) {
+	if n <= 0 {
+		return []string{}, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	const chunk = 64 * 1024
+	off := st.Size()
+	buf := make([]byte, 0, chunk)
+	newlines := 0
+	for off > 0 && newlines <= n {
+		readSize := int64(chunk)
+		if off < readSize {
+			readSize = off
+		}
+		off -= readSize
+		tmp := make([]byte, readSize)
+		if _, err := f.ReadAt(tmp, off); err != nil && err != io.EOF {
+			return nil, err
+		}
+		newlines += bytes.Count(tmp, []byte{'\n'})
+		buf = append(tmp, buf...)
+	}
+
+	lines := strings.Split(string(buf), "\n")
+	recent := make([]string, 0, n)
+	for i := len(lines) - 1; i >= 0 && len(recent) < n; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" {
+			recent = append(recent, line)
+		}
+	}
+	// 回读得到的是倒序，反转为时间正序（与日志文件一致）
+	for i, j := 0, len(recent)-1; i < j; i, j = i+1, j-1 {
+		recent[i], recent[j] = recent[j], recent[i]
+	}
+	return recent, nil
 }
 
 // ---- Static File Handler ----

@@ -25,16 +25,21 @@ type IPRegionChecker struct {
 	mu   sync.RWMutex
 }
 
-// 云服务商/IDC 关键词
+// 云服务商/IDC 中文品牌名（中文无词边界，按子串匹配）。
+// 收窄说明：不再使用 "host"/"vps"/"server"/"cloud" 这类英文通用词，
+// 它们会把虚拟主机、企业专线乃至普通 ISP 名称误判为云厂商（误杀正常用户）。
 var cloudISPKeywords = []string{
-	"阿里云", "阿里", "腾讯云", "腾讯", "华为云", "华为",
-	"百度云", "百度", "京东云", "金山云",
-	"amazon", "aws", "azure", "google", "microsoft",
-	"digitalocean", "vultr", "linode",
-	"阿里巴", "alibaba", "tencent", "huawei",
-	"世纪互联", "网宿", "青云", "qingcloud", "ucloud",
-	"host", "vps", "server", "cloud",
+	"阿里云", "阿里巴巴", "阿里", "腾讯云", "腾讯", "华为云", "华为",
+	"百度云", "百度", "京东云", "金山云", "青云", "优刻得",
+	"世纪互联", "网宿", "数据港", "光环新网",
 	"数据中心", "idc", "机房",
+}
+
+// 云服务商/IDC 英文品牌名（按词元精确匹配，见 isCloudISP）。
+var cloudISPWords = []string{
+	"amazon", "aws", "azure", "microsoft", "google",
+	"digitalocean", "vultr", "linode", "ovh", "hetzner",
+	"alibaba", "aliyun", "tencent", "huawei", "ucloud", "qingcloud",
 }
 
 func newIPRegionChecker() *IPRegionChecker {
@@ -155,12 +160,27 @@ func isForeignCountry(country string) bool {
 	return !strings.Contains(country, "内网") && !strings.Contains(country, "局域网")
 }
 
-// isCloudISP 判断 ISP 是否为云服务商/IDC 机房
+// isCloudISP 判断 ISP 是否为云服务商/IDC 机房。
+// 中文品牌名按子串匹配；英文品牌名按词元精确匹配，避免子串误判
+// （如 "aws" 命中 "laws"、"cloud" 命中 "CloudFiber"）。
 func isCloudISP(isp string) bool {
-	ispLower := strings.ToLower(isp)
+	ispLower := strings.ToLower(strings.TrimSpace(isp))
+	if ispLower == "" {
+		return false
+	}
 	for _, kw := range cloudISPKeywords {
-		if strings.Contains(ispLower, strings.ToLower(kw)) {
+		if strings.Contains(ispLower, kw) {
 			return true
+		}
+	}
+	tokens := strings.FieldsFunc(ispLower, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9')
+	})
+	for _, tok := range tokens {
+		for _, kw := range cloudISPWords {
+			if tok == kw {
+				return true
+			}
 		}
 	}
 	return false

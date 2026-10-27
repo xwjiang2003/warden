@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"html"
 	"image"
 	"image/color"
 	"image/draw"
@@ -311,12 +312,14 @@ func (s *captchaStore) evictOldestLocked(now time.Time) int {
 	return removed
 }
 
-// verify 校验点击序列（按 1→2→3→4 顺序传入的坐标）
-func (s *captchaStore) verify(id, ip string, clicks [][2]int) bool {
+// verify 校验点击序列（按 1→2→3→4 顺序传入的坐标）。
+// sid 与生成时的会话绑定：同一出口 IP（NAT/代理）下的其他会话不能借用
+// 别人拿到的验证码 id 提交，避免跨会话复用与"代答"。
+func (s *captchaStore) verify(id, sid, ip string, clicks [][2]int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	it, ok := s.m[id]
-	if !ok || it.ip != ip || time.Now().After(it.expiresAt) {
+	if !ok || it.ip != ip || it.sid != sid || time.Now().After(it.expiresAt) {
 		return false
 	}
 	if it.attempts >= captchaMaxTry {
@@ -390,11 +393,11 @@ func dist(a, b [2]int) float64 {
 // 只损失性能、不影响正确性与可辨识性。
 func quantizeCaptcha(img *image.RGBA) image.Image {
 	const (
-		bits      = 3                   // 每通道高 3 位
-		shift     = 8 - bits            // = 5
-		mask      = byte(0xE0)          // 与 shift 对应的通道掩码
-		keySpace  = 1 << (3 * bits)     // = 512
-		maxColors = 256                 // PNG 调色板上限；超出即回退 RGBA
+		bits      = 3               // 每通道高 3 位
+		shift     = 8 - bits        // = 5
+		mask      = byte(0xE0)      // 与 shift 对应的通道掩码
+		keySpace  = 1 << (3 * bits) // = 512
+		maxColors = 256             // PNG 调色板上限；超出即回退 RGBA
 	)
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
@@ -541,5 +544,5 @@ func abs(x int) int {
 
 // captchaHTML 挑战页：内嵌 base64 图片 + 点击采集 + 提交
 func captchaHTML(id, imgB64, targetURL string) string {
-	return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>安全验证</title><style>body{font-family:-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#f5f5f5}.box{text-align:center;padding:1.4rem;background:#fff;border-radius:10px;box-shadow:0 2px 12px rgba(0,0,0,.08)}#capwrap{position:relative;display:inline-block;cursor:crosshair}#cap{display:block;border:1px solid #eee;border-radius:4px;max-width:100%;height:auto}.m{position:absolute;width:22px;height:22px;line-height:22px;text-align:center;background:#1a73e8;color:#fff;border-radius:50%;font-size:13px;pointer-events:none;margin-left:-11px;margin-top:-11px}</style></head><body><div class="box"><h3 style="margin:0 0 .4rem">安全验证</h3><p style="color:#666;margin:0 0 .8rem">请依次点击数字 1 → 2 → 3 → 4</p><div id="capwrap"><img id="cap" src="data:image/png;base64,` + imgB64 + `"></div><p id="msg" style="color:#888;font-size:13px;margin:.8rem 0 0">已点击 0 / 4</p><button id="reset" style="margin-top:.6rem;border:1px solid #ddd;background:#fff;padding:5px 16px;border-radius:4px;cursor:pointer">重来</button></div><form id="f" method="post" action="/__cc_verify"><input type="hidden" name="id" value="` + id + `"><input type="hidden" name="url" value="` + targetURL + `"><input type="hidden" name="clicks" value=""></form><script>var cap=document.getElementById('cap'),wrap=document.getElementById('capwrap'),msg=document.getElementById('msg'),f=document.getElementById('f');var clicks=[];cap.addEventListener('click',function(e){if(clicks.length>=4)return;var r=cap.getBoundingClientRect(),sx=cap.naturalWidth/r.width,sy=cap.naturalHeight/r.height,dx=e.clientX-r.left,dy=e.clientY-r.top;var x=Math.round(dx*sx),y=Math.round(dy*sy);clicks.push([x,y]);var m=document.createElement('span');m.className='m';m.textContent=clicks.length;m.style.left=dx+'px';m.style.top=dy+'px';wrap.appendChild(m);msg.textContent='已点击 '+clicks.length+' / 4';if(clicks.length===4){f.clicks.value=clicks.map(function(p){return p[0]+','+p[1]}).join(';');setTimeout(function(){f.submit()},180)}});document.getElementById('reset').addEventListener('click',function(){location.reload()});</script></body></html>`
+	return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>安全验证</title><style>body{font-family:-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#f5f5f5}.box{text-align:center;padding:1.4rem;background:#fff;border-radius:10px;box-shadow:0 2px 12px rgba(0,0,0,.08)}#capwrap{position:relative;display:inline-block;cursor:crosshair}#cap{display:block;border:1px solid #eee;border-radius:4px;max-width:100%;height:auto}.m{position:absolute;width:22px;height:22px;line-height:22px;text-align:center;background:#1a73e8;color:#fff;border-radius:50%;font-size:13px;pointer-events:none;margin-left:-11px;margin-top:-11px}</style></head><body><div class="box"><h3 style="margin:0 0 .4rem">安全验证</h3><p style="color:#666;margin:0 0 .8rem">请依次点击数字 1 → 2 → 3 → 4</p><div id="capwrap"><img id="cap" src="data:image/png;base64,` + imgB64 + `"></div><p id="msg" style="color:#888;font-size:13px;margin:.8rem 0 0">已点击 0 / 4</p><button id="reset" style="margin-top:.6rem;border:1px solid #ddd;background:#fff;padding:5px 16px;border-radius:4px;cursor:pointer">重来</button></div><form id="f" method="post" action="/__cc_verify"><input type="hidden" name="id" value="` + id + `"><input type="hidden" name="url" value="` + html.EscapeString(targetURL) + `"><input type="hidden" name="clicks" value=""></form><script>var cap=document.getElementById('cap'),wrap=document.getElementById('capwrap'),msg=document.getElementById('msg'),f=document.getElementById('f');var clicks=[];cap.addEventListener('click',function(e){if(clicks.length>=4)return;var r=cap.getBoundingClientRect(),sx=cap.naturalWidth/r.width,sy=cap.naturalHeight/r.height,dx=e.clientX-r.left,dy=e.clientY-r.top;var x=Math.round(dx*sx),y=Math.round(dy*sy);clicks.push([x,y]);var m=document.createElement('span');m.className='m';m.textContent=clicks.length;m.style.left=dx+'px';m.style.top=dy+'px';wrap.appendChild(m);msg.textContent='已点击 '+clicks.length+' / 4';if(clicks.length===4){f.clicks.value=clicks.map(function(p){return p[0]+','+p[1]}).join(';');setTimeout(function(){f.submit()},180)}});document.getElementById('reset').addEventListener('click',function(){location.reload()});</script></body></html>`
 }

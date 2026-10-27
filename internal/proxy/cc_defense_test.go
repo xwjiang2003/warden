@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,11 +35,11 @@ func TestCaptchaFlow(t *testing.T) {
 	}
 
 	clicks := [][2]int{it.pos[0], it.pos[1], it.pos[2], it.pos[3]}
-	if !s.verify(id, "1.2.3.4", clicks) {
+	if !s.verify(id, "sid", "1.2.3.4", clicks) {
 		t.Fatalf("正确点击序列应通过")
 	}
 	// 一次性：通过后再验证应失败
-	if s.verify(id, "1.2.3.4", clicks) {
+	if s.verify(id, "sid", "1.2.3.4", clicks) {
 		t.Fatalf("验证码应一次性，二次验证不应通过")
 	}
 }
@@ -48,15 +49,19 @@ func TestCaptchaVerifyRejects(t *testing.T) {
 	id, _, _ := s.generate("sid", "1.2.3.4")
 
 	// 错误 IP
-	if s.verify(id, "5.6.7.8", [][2]int{{0, 0}, {0, 0}, {0, 0}, {0, 0}}) {
+	if s.verify(id, "sid", "5.6.7.8", [][2]int{{0, 0}, {0, 0}, {0, 0}, {0, 0}}) {
 		t.Fatalf("IP 不匹配应失败")
 	}
+	// 错误会话（同 IP 的其他 sid 不能借用该验证码）
+	if s.verify(id, "other-sid", "1.2.3.4", [][2]int{{0, 0}, {0, 0}, {0, 0}, {0, 0}}) {
+		t.Fatalf("会话不匹配应失败")
+	}
 	// 错误坐标（远离所有数字）
-	if s.verify(id, "1.2.3.4", [][2]int{{0, 0}, {0, 0}, {0, 0}, {0, 0}}) {
+	if s.verify(id, "sid", "1.2.3.4", [][2]int{{0, 0}, {0, 0}, {0, 0}, {0, 0}}) {
 		t.Fatalf("错误坐标应失败")
 	}
 	// 点击数量不对
-	if s.verify(id, "1.2.3.4", [][2]int{{0, 0}, {0, 0}}) {
+	if s.verify(id, "sid", "1.2.3.4", [][2]int{{0, 0}, {0, 0}}) {
 		t.Fatalf("点击数量不足应失败")
 	}
 }
@@ -221,14 +226,16 @@ func TestUntrustedOverflowServesCaptcha(t *testing.T) {
 	}
 }
 
-// TestUntrustedOverflowSearchBotKeepsRateLimit 验证：溢出时搜索引擎爬虫例外，
-// 仍按原策略限速断连，不被喂验证码页。
+// TestUntrustedOverflowSearchBotKeepsRateLimit 验证：爬虫不占用共享未信任桶，
+// 而是按自身每 IP 桶限速——溢出时仍按原策略限速断连，不被喂验证码页。
 func TestUntrustedOverflowSearchBotKeepsRateLimit(t *testing.T) {
 	f := false
 	cfg := config.CCDefenseConfig{
 		Enabled:           true,
 		NewIPQPSMax:       1,
 		NewIPQPSBurst:     1,
+		UntrustedIPQPSMax: 1,
+		UntrustedIPBurst:  1,
 		NewIPCheckMinReqs: 1 << 30,
 	}
 	cfg.Normalize()
@@ -624,5 +631,185 @@ func TestUntrustedPerIPRateLimit(t *testing.T) {
 	}
 	if atomic.LoadInt32(&hits) != 1 {
 		t.Fatalf("第二次请求不应转发后端, hits=%d", hits)
+	}
+}
+
+// TestTokenBucketConcurrentBudget 钉死令牌桶的并发预算。
+//
+// 修复前 allow() 的 CAS expected 取的是重新 Load 的最新值，与计算 newTokens
+// 所用的旧值不一致，并发下会把其他 goroutine 刚扣掉的令牌退回去：
+// 同样的压力模型实测 108ms 放行 514 次（预算 208，约 4.7 倍）。
+func TestTokenBucketConcurrentBudget(t *testing.T) {
+	const (
+		rate    = 1000 // tokens/s
+		burst   = 100
+		workers = 200
+	)
+	b := newTokenBucket(rate, burst)
+	deadline := time.Now().Add(100 * time.Millisecond)
+	start := make(chan struct{})
+
+	var allowed int64
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			for time.Now().Before(deadline) {
+				if b.allow() {
+					atomic.AddInt64(&allowed, 1)
+				}
+			}
+		}()
+	}
+	begin := time.Now()
+	close(start)
+	wg.Wait()
+	elapsed := time.Since(begin)
+
+	// 理论预算 = burst + rate × 实际耗时；给 1.5 倍余量吸收调度抖动。
+	budget := float64(burst) + float64(rate)*elapsed.Seconds()
+	t.Logf("allowed=%d, budget=%.0f, elapsed=%s", allowed, budget, elapsed)
+	if got := float64(allowed); got > budget*1.5 {
+		t.Fatalf("令牌桶超发: allowed=%d, budget=%.0f, elapsed=%s", allowed, budget, elapsed)
+	}
+}
+
+// TestVerifyEndpointGlobalRateLimit 回归：验证端点不再免限速。
+// 分布式多 IP 刷 /__cc_*_verify 会打满 HMAC/SHA-256，必须受全局桶约束。
+func TestVerifyEndpointGlobalRateLimit(t *testing.T) {
+	f := false
+	cfg := config.CCDefenseConfig{
+		Enabled:           true,
+		GlobalQPSMax:      1, // 极小全局桶：只够第一个验证提交
+		GlobalQPSBurst:    1,
+		UntrustedIPQPSMax: 100, // 每 IP 桶放大，排除单 IP 限速干扰
+		UntrustedIPBurst:  100,
+		NewIPCheckMinReqs: 1 << 30,
+	}
+	cfg.Normalize()
+	h := NewCCDefense(cfg, config.IPCheckConfig{BlockForeign: &f, BlockCloud: &f}, nil,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) }), nil, nil)
+
+	post := func(ip string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "http://example.com/__cc_pow_verify", nil)
+		req.RemoteAddr = ip + ":1234"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	// 首个 IP：空表单 → 正常处理（回首页）
+	if rec := post("203.0.113.61"); rec.Code != http.StatusSeeOther {
+		t.Fatalf("首个验证提交应正常处理, got %d", rec.Code)
+	}
+	// 换一个 IP 绕过每 IP 桶：仍应被全局桶拦下
+	if rec := post("203.0.113.62"); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("全局桶应拦截验证端点洪泛, got %d", rec.Code)
+	}
+}
+
+// TestVerifyEndpointPerIPRateLimit 回归：单 IP 反复提交验证答案同样受限。
+func TestVerifyEndpointPerIPRateLimit(t *testing.T) {
+	f := false
+	cfg := config.CCDefenseConfig{
+		Enabled:           true,
+		GlobalQPSMax:      1000,
+		GlobalQPSBurst:    1000,
+		UntrustedIPQPSMax: 1, // 极小每 IP 桶：第二个提交必被拒
+		UntrustedIPBurst:  1,
+		NewIPCheckMinReqs: 1 << 30,
+	}
+	cfg.Normalize()
+	h := NewCCDefense(cfg, config.IPCheckConfig{BlockForeign: &f, BlockCloud: &f}, nil,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) }), nil, nil)
+
+	post := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "http://example.com/__cc_silent_verify", nil)
+		req.RemoteAddr = "203.0.113.63:1234"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := post(); rec.Code != http.StatusSeeOther {
+		t.Fatalf("首个验证提交应正常处理, got %d", rec.Code)
+	}
+	if rec := post(); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("单 IP 连续提交应被每 IP 桶拦下, got %d", rec.Code)
+	}
+}
+
+// TestIsStaticResourceNormalization 回归：静态资源判定必须先规范化路径。
+// 原实现直接对原始路径做 HasPrefix("/static")，/static/../api 会命中放行分支，
+// 后端规范化后却路由到动态接口，从而完全绕过 CC。
+func TestIsStaticResourceNormalization(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"/static/app.css", true},
+		{"/assets/img/a.png", true},
+		{"/static", true},
+		{"/a/b/c.png", true},
+		{"/static/../api/login", false},
+		{"/static/./app.css", false},
+		{"/static//app.css", false},
+		{`/static\app.css`, false},
+		{"/staticfoo/list", false},
+		{"/jsapi/list", false},
+		{"/api/login", false},
+	}
+	for _, c := range cases {
+		if got := isStaticResource(c.path); got != c.want {
+			t.Errorf("isStaticResource(%q) = %v, want %v", c.path, got, c.want)
+		}
+	}
+}
+
+// TestStaticBypassRequiresCanonicalGet 回归：只有规范的 GET/HEAD 静态路径才免 CC。
+func TestStaticBypassRequiresCanonicalGet(t *testing.T) {
+	f := false
+	newHandler := func(hits *int32) *CCDefenseHandler {
+		cfg := config.CCDefenseConfig{
+			Enabled:           true,
+			NewIPQPSMax:       1, // 极小桶：只够第一个请求直达后端
+			NewIPQPSBurst:     1,
+			NewIPCheckMinReqs: 1 << 30, // 放大泛洪阈值，确保只走限速溢出分支
+		}
+		cfg.Normalize()
+		return NewCCDefense(cfg, config.IPCheckConfig{BlockForeign: &f, BlockCloud: &f}, nil,
+			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(hits, 1)
+				w.Write([]byte("OK"))
+			}), nil, nil)
+	}
+	do := func(h *CCDefenseHandler, method, rawPath string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, "http://example.com/api/ok", nil)
+		req.URL.Path = rawPath // 模拟未经规范化的原始路径
+		req.RemoteAddr = "203.0.113.51:1234"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 前缀穿越不得绕过 CC：首请求消耗桶，第二请求必须被挑战/拒绝而非直达后端
+	var hits int32
+	h := newHandler(&hits)
+	if rec := do(h, http.MethodGet, "/api/a"); rec.Body.String() != "OK" {
+		t.Fatalf("首请求应放行, got %d %q", rec.Code, rec.Body.String())
+	}
+	before := atomic.LoadInt32(&hits)
+	do(h, http.MethodGet, "/static/../api/b")
+	if atomic.LoadInt32(&hits) != before {
+		t.Fatal("/static/../api 绕过了 CC 直达后端")
+	}
+
+	// 方法门禁：POST 到静态目录/扩展名不能按静态资源放行
+	var hits2 int32
+	h2 := newHandler(&hits2)
+	do(h2, http.MethodPost, "/upload/a.css")
+	do(h2, http.MethodPost, "/upload/b.css")
+	if got := atomic.LoadInt32(&hits2); got != 1 {
+		t.Fatalf("POST 静态样式路径不应全部放行, backendHits=%d (want 1)", got)
 	}
 }

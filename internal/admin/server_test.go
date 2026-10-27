@@ -17,7 +17,7 @@ import (
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	cfg := &config.Config{Listen: ":81", Backend: "http://127.0.0.1:8002"}
-	return NewServer(cfg, "config.json", "sqlite", "", config.AdminConfig{})
+	return NewServer(config.NewHolder(cfg), "config.json", "sqlite", "", config.AdminConfig{})
 }
 
 func getJSON(t *testing.T, h http.HandlerFunc, path string) map[string]interface{} {
@@ -139,7 +139,7 @@ func TestPutConfigRejectsBadTrustedProxies(t *testing.T) {
 	if err := store.Save(cfgPath, "sqlite", dbPath, cfg); err != nil {
 		t.Fatalf("预置配置失败: %v", err)
 	}
-	s := NewServer(cfg, cfgPath, "sqlite", dbPath, config.AdminConfig{})
+	s := NewServer(config.NewHolder(cfg), cfgPath, "sqlite", dbPath, config.AdminConfig{})
 
 	body := `{"listen":":81","backend":"http://127.0.0.1:8002","trusted_proxies":["0.0.0.0/0"]}`
 	rec := httptest.NewRecorder()
@@ -159,8 +159,9 @@ func TestPutConfigRejectsBadTrustedProxies(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("合法可信代理应保存成功，实际 %d，body=%s", rec.Code, rec.Body.String())
 	}
-	if len(s.cfg.TrustedProxies) != 2 || s.cfg.TrustedProxies[0] != "127.0.0.1/32" {
-		t.Fatalf("配置未生效: %#v", s.cfg.TrustedProxies)
+	got := s.cfg.Load().TrustedProxies
+	if len(got) != 2 || got[0] != "127.0.0.1/32" {
+		t.Fatalf("配置未生效: %#v", got)
 	}
 
 	// 重新加载 DB，确认确实持久化了（而不是只改了内存）
@@ -181,7 +182,7 @@ func TestHandleGreyIPs(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "warden.db")
 	cfg := &config.Config{Listen: ":81", Backend: "http://127.0.0.1:8002"}
-	s := NewServer(cfg, "config.json", "sqlite", dbPath, config.AdminConfig{})
+	s := NewServer(config.NewHolder(cfg), "config.json", "sqlite", dbPath, config.AdminConfig{})
 
 	// 1) 未注入 store：空列表而非 503/500
 	m := getJSON(t, s.handleGreyIPs, "/api/grey_ips")
@@ -217,5 +218,118 @@ func TestHandleGreyIPs(t *testing.T) {
 	}
 	if first["state"].(float64) != greyliststore.StateHard {
 		t.Fatalf("state 应为 2(hard)，实际 %v", first["state"])
+	}
+}
+
+// TestConfigUpdatePublishesNewSnapshot 校验配置热更新走"复制-替换"：
+// 已发布的旧快照必须保持不变，新值只出现在新对象上。
+// 否则 *cfg = newCfg / 原地改字段会与告警循环等并发读者产生数据竞争。
+func TestConfigUpdatePublishesNewSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	dbPath := filepath.Join(dir, "warden.db")
+	cfg := &config.Config{Listen: ":81", Backend: "http://127.0.0.1:8002"}
+	if err := store.Save(cfgPath, "sqlite", dbPath, cfg); err != nil {
+		t.Fatalf("预置配置失败: %v", err)
+	}
+	s := NewServer(config.NewHolder(cfg), cfgPath, "sqlite", dbPath, config.AdminConfig{})
+	old := s.cfg.Load()
+
+	body := `{"templates":[{"id":"flood","enabled":true}],"cooldown_min":3}`
+	rec := httptest.NewRecorder()
+	s.handlePutAlertTemplates(rec, httptest.NewRequest(http.MethodPut, "/api/alert_templates", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("保存告警模板应成功，实际 %d，body=%s", rec.Code, rec.Body.String())
+	}
+
+	if len(old.Alert.Templates) != 0 {
+		t.Fatalf("旧快照被原地修改: %+v", old.Alert.Templates)
+	}
+	cur := s.cfg.Load()
+	if cur == old {
+		t.Fatal("应发布新的配置对象，而不是原地修改")
+	}
+	if cur.Alert.CooldownMin != 3 {
+		t.Fatalf("新快照 cooldown_min 应为 3，实际 %d", cur.Alert.CooldownMin)
+	}
+	enabled := false
+	for _, tpl := range cur.Alert.Templates {
+		if tpl.ID == "flood" && tpl.Enabled {
+			enabled = true
+		}
+	}
+	if !enabled {
+		t.Fatalf("新快照应包含已启用的 flood 模板: %+v", cur.Alert.Templates)
+	}
+}
+
+// TestPutConfigPartialKeepsAdmin 校验部分 PUT 不会把未提交的块清零：
+// 只改 listen 时，admin 的启用状态、用户名与密码必须保持原值。
+func TestPutConfigPartialKeepsAdmin(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	dbPath := filepath.Join(dir, "warden.db")
+	cfg := &config.Config{
+		Listen:  ":81",
+		Backend: "http://127.0.0.1:8002",
+		Admin:   config.AdminConfig{Enabled: true, Username: "admin", Password: "secret"},
+	}
+	if err := store.Save(cfgPath, "sqlite", dbPath, cfg); err != nil {
+		t.Fatalf("预置配置失败: %v", err)
+	}
+	s := NewServer(config.NewHolder(cfg), cfgPath, "sqlite", dbPath, cfg.Admin)
+
+	rec := httptest.NewRecorder()
+	s.handlePutConfig(rec, httptest.NewRequest(http.MethodPut, "/api/config", strings.NewReader(`{"listen":":82"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("部分 PUT 应成功，实际 %d，body=%s", rec.Code, rec.Body.String())
+	}
+	cur := s.cfg.Load()
+	if cur.Listen != ":82" {
+		t.Fatalf("listen 应更新为 :82，实际 %q", cur.Listen)
+	}
+	if !cur.Admin.Enabled || cur.Admin.Password != "secret" || cur.Admin.Username != "admin" {
+		t.Fatalf("admin 块被意外改动: %+v", cur.Admin)
+	}
+}
+
+// TestAdminPasswordChangeHotReload 校验改密码无需重启：旧密码立即失效、新密码立即生效。
+func TestAdminPasswordChangeHotReload(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	dbPath := filepath.Join(dir, "warden.db")
+	cfg := &config.Config{
+		Listen:  ":81",
+		Backend: "http://127.0.0.1:8002",
+		Admin:   config.AdminConfig{Enabled: true, Username: "admin", Password: "old-pass"},
+	}
+	if err := store.Save(cfgPath, "sqlite", dbPath, cfg); err != nil {
+		t.Fatalf("预置配置失败: %v", err)
+	}
+	s := NewServer(config.NewHolder(cfg), cfgPath, "sqlite", dbPath, cfg.Admin)
+	h := s.handler()
+
+	call := func(pass string) int {
+		req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+		req.SetBasicAuth("admin", pass)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if code := call("old-pass"); code != http.StatusOK {
+		t.Fatalf("旧密码应立即通过，实际 %d", code)
+	}
+
+	body := `{"admin":{"enabled":true,"username":"admin","password":"new-pass"}}`
+	rec := httptest.NewRecorder()
+	s.handlePutConfig(rec, httptest.NewRequest(http.MethodPut, "/api/config", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("保存新密码失败: %d body=%s", rec.Code, rec.Body.String())
+	}
+	if code := call("old-pass"); code != http.StatusUnauthorized {
+		t.Fatalf("旧密码应失效，实际 %d", code)
+	}
+	if code := call("new-pass"); code != http.StatusOK {
+		t.Fatalf("新密码应生效，实际 %d", code)
 	}
 }

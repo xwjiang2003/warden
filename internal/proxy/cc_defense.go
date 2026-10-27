@@ -3,6 +3,7 @@ package proxy
 import (
 	"log"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +35,16 @@ func isSearchBot(ua string) bool {
 	return false
 }
 
+// searchBotRequest 判断是否为只读的搜索引擎抓取请求。
+// 仅 GET/HEAD 认 UA 白名单：写操作（POST/PUT 等）伪造爬虫 UA 不得绕过挑战。
+func searchBotRequest(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+		return isSearchBot(r.Header.Get("User-Agent"))
+	}
+	return false
+}
+
 // staticExts 静态资源扩展名：一篇文章会并发加载大量图片/样式/脚本，
 // 属正常浏览器行为，不应进入 CC 行为检测/限速/挑战。
 var staticExts = []string{
@@ -43,15 +54,29 @@ var staticExts = []string{
 }
 
 // isStaticResource 判断路径是否为静态资源（按扩展名或常见静态目录前缀）。
-func isStaticResource(path string) bool {
-	lower := strings.ToLower(path)
+//
+// 必须先规范化再判断：原实现直接对原始路径做 HasPrefix，攻击者可用
+// /static/../api/login 命中前缀放行分支，而后端规范化后会路由到动态接口，
+// 从而完全绕过 CC 的行为检测/限速/挑战。同理含反斜杠的路径在部分后端
+// （Windows/IIS）会被当作目录分隔符，也一律不放行。
+func isStaticResource(p string) bool {
+	if strings.ContainsRune(p, '\\') {
+		return false
+	}
+	clean := path.Clean(p)
+	if clean != p {
+		// 非规范路径（含 ..、.、重复斜杠）不按静态资源放行
+		return false
+	}
+	lower := strings.ToLower(clean)
 	for _, ext := range staticExts {
 		if strings.HasSuffix(lower, ext) {
 			return true
 		}
 	}
-	for _, p := range []string{"/static", "/assets", "/upload", "/images", "/img", "/js", "/css", "/fonts"} {
-		if strings.HasPrefix(lower, p) {
+	for _, pfx := range []string{"/static", "/assets", "/upload", "/images", "/img", "/js", "/css", "/fonts"} {
+		// 要求目录边界，避免 /staticfoo、/jsapi 之类的动态路由被误判
+		if lower == pfx || strings.HasPrefix(lower, pfx+"/") {
 			return true
 		}
 	}
@@ -125,6 +150,15 @@ func (t *ipTrustTracker) recordVisit(ip string) bool {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	// 计数器硬上限：攻击者可用海量新 IP 撑爆 map（gc 只在超限时清过期项，
+	// 若全为新鲜 IP 则永远删不掉）。达到上限后先清过期，仍满则直接不再计数
+	// （只影响"按访问次数晋升"，不影响限速/挑战判定）。
+	if _, ok := t.counters[ip]; !ok && len(t.counters) >= trustCountersMax {
+		t.pruneCountersLocked(time.Now())
+		if len(t.counters) >= trustCountersMax {
+			return false
+		}
+	}
 	tr, ok := t.counters[ip]
 	if !ok {
 		t.counters[ip] = &ipTrack{count: 1, first: time.Now()}
@@ -215,62 +249,83 @@ func (t *ipTrustTracker) listTrusted() []truststore.Entry {
 	return out
 }
 
+// trustCountersMax 未晋升访问计数器的硬上限，防止海量新 IP 撑爆内存。
+const trustCountersMax = 200000
+
 func (t *ipTrustTracker) gc() {
 	t.mu.Lock()
-	if len(t.counters) < 200000 {
-		t.mu.Unlock()
-		return
+	if len(t.counters) >= trustCountersMax {
+		t.pruneCountersLocked(time.Now())
 	}
-	now := time.Now()
+	t.mu.Unlock()
+}
+
+// pruneCountersLocked 删除超过 3 倍统计窗口未活动的计数条目（需持有 t.mu）。
+func (t *ipTrustTracker) pruneCountersLocked(now time.Time) {
 	cutoff := time.Duration(t.windowSec) * time.Second * 3
 	for ip, tr := range t.counters {
 		if now.Sub(tr.first) > cutoff {
 			delete(t.counters, ip)
 		}
 	}
-	t.mu.Unlock()
 }
 
-// ---- 无锁令牌桶 (atomic int64) ----
-// 使用纳秒级时间戳 + atomic CAS，避免 mutex 争抢
+// ---- 令牌桶 ----
+// 用互斥锁把"补充 + 扣减"做成一次原子状态转移。
+//
+// 历史实现是无锁 atomic CAS，但 CAS 的 expected 取的是重新 Load 的最新值，
+// 与前面计算 newTokens 时用的旧值不一致，导致并发下把其他 goroutine
+// 刚扣掉的令牌退了回去（丢失更新）。实测 200 并发、rate=1000/s burst=100
+// 时 108ms 放行 514 次（预算 208，约 4.7 倍），CC 限速与连接限流同时失效。
+//
+// 桶数量有限（全局 2 个 + 每 IP 1 个），锁内只有几次整数运算，
+// 比"CAS 重试 + 每次分配新状态"更简单也更快。
 
 type tokenBucket struct {
-	rate       float64
-	burst      float64
-	tokens     int64 // 定点数 tokens * 1e9
-	lastUpdate int64 // UnixNano
+	mu     sync.Mutex
+	rate   float64
+	burst  int64 // 定点数：容量 * 1e9
+	tokens int64 // 定点数：当前令牌 * 1e9
+	last   int64 // UnixNano
 }
 
 func newTokenBucket(qps, burst int) *tokenBucket {
 	return &tokenBucket{
-		rate:       float64(qps),
-		burst:      float64(burst),
-		tokens:     int64(burst) * 1e9,
-		lastUpdate: time.Now().UnixNano(),
+		rate:   float64(qps),
+		burst:  int64(burst) * 1e9,
+		tokens: int64(burst) * 1e9,
+		last:   time.Now().UnixNano(),
 	}
 }
 
 func (b *tokenBucket) allow() bool {
 	now := time.Now().UnixNano()
-	for {
-		last := atomic.LoadInt64(&b.lastUpdate)
-		if last > now {
-			last = now
-		}
-		elapsed := float64(now-last) / 1e9
-		newTokens := atomic.LoadInt64(&b.tokens) + int64(elapsed*b.rate*1e9)
-		burstNano := int64(b.burst * 1e9)
-		if newTokens > burstNano {
-			newTokens = burstNano
-		}
-		if newTokens < 1e9 {
-			return false
-		}
-		if atomic.CompareAndSwapInt64(&b.tokens, atomic.LoadInt64(&b.tokens), newTokens-1e9) {
-			atomic.StoreInt64(&b.lastUpdate, now)
-			return true
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	last := b.last
+	if now < last {
+		now = last // 系统时钟回拨：不外推补充量
+	}
+	elapsed := float64(now-last) / 1e9
+	// 把补充时长限制在"从空桶到满桶"所需时间，避免长时间空闲后
+	// elapsed*rate*1e9 溢出 int64。
+	if b.rate > 0 {
+		if maxElapsed := float64(b.burst) / (b.rate * 1e9); elapsed > maxElapsed {
+			elapsed = maxElapsed
 		}
 	}
+	tokens := b.tokens + int64(elapsed*b.rate*1e9)
+	if tokens > b.burst {
+		tokens = b.burst
+	}
+	b.tokens = tokens
+	b.last = now
+	if tokens < 1e9 {
+		return false
+	}
+	b.tokens -= 1e9
+	return true
 }
 
 type dualRateLimiter struct {
@@ -338,6 +393,10 @@ func (l *perIPLimiter) gc(idleTTL time.Duration) {
 
 // ---- 新 IP 泛洪检测 (仅用于未信任 IP) ----
 
+// floodSeenMax 泛洪检测 IP 记录表的硬上限。滑窗只按 seenTTL 惰性清过期项，
+// 持续攻击期间可积累海量不同 IP；超限时先清过期，仍满则整体重建（重新学习）。
+const floodSeenMax = 500000
+
 type newIPFloodDetector struct {
 	checkSec  int
 	ratioPct  int
@@ -371,6 +430,20 @@ func (d *newIPFloodDetector) floodRatio() int {
 	return int(atomic.LoadInt64(&d.recentNew) * 100 / total)
 }
 
+// floodActive 只读判断当前是否处于新 IP 泛洪：不记录 IP、不推进窗口。
+// 供验证端点使用——泛洪前预解的低档挑战不能用来换取泛洪期的可信身份。
+func (d *newIPFloodDetector) floodActive() bool {
+	// 窗口长时间无流量时计数已陈旧，不能据此判泛洪
+	if time.Since(time.Unix(0, atomic.LoadInt64(&d.windowAt))) > time.Duration(d.checkSec)*time.Second {
+		return false
+	}
+	total := atomic.LoadInt64(&d.recentNew) + atomic.LoadInt64(&d.recentOld)
+	if total < int64(d.minReqs) {
+		return false
+	}
+	return d.floodRatio() >= d.ratioPct
+}
+
 func (d *newIPFloodDetector) isFlooding(ip string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -397,6 +470,9 @@ func (d *newIPFloodDetector) isFlooding(ip string) bool {
 		atomic.AddInt64(&d.recentOld, 1)
 		d.seen[ip] = nowNano // 刷新活跃时间
 	} else {
+		if len(d.seen) >= floodSeenMax {
+			d.evictSeenLocked(nowNano)
+		}
 		d.seen[ip] = nowNano
 		atomic.AddInt64(&d.recentNew, 1)
 	}
@@ -416,6 +492,21 @@ func (d *newIPFloodDetector) isFlooding(ip string) bool {
 		return true
 	}
 	return false
+}
+
+// evictSeenLocked 回收泛洪记录：先删超过 seenTTL 的项，仍满则整体重建（需持有 d.mu）。
+func (d *newIPFloodDetector) evictSeenLocked(nowNano int64) {
+	if d.seenTTL > 0 {
+		cutoff := nowNano - int64(d.seenTTL)
+		for k, v := range d.seen {
+			if v < cutoff {
+				delete(d.seen, k)
+			}
+		}
+	}
+	if len(d.seen) >= floodSeenMax {
+		d.seen = make(map[string]int64, floodSeenMax/2)
+	}
 }
 
 // ---- IP 行为检测 ----
@@ -633,6 +724,10 @@ type sessionTracker struct {
 	ipToSessions map[string]map[string]int // IP → sessionID → 次数
 }
 
+// sessionTrackerMaxEntries 两个方向的顶层条目硬上限；超过即整体重建。
+// 单条目内的映射也有上限（见 record），保证总量 = 条目数 × 单条上限。
+const sessionTrackerMaxEntries = 200000
+
 func newSessionTracker() *sessionTracker {
 	return &sessionTracker{
 		sessionToIPs: make(map[string]map[string]int),
@@ -662,30 +757,40 @@ func (st *sessionTracker) record(sessionID, ip string) (anomaly bool, reason str
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	// session → IPs
-	if st.sessionToIPs[sessionID] == nil {
-		st.sessionToIPs[sessionID] = make(map[string]int)
+	// 顶层条目硬上限：整体重建（攻击期间牺牲检测连续性换取内存有界）。
+	if _, ok := st.sessionToIPs[sessionID]; !ok && len(st.sessionToIPs) >= sessionTrackerMaxEntries {
+		st.sessionToIPs = make(map[string]map[string]int)
+		st.ipToSessions = make(map[string]map[string]int)
 	}
-	st.sessionToIPs[sessionID][ip]++
+
+	// session → IPs。达到 5 个不同 IP 后不再登记新 IP（否则异常返回前仍会持续增长）。
+	ips := st.sessionToIPs[sessionID]
+	if ips == nil {
+		ips = make(map[string]int, 2)
+		st.sessionToIPs[sessionID] = ips
+	}
+	if _, seen := ips[ip]; !seen && len(ips) >= 5 {
+		return true, "session_shared_by_many_ips"
+	}
+	ips[ip]++
 	// 同一 session 被 >5 个不同 IP 使用 → 异常
-	if len(st.sessionToIPs[sessionID]) > 5 {
+	if len(ips) > 5 {
 		return true, "session_shared_by_many_ips"
 	}
 
-	// IP → sessions
-	if st.ipToSessions[ip] == nil {
-		st.ipToSessions[ip] = make(map[string]int)
+	// IP → sessions。达到 30 个不同 session 后不再登记新会话。
+	sess := st.ipToSessions[ip]
+	if sess == nil {
+		sess = make(map[string]int, 4)
+		st.ipToSessions[ip] = sess
 	}
-	st.ipToSessions[ip][sessionID]++
-	// 同一 IP 使用 >30 个不同 session → 异常（真人最多几个session）
-	if len(st.ipToSessions[ip]) > 30 {
+	if _, seen := sess[sessionID]; !seen && len(sess) >= 30 {
 		return true, "ip_uses_many_sessions"
 	}
-
-	// 定期清理
-	if len(st.sessionToIPs) > 200000 {
-		st.sessionToIPs = make(map[string]map[string]int)
-		st.ipToSessions = make(map[string]map[string]int)
+	sess[sessionID]++
+	// 同一 IP 使用 >30 个不同 session → 异常（真人最多几个session）
+	if len(sess) > 30 {
+		return true, "ip_uses_many_sessions"
 	}
 
 	return false, ""
@@ -761,8 +866,12 @@ func (t *logThrottler) gc() {
 // ---- 主处理器 ----
 
 type CCDefenseHandler struct {
-	dlimiter        *dualRateLimiter
-	perIP           *perIPLimiter
+	dlimiter *dualRateLimiter
+	perIP    *perIPLimiter
+	// verifyBudget 验证端点（/__cc_*_verify）的全局令牌桶。
+	// 这些端点在校验前就要限速：否则攻击者可用海量请求刷 HMAC/SHA-256、
+	// 失败日志与挑战重发，把 WAF 自身变成 CPU 放大器。
+	verifyBudget    *tokenBucket
 	trust           *ipTrustTracker
 	flood           *newIPFloodDetector
 	fw              *FirewallBlocker
@@ -771,11 +880,11 @@ type CCDefenseHandler struct {
 	sessions        *sessionTracker
 	ipChecker       *IPRegionChecker
 	captcha         *captchaStore
-	trustedSessions sync.Map // sid -> time.Time，验证码通过后的可信会话
-	chFails         sync.Map // ip -> challengeFail，挑战提交失败后的强制冷却窗口
-	pow             *PoWChallenge // JS 计算挑战（nil 或未启用时回退验证码）
-	slide           *slideStore // 滑动拼图验证（v1.2.0 F7）
-	grey            *greyList   // 挑战失败灰名单递进（v1.2.0 F8）
+	trustedSessions *trustedSessionStore // sid -> time.Time，验证码通过后的可信会话（有界）
+	chFails         sync.Map             // ip -> challengeFail，挑战提交失败后的强制冷却窗口
+	pow             *PoWChallenge        // JS 计算挑战（nil 或未启用时回退验证码）
+	slide           *slideStore          // 滑动拼图验证（v1.2.0 F7）
+	grey            *greyList            // 挑战失败灰名单递进（v1.2.0 F8）
 	blockForeign    bool
 	blockCloud      bool
 	throttle        *logThrottler
@@ -788,6 +897,80 @@ type CCDefenseHandler struct {
 // 挑战页 GET 与验证 POST 均不消耗 per-IP 桶，若不设冷却，作弊者无需通过验证
 // 即可在泛洪窗口稀释后拿到放行。
 const challengeFailCoolSec = 60
+
+// 可信会话存储上限与 TTL。攻击者可低成本通过 silent 挑战换取大量会话，
+// 无界增长会在 24h 内被刷到百万级；这里做硬上限 + 过期回收。
+const (
+	trustedSessionTTL = 24 * time.Hour
+	trustedSessionMax = 200000
+)
+
+// trustedSessionStore 有界可信会话表（sid → 签发时间）。
+type trustedSessionStore struct {
+	mu  sync.Mutex
+	m   map[string]time.Time
+	max int
+	ttl time.Duration
+}
+
+func newTrustedSessionStore(max int) *trustedSessionStore {
+	return &trustedSessionStore{m: make(map[string]time.Time), max: max, ttl: trustedSessionTTL}
+}
+
+func (s *trustedSessionStore) Load(k string) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.m[k]
+	return t, ok
+}
+
+func (s *trustedSessionStore) Store(k string, t time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.m[k]; !ok && len(s.m) >= s.max {
+		s.evictLocked(t)
+	}
+	s.m[k] = t
+}
+
+func (s *trustedSessionStore) Delete(k string) {
+	s.mu.Lock()
+	delete(s.m, k)
+	s.mu.Unlock()
+}
+
+// evictLocked 先删过期项；仍超上限则淘汰任意条目到 3/4 水位（有界兜底）。
+func (s *trustedSessionStore) evictLocked(now time.Time) {
+	for k, t := range s.m {
+		if now.Sub(t) >= s.ttl {
+			delete(s.m, k)
+		}
+	}
+	if len(s.m) < s.max {
+		return
+	}
+	target := s.max * 3 / 4
+	for k := range s.m {
+		if len(s.m) <= target {
+			break
+		}
+		delete(s.m, k)
+	}
+}
+
+// sweep 回收过期会话（供后台 reaper 定期调用）。
+func (s *trustedSessionStore) sweep(now time.Time) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	for k, t := range s.m {
+		if now.Sub(t) >= s.ttl {
+			delete(s.m, k)
+			removed++
+		}
+	}
+	return removed
+}
 
 type challengeFail struct {
 	until time.Time
@@ -824,21 +1007,23 @@ type offenderTrack struct {
 func NewCCDefense(cfg config.CCDefenseConfig, ipCfg config.IPCheckConfig, fw *FirewallBlocker, next http.Handler, trustStore *truststore.Store, greyStore *greyliststore.Store) *CCDefenseHandler {
 	cfg.Normalize()
 	h := &CCDefenseHandler{
-		dlimiter:     newDualRateLimiter(cfg.GlobalQPSMax, cfg.GlobalQPSBurst, cfg.NewIPQPSMax, cfg.NewIPQPSBurst),
-		perIP:        newPerIPLimiter(cfg.UntrustedIPQPSMax, cfg.UntrustedIPBurst),
-		trust:        newIPTrustTracker(cfg.TrustIPWindowSec, cfg.TrustIPMinVisits, cfg.TrustIPTTLSec, trustStore),
-		flood:        newNewIPFloodDetector(cfg.NewIPCheckSec, cfg.NewIPRatioBlock, cfg.NewIPCheckMinReqs, cfg.FloodSlidingWindowSec),
-		fw:           fw,
-		captcha:      newCaptchaStore(cfg.CaptchaGenMaxPerSec),
-		behavior:     newIPBehaviorTracker(cfg.BehaviorIdleResetSec, cfg.BehaviorPathReqsMin, cfg.BehaviorPathCountMax),
-		sessions:     newSessionTracker(),
-		ipChecker:    newIPRegionChecker(),
-		slide:        newSlideStore(cfg.CaptchaGenMaxPerSec),
-		blockForeign: ipCfg.BlockForeignEnabled(),
-		blockCloud:   ipCfg.BlockCloudEnabled(),
-		throttle:     newLogThrottler(ccLogThrottleInterval),
-		cfg:          cfg,
-		next:         next,
+		dlimiter:        newDualRateLimiter(cfg.GlobalQPSMax, cfg.GlobalQPSBurst, cfg.NewIPQPSMax, cfg.NewIPQPSBurst),
+		perIP:           newPerIPLimiter(cfg.UntrustedIPQPSMax, cfg.UntrustedIPBurst),
+		verifyBudget:    newTokenBucket(cfg.GlobalQPSMax, cfg.GlobalQPSBurst),
+		trust:           newIPTrustTracker(cfg.TrustIPWindowSec, cfg.TrustIPMinVisits, cfg.TrustIPTTLSec, trustStore),
+		flood:           newNewIPFloodDetector(cfg.NewIPCheckSec, cfg.NewIPRatioBlock, cfg.NewIPCheckMinReqs, cfg.FloodSlidingWindowSec),
+		fw:              fw,
+		captcha:         newCaptchaStore(cfg.CaptchaGenMaxPerSec),
+		trustedSessions: newTrustedSessionStore(trustedSessionMax),
+		behavior:        newIPBehaviorTracker(cfg.BehaviorIdleResetSec, cfg.BehaviorPathReqsMin, cfg.BehaviorPathCountMax),
+		sessions:        newSessionTracker(),
+		ipChecker:       newIPRegionChecker(),
+		slide:           newSlideStore(cfg.CaptchaGenMaxPerSec),
+		blockForeign:    ipCfg.BlockForeignEnabled(),
+		blockCloud:      ipCfg.BlockCloudEnabled(),
+		throttle:        newLogThrottler(ccLogThrottleInterval),
+		cfg:             cfg,
+		next:            next,
 	}
 	// 灰名单顽固档违规上报接防火墙（回调在 h 构造完成后注册，闭包安全捕获 h）
 	h.grey = newGreyList(cfg.Greylist, greyStore, func(ip string) { h.ReportOffender(ip) })
@@ -889,12 +1074,7 @@ func (h *CCDefenseHandler) reaper() {
 		h.trust.sweepExpired()
 
 		// 2) 可信会话：删除超过 24 小时的会话
-		h.trustedSessions.Range(func(k, v interface{}) bool {
-			if ts, ok := v.(time.Time); ok && now.Sub(ts) >= 24*time.Hour {
-				h.trustedSessions.Delete(k)
-			}
-			return true
-		})
+		h.trustedSessions.sweep(now)
 
 		// 3) 违规记录：删除超过 offender_ttl_sec 未活动的 IP
 		h.offenders.Range(func(k, v interface{}) bool {
@@ -922,8 +1102,10 @@ func (h *CCDefenseHandler) reaper() {
 		h.captcha.sweep(now)
 		// 8) 滑动拼图：回收过期条目（TTL 60s）。
 		h.slide.sweep(now)
-		// 9) 灰名单持久化：清理已过期条目（内存态由 status 惰性降级/清除）。
+		// 9) 灰名单：内存态按到期降级/回收（含未升级的失败计数条目），并清理持久化层过期条目。
 		h.grey.sweepExpired(now)
+		// 10) PoW 一次性 nonce 表：清理已过期的消费记录。
+		h.pow.pruneSeen(now)
 	}
 }
 
@@ -970,9 +1152,10 @@ func (h *CCDefenseHandler) servePow(w http.ResponseWriter, r *http.Request, ip s
 		return
 	}
 	metrics.PoWChallenged.Inc()
-	nonce, difficulty, expires, sig := h.pow.issue(ip, level)
+	target := challengeTarget(r.URL.String())
+	nonce, difficulty, expires, sig := h.pow.issue(ip, level, target)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(powChallengeHTML(nonce, difficulty, expires, sig, r.URL.String())))
+	w.Write([]byte(powChallengeHTML(nonce, difficulty, expires, sig, target)))
 }
 
 // handlePoWVerify 处理 JS 计算挑战提交：校验通过则标记 IP/会话可信并跳回原地址。
@@ -984,11 +1167,7 @@ func (h *CCDefenseHandler) handlePoWVerify(w http.ResponseWriter, r *http.Reques
 	}
 	ip := util.ClientIP(r)
 	sid := getSessionID(r)
-	target := r.FormValue("url")
-	// 防开放重定向：仅允许站内相对路径
-	if !strings.HasPrefix(target, "/") || strings.Contains(target, "//") {
-		target = "/"
-	}
+	target := challengeTarget(r.FormValue("url"))
 	nonce := r.FormValue("nonce")
 	solution := r.FormValue("solution")
 	sig := r.FormValue("sig")
@@ -998,7 +1177,21 @@ func (h *CCDefenseHandler) handlePoWVerify(w http.ResponseWriter, r *http.Reques
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	if h.pow != nil && h.pow.verify(ip, nonce, sig, difficulty, expires, solution) {
+
+	// 档位绑定：难度必须对应某个标准档；泛洪期只接受高档。
+	// 原实现不校验档位、失败后固定按 Mid 重发：攻击者在高档挑战上失败一次
+	// 就能拿到中档题目直接降档通过；也可能在泛洪前预解低档解法。
+	var lvl ChallengeLevel
+	lvlOK := false
+	if h.pow != nil {
+		lvl, lvlOK = h.pow.levelForDifficulty(difficulty)
+	}
+	if lvlOK && h.flood.floodActive() && lvl < ChallengeHigh {
+		lvlOK = false
+	}
+
+	if lvlOK && h.pow.verify(ip, nonce, sig, difficulty, expires, solution, target) {
+		metrics.PoWPassed.Inc()
 		log.Printf("[cc_defense] pow passed ip=%s difficulty=%d", ip, difficulty)
 		// 通过挑战即视为可信：清违规累计、解除防火墙拉黑、签发可信会话
 		h.offenders.Delete(ip)
@@ -1013,10 +1206,16 @@ func (h *CCDefenseHandler) handlePoWVerify(w http.ResponseWriter, r *http.Reques
 		http.Redirect(w, r, target, http.StatusSeeOther)
 		return
 	}
+	metrics.PoWFailed.Inc()
 	log.Printf("[cc_defense] pow failed ip=%s", ip)
-	// 失败重发挑战（PoW 页面）
+	// 失败重发同一档挑战（档位无效/泛洪期低档则按最高档重发），
+	// 绝不降档，避免"失败一次就换到更便宜的题目"。
+	retry := lvl
+	if !lvlOK {
+		retry = ChallengeHigh
+	}
 	if h.pow != nil && h.pow.Enabled() {
-		nonce, difficulty, expires, sig := h.pow.issue(ip, ChallengeMid)
+		nonce, difficulty, expires, sig := h.pow.issue(ip, retry, target)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(powChallengeHTML(nonce, difficulty, expires, sig, target)))
 		return
@@ -1044,7 +1243,7 @@ func (h *CCDefenseHandler) handleCaptchaVerify(w http.ResponseWriter, r *http.Re
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	if h.captcha.verify(id, ip, clicks) {
+	if h.captcha.verify(id, sid, ip, clicks) {
 		log.Printf("[cc_defense] captcha passed ip=%s", ip)
 		metrics.CaptchaPassed.Inc()
 		// 通过验证码即视为可信：清除该 IP 的违规累计并解除防火墙拉黑，
@@ -1102,34 +1301,59 @@ func (h *CCDefenseHandler) blockIfSessionAnomaly(w http.ResponseWriter, r *http.
 	return false
 }
 
+// isVerifyEndpoint 判断是否为挑战答案提交端点。
+func isVerifyEndpoint(p string) bool {
+	switch p {
+	case "/__cc_verify", "/__cc_pow_verify", "/__cc_silent_verify", "/__cc_slider_verify":
+		return true
+	}
+	return false
+}
+
+// allowVerifySubmission 给验证提交做两层限速：全局桶（防分布式多 IP 刷端点）
+// + 每 IP 桶（防单 IP 反复重试）。两个桶都是 O(1) 内存操作。
+func (h *CCDefenseHandler) allowVerifySubmission(ip string) bool {
+	if !h.verifyBudget.allow() {
+		return false
+	}
+	return h.perIP.allow(ip)
+}
+
 func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !h.cfg.Enabled {
 		h.next.ServeHTTP(w, r)
 		return
 	}
 
-	// 验证码提交接口
-	if r.URL.Path == "/__cc_verify" {
-		h.handleCaptchaVerify(w, r)
-		return
-	}
-	// JS 计算挑战提交接口（v1.2.0 F6）
-	if r.URL.Path == "/__cc_pow_verify" {
-		h.handlePoWVerify(w, r)
-		return
-	}
-	// 无感验证提交接口（v1.2.0 F7）
-	if r.URL.Path == "/__cc_silent_verify" {
-		h.handleSilentVerify(w, r)
-		return
-	}
-	// 滑动拼图验证提交接口（v1.2.0 F7）
-	if r.URL.Path == "/__cc_slider_verify" {
-		h.handleSliderVerify(w, r)
-		return
-	}
-
 	ip := util.ClientIP(r)
+
+	// 验证提交接口（挑战答案 POST）。必须在校验前限速：原实现把它们排在
+	// 所有限流之前直接 return，攻击者可无限刷 HMAC/SHA-256、失败日志与
+	// 挑战重发（分布式多 IP 下尤其明显），把 WAF 自身变成 CPU 放大器。
+	if isVerifyEndpoint(r.URL.Path) {
+		if !h.allowVerifySubmission(ip) {
+			metrics.CCBlocked.Inc()
+			// 超限拒绝不再逐条写攻击/审计日志：海量拒绝会造成写放大，
+			// 按 IP 限频保留可观测性即可。
+			if h.throttle.allow("verify:" + ip) {
+				log.Printf("[cc_defense] verify endpoint rate limited ip=%s path=%s", ip, r.URL.Path)
+				attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "verify endpoint")
+			}
+			util.DenyConnection(w, http.StatusTooManyRequests, "429 请求过于频繁，请稍后重试\n")
+			return
+		}
+		switch r.URL.Path {
+		case "/__cc_verify":
+			h.handleCaptchaVerify(w, r)
+		case "/__cc_pow_verify":
+			h.handlePoWVerify(w, r)
+		case "/__cc_silent_verify":
+			h.handleSilentVerify(w, r)
+		default:
+			h.handleSliderVerify(w, r)
+		}
+		return
+	}
 
 	// IP 归属检测：按开关分别拦截国外 / 云厂商 IP
 	if h.ipChecker != nil && (h.blockForeign || h.blockCloud) {
@@ -1146,15 +1370,17 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 静态资源直接放行：一篇文章会并发加载大量图片/样式/脚本，
 	// 属正常浏览器行为，不做行为检测/每IP限速/挑战，避免误伤。
-	if isStaticResource(r.URL.Path) {
+	// 仅 GET/HEAD 才算静态抓取：POST 到 /upload、*.css 之类的路径不是取静态资源，
+	// 放行会让动态接口（上传/回调）完全绕过 CC。
+	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && isStaticResource(r.URL.Path) {
 		h.next.ServeHTTP(w, r)
 		return
 	}
 
 	// 快速路径：可信会话（cookie，区分同 IP 多用户）→ 直接放行
 	if sid := getSessionID(r); sid != "" {
-		if v, ok := h.trustedSessions.Load(sid); ok {
-			if t, ok := v.(time.Time); ok && time.Since(t) < 24*time.Hour {
+		if t, ok := h.trustedSessions.Load(sid); ok {
+			if time.Since(t) < trustedSessionTTL {
 				if !h.dlimiter.trusted.allow() {
 					if h.throttle.allow("tsess") {
 						log.Printf("[cc_defense] trusted session rate limited, closing connection")
@@ -1237,9 +1463,11 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if flooding {
-		// 搜索引擎爬虫白名单 — 不挑战，限速后放行
-		if isSearchBot(r.Header.Get("User-Agent")) {
-			if !h.dlimiter.untrusted.allow() {
+		// 搜索引擎爬虫白名单 — 不挑战，但必须消耗该 IP 自己的限速桶：
+		// 原实现占用共享未信任桶，伪造 Googlebot UA 的请求可以把共享令牌吃光，
+		// 饿死正常用户流量（P2）。仅 GET/HEAD 认白名单（见 searchBotRequest）。
+		if searchBotRequest(r) {
+			if !h.perIP.allow(ip) {
 				if h.throttle.allow("sbot:" + ip) {
 					log.Printf("[cc_defense] search bot ip=%s rate limited, closing connection", ip)
 				}
@@ -1255,6 +1483,22 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.ReportOffender(ip)
 		attacklog.Record(ip, r.Host, r.URL.Path, "CC挑战", "flooding")
 		h.serveChallenge(w, r, ip, ChallengeHigh)
+		return
+	}
+
+	// 搜索引擎爬虫：不挑战，但只消耗该 IP 自己的桶，不占用共享未信任桶。
+	// 否则伪造 Googlebot UA 可吃光共享令牌，导致正常用户被饿死（P2）。
+	if searchBotRequest(r) {
+		if !h.perIP.allow(ip) {
+			if h.throttle.allow("sbot:" + ip) {
+				log.Printf("[cc_defense] search bot ip=%s rate limited, closing connection", ip)
+			}
+			attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "search bot")
+			metrics.CCBlocked.Inc()
+			util.DenyConnection(w, http.StatusTooManyRequests, "429 请求过于频繁，请稍后重试\n")
+			return
+		}
+		h.next.ServeHTTP(w, r)
 		return
 	}
 
@@ -1289,22 +1533,12 @@ func (h *CCDefenseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !h.dlimiter.untrusted.allow() {
 		// 未信任共享桶达到上限：不再直接断连，改为验证码挑战。
 		// 通过验证后获得可信凭证（会话 Cookie / 可信 IP），转入可信桶，
-		// 不再占用未信任桶，拥堵可自我恢复。搜索引擎爬虫例外，仍按原策略限速断连，
-		// 避免把验证码页喂给爬虫。
+		// 不再占用未信任桶，拥堵可自我恢复。
 		//
 		// 注意：验证码产能上限来自 cc_defense.captcha_gen_max_per_sec
 		// （缺省跟随 new_ip_qps_max），超出即回 503，不再静默断连。
 		// 另外这里的"桶耗尽"只是 4 个挑战来源之一：泛洪新 IP（flooding 分支）、
 		// bot-like 行为、per-IP 限速也会直接挑战，所以产能需求并不只由本桶决定。
-		if isSearchBot(r.Header.Get("User-Agent")) {
-			if h.throttle.allow("sbot:" + ip) {
-				log.Printf("[cc_defense] search bot ip=%s rate limited, closing connection", ip)
-			}
-			attacklog.Record(ip, r.Host, r.URL.Path, "CC限速", "search bot")
-			metrics.CCBlocked.Inc()
-			util.DenyConnection(w, http.StatusTooManyRequests, "429 请求过于频繁，请稍后重试\n")
-			return
-		}
 		if h.throttle.allow("bucket:" + ip) {
 			log.Printf("[cc_defense] untrusted ip=%s bucket exhausted, serving challenge", ip)
 		}

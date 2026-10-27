@@ -48,6 +48,8 @@ func Open(driver, dsn string) (*Store, error) {
 }
 
 // Upsert 保存（或覆盖）一条可信 IP 记录。
+// 时间统一以 UTC RFC3339 存储，避免本地时区偏移参与 TEXT 字符串比较时
+// 与时间顺序不一致（见 DeleteBefore/List）。
 func (s *Store) Upsert(ip, reason string, since time.Time) {
 	if s == nil || s.db == nil {
 		return
@@ -55,7 +57,7 @@ func (s *Store) Upsert(ip, reason string, since time.Time) {
 	d := sqlutil.DialectFor(s.driver)
 	err := sqlutil.Retry(func() error {
 		_, err := s.db.Exec(d.Upsert("trusted_ip", []string{"ip", "reason", "since"}, []string{"ip"}),
-			ip, reason, since.Format(time.RFC3339))
+			ip, reason, since.UTC().Format(time.RFC3339))
 		return err
 	})
 	if err != nil {
@@ -84,7 +86,7 @@ func (s *Store) DeleteBefore(before time.Time) int {
 		return 0
 	}
 	d := sqlutil.DialectFor(s.driver)
-	res, err := s.db.Exec(d.Placeholders(`DELETE FROM trusted_ip WHERE since < ?`), before.Format(time.RFC3339))
+	res, err := s.db.Exec(d.Placeholders(`DELETE FROM trusted_ip WHERE since < ?`), before.UTC().Format(time.RFC3339))
 	if err != nil {
 		log.Printf("[truststore] 清理过期可信 IP 失败: %v", err)
 		return 0

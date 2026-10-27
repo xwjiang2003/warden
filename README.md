@@ -360,7 +360,7 @@ curl http://127.0.0.1:81/healthz     # 健康检查（端口按 config.listen）
 curl -I  http://127.0.0.1:81/        # 应转发到后端
 ```
 
-管理后台：<http://127.0.0.1:9090>（默认监听本机，`admin.password` 为空时不启用认证）。
+管理后台：<http://127.0.0.1:9090>（默认监听本机；未设置 `admin.password` 时管理后台拒绝启动，不会以无认证方式对外提供服务）。
 
 ---
 
@@ -461,7 +461,7 @@ curl -I  http://127.0.0.1:81/        # 应转发到后端
 |---|---|---|
 | `enabled` | `true` | 是否启用 |
 | `listen` | `127.0.0.1:9090` | 监听地址，**建议只监听本机** |
-| `username` / `password` | `admin` / 空 | `password` 为空则不启用认证 |
+| `username` / `password` | `admin` / 空 | `password` 为空时管理后台拒绝启动（空密码等于无认证）；不需要管理后台请设 `enabled: false` |
 
 ### `alert` 告警
 
@@ -601,8 +601,9 @@ docker compose down         # 停止（卷数据保留）
 > 2. **nginx 容器前置**：warden 与 nginx 同网络，把 nginx 所在网段填入 `trusted_proxies`；
 > 3. **外部 nginx 前置**：把 nginx 机器地址填入 `trusted_proxies`。
 >
-> 管理后台默认**不映射端口**（默认无密码认证）；需要从宿主机访问时取消 compose 中 9090 的
-> 端口映射注释，并**务必先设置 `admin.password`**。
+> 管理后台默认**不映射端口**，且 `docker/config.json` 的 `admin.password` 为空——
+> 此时管理后台会拒绝启动（不会裸奔监听 0.0.0.0:9090）。需要从宿主机访问时，
+> 取消 compose 中 9090 的端口映射注释，并**务必先设置 `admin.password`**。
 >
 > 服务器验证清单见 [docs/docker-verify.md](docs/docker-verify.md)。
 
@@ -931,8 +932,9 @@ go build -ldflags "-X warden/internal/version.Version=1.2.3" -o warden.exe ./cmd
 
 ## 安全说明
 
-- **管理后台默认无认证**（`admin.password` 为空），且默认只监听 `127.0.0.1`。
-  如需远程访问，请**务必**设置强密码，并通过反向代理 + HTTPS + IP 白名单暴露；
+- **管理后台未设置密码时拒绝启动**：`admin.password` 为空且 `admin.enabled=true` 时，
+  管理后台不会监听任何端口（启动日志会明确提示），流量防护不受影响。
+  如需远程访问，请设置强密码，并通过反向代理 + HTTPS + IP 白名单暴露；
 - 管理后台不要直接暴露到公网；
 - **客户端 IP 默认不可伪造**：只采信来自可信代理的 XFF/X-Real-IP，
   默认仅信任本机回环（等价于 Tomcat `RemoteIpValve` 的默认策略）。

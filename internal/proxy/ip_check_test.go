@@ -36,6 +36,24 @@ func TestIsNonPublicIP(t *testing.T) {
 	}
 }
 
+// TestIsCloudISPNarrowed 钉死云厂商判定语义：
+// 英文品牌名按词元精确匹配，通用词（host/vps/server/cloud）不再命中，
+// 避免把虚拟主机/企业专线/普通 ISP 误判为云厂商而误杀正常用户。
+func TestIsCloudISPNarrowed(t *testing.T) {
+	cloud := []string{"阿里云", "阿里巴巴", "Amazon AWS", "Google Cloud", "DigitalOcean", "UCloud", "Azure"}
+	for _, isp := range cloud {
+		if !isCloudISP(isp) {
+			t.Errorf("isCloudISP(%q) 应判为云厂商", isp)
+		}
+	}
+	notCloud := []string{"中国电信", "Laws Telecom", "CloudFiber", "Shared Hosting", "VPS Hosting", ""}
+	for _, isp := range notCloud {
+		if isCloudISP(isp) {
+			t.Errorf("isCloudISP(%q) 不应判为云厂商（通用词误杀）", isp)
+		}
+	}
+}
+
 // TestIPCheckPrivateNotBlocked 验证私有/内网地址不会被误判为国外。
 // 需要 data/ip2region.xdb，缺失时跳过。
 func TestIPCheckPrivateNotBlocked(t *testing.T) {

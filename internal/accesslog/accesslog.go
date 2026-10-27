@@ -47,8 +47,22 @@ func (al *Logger) Close() {
 	al.mu.Lock()
 	defer al.mu.Unlock()
 	if al.f != nil {
+		// 关闭前落盘：仅 Close 不会把页缓存写回磁盘，进程异常退出会丢最后几行。
+		_ = al.f.Sync()
 		_ = al.f.Close()
 		al.f = nil
+	}
+}
+
+// Sync 将已写入的日志刷到磁盘。审计日志用它保证条目尽快持久化。
+func (al *Logger) Sync() {
+	if al == nil {
+		return
+	}
+	al.mu.Lock()
+	defer al.mu.Unlock()
+	if al.f != nil {
+		_ = al.f.Sync()
 	}
 }
 
@@ -110,6 +124,8 @@ func (al *Logger) rotateIfNeeded(lineLen int, now time.Time) error {
 
 func (al *Logger) rotateBySize(now time.Time) error {
 	if al.f != nil {
+		// 归档前先落盘，避免 rename 之后仍依赖页缓存
+		_ = al.f.Sync()
 		_ = al.f.Close()
 		al.f = nil
 	}

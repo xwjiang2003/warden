@@ -1,9 +1,14 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"log"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // 挑战方式合法值（与 proxy 的 ChallengeKind 常量一致，此处独立于 proxy 包定义）
@@ -371,7 +376,7 @@ func (c *CCDefenseConfig) Normalize() {
 		c.NewIPCheckMinReqs = 60
 	}
 	if c.ChallengeCookieKey == "" {
-		c.ChallengeCookieKey = "warden-cc-secret"
+		c.ChallengeCookieKey = GenerateChallengeCookieKey()
 	}
 	if c.FirewallOffenderLimit <= 0 {
 		c.FirewallOffenderLimit = 10
@@ -459,6 +464,36 @@ func (c *CCDefenseConfig) Normalize() {
 	}
 }
 
+// legacyChallengeCookieKey v1.4 及更早版本的硬编码默认值。
+// 它是公开常量，任何部署都能据此伪造 PoW/滑动验证的 HMAC 签名，
+// 因此必须视为"未配置"并在加载时替换。
+const legacyChallengeCookieKey = "warden-cc-secret"
+
+// GenerateChallengeCookieKey 生成随机挑战签名密钥（32 字节，hex 编码）。
+// PoW 与滑动拼图的签名都依赖它；若所有部署共用同一固定值，
+// 攻击者可自行签发合法签名直接通过挑战并获得可信身份。
+func GenerateChallengeCookieKey() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand 失败属极端环境异常；退化为纳秒时间戳，
+		// 至少保证不同部署、不同启动之间不共用同一密钥。
+		return strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
+	return hex.EncodeToString(b)
+}
+
+// EnsureChallengeCookieKey 在密钥缺失或仍是历史公开常量时生成新密钥，返回是否生成。
+// 调用方（启动加载路径）应持久化结果，否则每次重启都会换密钥，
+// 使在途的 PoW/滑动挑战全部失效。
+func EnsureChallengeCookieKey(cfg *Config) bool {
+	k := cfg.CCDefense.ChallengeCookieKey
+	if k != "" && k != legacyChallengeCookieKey {
+		return false
+	}
+	cfg.CCDefense.ChallengeCookieKey = GenerateChallengeCookieKey()
+	return true
+}
+
 type WAFRulesConfig struct {
 	CCPaths           []string `json:"cc_paths"`
 	CCNoRefererBlock  bool     `json:"cc_no_referer_block"`
@@ -529,7 +564,18 @@ func Load(path string) (*Config, error) {
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return nil, err
 	}
+	// 必须在 ApplyDefaults 之前判断：Normalize 会给空密钥补一个随机值，
+	// 之后就无法区分"原本有密钥"与"刚刚生成"。
+	generated := EnsureChallengeCookieKey(&cfg)
 	ApplyDefaults(&cfg)
+	if generated {
+		// 持久化随机密钥：否则每次重启都换密钥，在途的挑战全部失效。
+		if err := Save(path, &cfg); err != nil {
+			log.Printf("[config] 持久化挑战签名密钥失败(%v)，本次运行使用临时密钥", err)
+		} else {
+			log.Printf("[config] 已生成随机挑战签名密钥并写入 %s", path)
+		}
+	}
 	return &cfg, nil
 }
 
@@ -567,5 +613,11 @@ func Save(path string, cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	// 配置里含 admin.password / smtp_password / challenge_cookie_key，
+	// 属敏感信息：仅属主可读（0600）。已存在的文件权限不受 WriteFile 影响，
+	// 故显式 Chmod 修正历史遗留的 0644。
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
 }

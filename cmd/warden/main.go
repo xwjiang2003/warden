@@ -105,15 +105,6 @@ func main() {
 		log.Printf("trusted_proxies: 未配置且 trust_local_proxy=false，客户端 IP 一律取直连对端地址（忽略 XFF/X-Real-IP）")
 	}
 
-	adminSrv := admin.NewServer(cfg, cfgPath, dbDriver, dbDSN, cfg.Admin)
-	adminSrv.Start()
-
-	// 诊断用 pprof 端点：默认关闭，仅 WARDEN_PPROF 设置时启动，且强制绑回环。
-	proxy.StartPprofIfEnabled()
-
-	alertChecker := alert.NewChecker(cfg)
-	go alertChecker.Run()
-
 	for _, d := range []string{"logs", "rules"} {
 		if err = os.MkdirAll(d, 0755); err != nil {
 			fatalStartup(exeDir, "mkdir %s: %v", d, err)
@@ -132,6 +123,22 @@ func main() {
 		fatalStartup(exeDir, "waf: %v", err)
 	}
 
+	// 启动期的原地修改（Normalize / waf_rules 入库覆盖）必须在发布 Holder 之前全部完成：
+	// 之后 cfg 作为只读快照被管理后台与告警循环并发读取，更新一律走复制-修改-替换。
+	cfg.AccessLogRotate.Normalize()
+	cfg.ConnLimit.Normalize()
+	cfg.FirewallBlock.Normalize()
+	cfg.CCDefense.Normalize()
+	cfgHolder := config.NewHolder(cfg)
+
+	adminSrv := admin.NewServer(cfgHolder, cfgPath, dbDriver, dbDSN, cfg.Admin)
+
+	// 诊断用 pprof 端点：默认关闭，仅 WARDEN_PPROF 设置时启动，且强制绑回环。
+	proxy.StartPprofIfEnabled()
+
+	alertChecker := alert.NewChecker(cfgHolder)
+	go alertChecker.Run()
+
 	accessLog := accesslog.New(cfg.AccessLog, cfg.AccessLogRotate)
 	defer accessLog.Close()
 	siteRouter, err := router.New(cfg, accessLog)
@@ -148,8 +155,6 @@ func main() {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	cfg.ConnLimit.Normalize()
-	cfg.FirewallBlock.Normalize()
 	fwStore, fwErr := fwstore.Open(dbDriver, dbDSN)
 	if fwErr != nil {
 		log.Printf("[firewall] 打开拉黑持久化失败(%v)，拉黑将不持久化", fwErr)
@@ -184,11 +189,14 @@ func main() {
 	ccDef = proxy.NewCCDefense(cfg.CCDefense, cfg.IPCheck, fwBlocker, handler, trustStore, greyStore)
 	adminSrv.SetTrustStore(trustStore)
 	adminSrv.SetGreyStore(greyStore)
-	adminSrv.SetRuleRepo(dbDriver, dbDSN, &cfg.WAFRules, wafHolder)
+	adminSrv.SetRuleRepo(dbDriver, dbDSN, wafHolder)
+	// 依赖注入全部完成后再对外监听：否则管理后台先起来、规则仓库/可信 IP
+	// 尚未就绪，此间到达的 /api/rules 等请求会收到 503。
+	adminSrv.Start()
 	whitelist := proxy.NewIPWhitelist(cfg.IPWhitelist.CIDRs)
 	blocklist := proxy.NewIPWhitelist(cfg.IPBlacklist.CIDRs)
 	mux.Handle("/", proxy.BlocklistMiddleware(blocklist, cfg.IPBlacklist.Enabled,
-		proxy.URLMiddleware(cfg.URLAllowlist, cfg.URLBlocklist, siteRouter,
+		proxy.URLMiddleware(cfg.URLAllowlist, cfg.URLBlocklist, inner,
 			proxy.WhitelistMiddleware(whitelist, cfg.IPWhitelist.Enabled, inner, ccDef))))
 
 	readTO := util.DurationSec(cfg.ReadTimeoutSec, 60)
@@ -212,11 +220,9 @@ func main() {
 
 	log.Printf("沃盾 listening on %s -> %s", cfg.Listen, cfg.Backend)
 	log.Printf("rules: %s", rulesPath)
-	cfg.AccessLogRotate.Normalize()
 	log.Printf("rate_limit: enabled=%v hot=%d/%ds site=%d/min hot_patterns=%d block=%v",
 		cfg.RateLimit.Enabled, cfg.RateLimit.HotPathMax, cfg.RateLimit.HotPathWindowSec,
 		cfg.RateLimit.SiteMaxPerMin, len(cfg.RateLimit.HotPathPatterns), cfg.BlockRequests)
-	cfg.CCDefense.Normalize()
 	log.Printf("cc_defense: enabled=%v global_qps=%d burst=%d new_ip_ratio=%d%% win=%ds",
 		cfg.CCDefense.Enabled, cfg.CCDefense.GlobalQPSMax, cfg.CCDefense.GlobalQPSBurst,
 		cfg.CCDefense.NewIPRatioBlock, cfg.CCDefense.NewIPCheckSec)
@@ -235,7 +241,7 @@ func main() {
 	}
 	log.Printf("按 Ctrl+C 停止服务")
 
-	ln, err := net.Listen("tcp", cfg.Listen)
+	ln, err := listenWithRetry(cfg.Listen, 20*time.Second)
 	if err != nil {
 		fatalStartup(exeDir, "listen %s: %v (端口被占用？请改 config.json 的 listen)", cfg.Listen, err)
 	}
@@ -251,7 +257,45 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.Println("shutting down...")
-	_ = srv.Close()
+	// 先等在途请求结束（避免中断正在写日志/响应的请求），再依次收尾各日志：
+	// attacklog 写入协程有 500ms/200 条的缓冲，不 flush 会丢最后一批攻击日志；
+	// auditlog 需要 Close 才会做最后一次 fsync。
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("shutdown: 等待在途请求结束: %v", err)
+	}
+	attacklog.Close()
+	auditlog.Close()
+}
+
+// listenWithRetry 在端口仍被上一代进程占用时短暂重试。
+// Windows 重启采用「先起子进程、父进程再退出」的方式（internal/restart），
+// 子进程 bind 可能早于父进程释放监听端口；单次 net.Listen 直接失败会导致
+// 重启后服务起不来。这里仅对「地址已占用」类错误重试，其他错误立即返回。
+func listenWithRetry(addr string, timeout time.Duration) (net.Listener, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			return ln, nil
+		}
+		if !isAddrInUse(err) || time.Now().After(deadline) {
+			return nil, err
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// isAddrInUse 判断 listen 失败是否因端口被占用。
+// Windows 上 Go 返回的是原始 WSAEADDRINUSE(10048)，未映射为 syscall.EADDRINUSE，
+// 故需按 errno 数值额外判断一次。
+func isAddrInUse(err error) bool {
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	var errno syscall.Errno
+	return errors.As(err, &errno) && errno == 10048 // WSAEADDRINUSE
 }
 
 // acmeStagingURL Let's Encrypt 预演环境 Directory 端点
@@ -339,7 +383,11 @@ func fatalStartup(exeDir, format string, args ...interface{}) {
 
 func metricsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		metrics.TotalRequests.Inc()
+		// 探活请求不计入业务指标：/healthz 频率高且不是真实流量，
+		// 计入 TotalRequests 会稀释拦截率，使告警阈值失真。
+		if r.URL.Path != "/healthz" {
+			metrics.TotalRequests.Inc()
+		}
 		next.ServeHTTP(w, r)
 	})
 }

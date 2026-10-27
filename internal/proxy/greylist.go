@@ -103,10 +103,16 @@ func (g *greyList) recordFail(ip string, level ChallengeLevel) {
 		return
 	}
 	now := time.Now()
-	v, _ := g.entries.LoadOrStore(ip, &greyEntry{ip: ip, since: now})
+	// 未升级条目的失败计数只在 ttl 窗口内有效：窗口到期即重新累计，
+	// 也保证这类条目有确定的过期时间，能被 reaper 回收
+	// （原实现 until 为零值，永不清理 → 海量一次性 IP 造成内存泄漏）。
+	v, _ := g.entries.LoadOrStore(ip, &greyEntry{ip: ip, since: now, until: now.Add(g.ttl)})
 	e := v.(*greyEntry)
 	e.mu.Lock()
 	e.level = level
+	if e.state == greyNone && now.After(e.until) {
+		e.fails = 0
+	}
 	e.fails++
 	fails := int(e.fails)
 
@@ -119,6 +125,9 @@ func (g *greyList) recordFail(ip string, level ChallengeLevel) {
 			e.fails = 0
 			g.persist(e)
 			log.Printf("[greylist] ip=%s 挑战连续失败 %d 次 → 灰名单(限速档) ttl=%s", ip, fails, g.ttl)
+		} else {
+			// 滑动窗口：窗口内持续失败则保留计数，停止失败后随 until 到期被清理
+			e.until = now.Add(g.ttl)
 		}
 	case greySoft:
 		if fails >= int(g.escalate) {
@@ -180,8 +189,41 @@ func (g *greyList) allow(ip string) bool {
 	return g.limiter.allow(ip)
 }
 
-// sweepExpired 惰性清理持久化层已过期条目（reaper 周期调用）。
+// sweepExpired 周期清扫内存与持久化层的过期条目（reaper 调用）。
+// 原实现只清数据库，内存态依赖 status() 的惰性清理——IP 不再回来就永不释放，
+// 攻击期海量一次性 IP 会让 entries 无界增长。
 func (g *greyList) sweepExpired(now time.Time) {
+	g.entries.Range(func(k, v interface{}) bool {
+		ip := k.(string)
+		e := v.(*greyEntry)
+		e.mu.Lock()
+		if now.After(e.until) {
+			switch e.state {
+			case greyHard:
+				// 顽固到期 → 降级灰名单（与 status 一致，再给一个 TTL 窗口）
+				e.state = greySoft
+				e.until = now.Add(g.ttl)
+				e.fails = 0
+				e.since = now
+				g.persist(e)
+			case greySoft:
+				if g.store != nil {
+					g.store.Delete(ip)
+				}
+				g.entries.Delete(ip)
+			case greyNone:
+				// 未升级的失败计数窗口到期：直接回收
+				g.entries.Delete(ip)
+			}
+		}
+		e.mu.Unlock()
+		return true
+	})
+
+	// 限速桶同样按空闲回收：解除灰名单/过期后残留的桶否则永不释放。
+	// 桶在 allow 时创建，reaper 只 gc 了 h.perIP，这里必须单独回收。
+	g.limiter.gc(g.hardTTL)
+
 	if g.store == nil {
 		return
 	}

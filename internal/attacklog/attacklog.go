@@ -6,6 +6,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"warden/internal/auditlog"
@@ -24,6 +25,13 @@ type Event struct {
 
 const maxEvents = 2000
 
+// maxExportRows CSV 明细导出的行数上限：无上限时一次导出百万行会把
+// 整个结果集连同 CSV 文本全部堆在内存里（管理后台进程 OOM）。
+const maxExportRows = 50000
+
+// auditQueueSize 审计事件异步队列容量。
+const auditQueueSize = 8192
+
 var (
 	mu         sync.Mutex
 	events     []Event
@@ -31,14 +39,41 @@ var (
 	dialect    sqlutil.Dialect
 	ch         = make(chan Event, 2000)
 	retainDays = 90 // 攻击日志保留天数
-	auditHook  func(auditlog.Event)
+
+	// auditHook 审计写盘钩子。Record 在请求路径上被调用，
+	// 直接同步写 JSON 文件会因磁盘抖动拖慢拦截链路，故一律投递到
+	// 有界队列由独立 goroutine 消费；队列满时丢弃（审计是旁路）。
+	auditHook atomic.Value // func(auditlog.Event)
+	auditCh   = make(chan auditlog.Event, auditQueueSize)
+	auditOnce sync.Once
+	auditDrop int64 // 队列满导致丢弃的累计条数
+
+	// clearCh Clear 与写入协程的会合点：确保"清空"之后不会再有旧缓冲落库。
+	clearCh = make(chan chan struct{}, 1)
+
+	// closeCh 退出收尾：通知写入协程 flush 缓冲后退出（进程退出前调用）。
+	// 不关闭 ch：Record 仍可能被并发调用，向已关闭 channel 发送会 panic。
+	closeCh   = make(chan chan struct{}, 1)
+	closeOnce sync.Once
 )
 
-// SetAuditHook 注册审计钩子（v1.4.0 F13）：每条攻击事件同步写一行审计日志
+// SetAuditHook 注册审计钩子（v1.4.0 F13）：每条攻击事件异步写一行审计日志
 // （JSON 文件，复用 accesslog 轮转），与落库互不阻塞。
 // 类型取攻击分类原文（CC挑战 / IP归属 / 频率限制 …），详情取原始 detail。
 func SetAuditHook(hook func(auditlog.Event)) {
-	auditHook = hook
+	if hook == nil {
+		return
+	}
+	auditHook.Store(hook)
+	auditOnce.Do(func() {
+		go func() {
+			for evt := range auditCh {
+				if h, ok := auditHook.Load().(func(auditlog.Event)); ok && h != nil {
+					h(evt)
+				}
+			}
+		}()
+	})
 }
 
 // Init 打开数据库、启动异步写入协程与定期清理。
@@ -97,15 +132,20 @@ func Record(ip, host, path, category, detail string) {
 	default:
 	}
 	// F13 审计：同事件写审计日志（JSON 文件，旁路，失败不影响请求路径）。
-	// 放在内存队列之后、锁之外，保证攻击日志优先、审计不拖慢拦截链路。
-	if auditHook != nil {
-		auditHook(auditlog.Event{
-			Type:   category,
-			IP:     ip,
-			Host:   host,
-			Path:   path,
-			Detail: detail,
-		})
+	// 投递到异步队列而非直接落盘：审计写在请求链路上会引入磁盘延迟，
+	// 且队列满时只丢弃审计、绝不反压业务请求。
+	select {
+	case auditCh <- auditlog.Event{
+		Type:   category,
+		IP:     ip,
+		Host:   host,
+		Path:   path,
+		Detail: detail,
+	}:
+	default:
+		if n := atomic.AddInt64(&auditDrop, 1); n == 1 || n%1000 == 0 {
+			log.Printf("[attacklog] 审计队列已满，累计丢弃 %d 条", n)
+		}
 	}
 }
 
@@ -157,8 +197,45 @@ func writer() {
 			}
 		case <-ticker.C:
 			flush()
+		case done := <-closeCh:
+			// 退出收尾：把缓冲落库后结束写入协程。
+			flush()
+			close(done)
+			return
+		case done := <-clearCh:
+			// 清空请求：丢弃本批缓冲与队列里尚未落库的事件，再放行 Clear
+			// 去 DELETE，否则"清空"之后旧事件还会被补写回库里。
+			buf = buf[:0]
+		drain:
+			for {
+				select {
+				case <-ch:
+				default:
+					break drain
+				}
+			}
+			close(done)
 		}
 	}
+}
+
+// Close 让写入协程把缓冲落盘后退出（进程退出前调用）。
+// 不关闭 ch：Record 仍可能被并发调用，向已关闭 channel 发送会 panic。
+func Close() {
+	if db == nil {
+		return
+	}
+	closeOnce.Do(func() {
+		done := make(chan struct{})
+		select {
+		case closeCh <- done:
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+			}
+		case <-time.After(2 * time.Second):
+		}
+	})
 }
 
 // writeBatch 在一个事务里批量插入攻击日志，减少写事务/锁次数。
@@ -221,10 +298,24 @@ func Clear() {
 	mu.Lock()
 	events = nil
 	mu.Unlock()
-	if db != nil {
-		if _, err := db.Exec(`DELETE FROM attack_log`); err != nil {
-			log.Printf("[attacklog] 清空失败: %v", err)
+	if db == nil {
+		return
+	}
+	// 先让写入协程丢弃未落库的缓冲，再删库，避免旧事件被补写回来。
+	// 写入协程卡在慢批次上时最多等 3 秒，超时也继续清（宁可留少量旧行）。
+	done := make(chan struct{})
+	select {
+	case clearCh <- done:
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			log.Printf("[attacklog] 等待写入协程排空超时，直接清空")
 		}
+	default:
+		log.Printf("[attacklog] 写入协程未就绪，直接清空")
+	}
+	if _, err := db.Exec(`DELETE FROM attack_log`); err != nil {
+		log.Printf("[attacklog] 清空失败: %v", err)
 	}
 }
 
@@ -339,11 +430,12 @@ func QueryReport(start string, granularity string, topN int) (*Report, error) {
 
 // QueryRangeCSV 导出起始时间之后的攻击日志明细（CSV 内容，UTF-8 无 BOM；
 // 调用方如需 Excel 直接打开可加 BOM）。列：time,ip,host,path,category,detail。
+// 最多导出 maxExportRows 行（最新在前），避免大范围导出把整个结果集堆进内存。
 func QueryRangeCSV(start string) (string, error) {
 	if db == nil {
 		return "", nil
 	}
-	rows, err := db.Query(dialect.Placeholders(`SELECT time, ip, host, path, category, detail FROM attack_log WHERE time >= ? ORDER BY time DESC`), start)
+	rows, err := db.Query(dialect.Placeholders(`SELECT time, ip, host, path, category, detail FROM attack_log WHERE time >= ? ORDER BY time DESC LIMIT `+itoa(maxExportRows)), start)
 	if err != nil {
 		return "", err
 	}
@@ -393,7 +485,13 @@ func fillBuckets(start, granularity string, got map[string]int64) []TrendPoint {
 }
 
 // csvEscape 按 RFC 4180 转义字段（含逗号/引号/换行时用双引号包裹）。
+// 同时防 CSV 公式注入：以 = + - @ 或 Tab/CR 开头的单元格会被 Excel/WPS
+// 当作公式执行（攻击者可写入 =HYPERLINK(...) 之类的 detail），前置单引号
+// 让表格软件按文本处理。
 func csvEscape(s string) string {
+	if s != "" && strings.ContainsRune("=+-@\t\r", rune(s[0])) {
+		s = "'" + s
+	}
 	if strings.ContainsAny(s, ",\"\n") {
 		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 	}

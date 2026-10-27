@@ -27,7 +27,9 @@ func TestRealIPMiddlewareRewritesRemoteAddr(t *testing.T) {
 		{"单段 XFF", "127.0.0.1:51000", "203.0.113.77", "203.0.113.77:51000"},
 		{"无 XFF：回退到对端地址", "127.0.0.1:51000", "", "127.0.0.1:51000"},
 		{"对端不可信：忽略伪造 XFF", "198.51.100.7:51000", "1.2.3.4", "198.51.100.7:51000"},
-		{"IPv6 客户端", "127.0.0.1:51000", "2001:db8::99", "2001:db8::99:51000"},
+		// IPv6 必须保留方括号：否则 "2001:db8::99:51000" 会被解析失败（空串）
+		// 或把端口当成地址最后一段（端口 1~4 位时），IPv6 客户端 IP 全链路失真。
+		{"IPv6 客户端", "127.0.0.1:51000", "2001:db8::99", "[2001:db8::99]:51000"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -45,6 +47,57 @@ func TestRealIPMiddlewareRewritesRemoteAddr(t *testing.T) {
 				t.Fatalf("下游看到的 RemoteAddr = %q, want %q", seen, c.want)
 			}
 		})
+	}
+}
+
+// TestRealIPMiddlewareIPv6ClientIP 校验改写后的方括号形式不会破坏下游 ClientIP：
+// 旧实现拼接出的 "2001:db8::99:51000" 会让 SplitHostPort 失败并返回空 IP，
+// IPv6 用户因此全部落进同一个空 IP 限流桶。
+func TestRealIPMiddlewareIPv6ClientIP(t *testing.T) {
+	old := defaultClientIPResolver
+	defer func() { defaultClientIPResolver = old }()
+	SetTrustedProxies([]string{"127.0.0.1/32"}, false)
+
+	for _, peer := range []string{"127.0.0.1:51000", "127.0.0.1:80"} {
+		gotIP := ""
+		h := RealIPMiddleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			gotIP = ClientIP(r)
+		}))
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		req.RemoteAddr = peer
+		req.Header.Set("X-Forwarded-For", "2001:db8::99")
+		h.ServeHTTP(httptest.NewRecorder(), req)
+		if gotIP != "2001:db8::99" {
+			t.Fatalf("peer=%s 下游 ClientIP = %q, want 2001:db8::99", peer, gotIP)
+		}
+	}
+}
+
+// TestRealIPMiddlewareStripsForwardHeaders 校验解析后转发头被删除：
+// 下游再调 ClientIP 时只能依据已改写好的 RemoteAddr，不会把同一份 XFF
+// 二次解析（改写后的对端落在可信网段时尤其危险）。
+func TestRealIPMiddlewareStripsForwardHeaders(t *testing.T) {
+	old := defaultClientIPResolver
+	defer func() { defaultClientIPResolver = old }()
+	SetTrustedProxies([]string{"127.0.0.1/32"}, false)
+
+	var gotXFF, gotXRI, gotIP string
+	h := RealIPMiddleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		gotXFF = r.Header.Get("X-Forwarded-For")
+		gotXRI = r.Header.Get("X-Real-IP")
+		gotIP = ClientIP(r)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.RemoteAddr = "127.0.0.1:51000"
+	req.Header.Set("X-Forwarded-For", "1.2.3.4, 203.0.113.77")
+	req.Header.Set("X-Real-IP", "1.2.3.4")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if gotXFF != "" || gotXRI != "" {
+		t.Fatalf("下游不应再看到转发头: XFF=%q X-Real-IP=%q", gotXFF, gotXRI)
+	}
+	if gotIP != "203.0.113.77" {
+		t.Fatalf("下游 ClientIP = %q, want 203.0.113.77", gotIP)
 	}
 }
 

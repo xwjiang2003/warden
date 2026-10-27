@@ -13,7 +13,7 @@ import (
 // 不触发任何 netsh/powershell 子进程（单测环境不污染系统防火墙）。
 func TestFirewallBlockerDisabledSafe(t *testing.T) {
 	fb := NewFirewallBlocker(false, 30, nil, nil)
-	if fb.enabled {
+	if fb.enabled.Load() {
 		t.Fatal("enabled 应为 false")
 	}
 	// 禁用态 block：直接返回，内存态不增长
@@ -125,9 +125,9 @@ func TestIpSetRestoreScript(t *testing.T) {
 func TestFirewallBlockerMaxBlocked(t *testing.T) {
 	fb := &FirewallBlocker{
 		blockedIPs: make(map[string]time.Time),
-		enabled:    true,
 		maxBlocked: 4,
 	}
+	fb.enabled.Store(true)
 	for i := 1; i <= 5; i++ {
 		fb.block(fmt.Sprintf("1.0.0.%d", i), "unit-test")
 	}

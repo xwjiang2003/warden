@@ -64,6 +64,46 @@ func TestHolderHotReload(t *testing.T) {
 	}
 }
 
+// TestHolderIPv6RemoteAddr 校验 IPv6 的 REMOTE_ADDR 规则可命中，且下游
+// （反代/日志）拿到的仍是标准的 "[ip]:port" 形式——两者形式不同，
+// 由 Holder 在进入/离开 Coraza 时分别转换与恢复。
+func TestHolderIPv6RemoteAddr(t *testing.T) {
+	const directives = `
+SecRule REMOTE_ADDR "@ipMatch 2001:db8::99" "id:990001,phase:1,deny,status:403,log,msg:'ipv6'"
+`
+	engine, err := NewFromText(directives, &config.WAFRulesConfig{})
+	if err != nil {
+		t.Fatalf("引擎构建失败: %v", err)
+	}
+	var downstream string
+	h := NewHolder()
+	h.Init(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downstream = r.RemoteAddr
+		w.WriteHeader(http.StatusOK)
+	}))
+	h.SetEngine(engine)
+	handler := h.Handler()
+
+	req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	req.RemoteAddr = "[2001:db8::99]:51000"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("IPv6 REMOTE_ADDR 规则应命中并 403，实际 %d", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/ok", nil)
+	req.RemoteAddr = "[2001:db8::100]:51000"
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("非命中 IPv6 应放行，实际 %d", rec.Code)
+	}
+	if downstream != "[2001:db8::100]:51000" {
+		t.Fatalf("下游 RemoteAddr = %q，应为标准方括号形式", downstream)
+	}
+}
+
 // TestHolderNotReady 引擎未初始化时返回 503，而不是 panic。
 func TestHolderNotReady(t *testing.T) {
 	h := NewHolder()

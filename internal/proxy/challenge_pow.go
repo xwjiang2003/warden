@@ -7,13 +7,19 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"html"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"warden/internal/config"
-	"warden/internal/metrics"
 )
+
+// powSeenMax nonce 一次性消费表的硬上限（条）。
+// 条目 TTL 与挑战有效期一致（默认 60s），按 ~60B/条估算上限内存约 12MB；
+// 超出时先清过期项，仍满则淘汰任意条目兜底（牺牲极少量重放防护换取内存有界）。
+const powSeenMax = 200000
 
 // ChallengeLevel 挑战风险档：决定 PoW 难度（按 difficulty_min..max 映射）。
 type ChallengeLevel int
@@ -29,14 +35,20 @@ const (
 
 // PoWChallenge JS 计算挑战（Proof-of-Work，v1.2.0 F6）。
 //
-// 无状态设计：挑战参数（nonce/difficulty/expires）由 HMAC-SHA256 签名，
-// 服务端不存表、不占内存；客户端用纯 JS 求 SHA-256 前缀碰撞，服务端校验成本
-// 一次哈希。防重放：expires 时间窗（默认 60s）+ 签名绑定 IP。
+// 主体无状态：挑战参数（nonce/difficulty/expires）由 HMAC-SHA256 签名，
+// 服务端不存表；客户端用纯 JS 求 SHA-256 前缀碰撞，服务端校验成本一次哈希。
+// 防重放：expires 时间窗（默认 60s）+ 签名绑定 IP + nonce 一次性消费（bounded map）。
 type PoWChallenge struct {
-	key            []byte // HMAC key（challenge_cookie_key）
-	ttl            time.Duration
+	key              []byte // HMAC key（challenge_cookie_key）
+	ttl              time.Duration
 	minDiff, maxDiff int
-	enabled        bool
+	enabled          bool
+
+	// seen 一次性 nonce 表：nonce -> 挑战到期时间。
+	// 签发/校验本身无状态（HMAC 签名），但允许同一解法在有效期内反复提交，
+	// 等于把"一次计算"变成"无限次通行证"；这里在通过后消费 nonce 防重放。
+	seenMu sync.Mutex
+	seen   map[string]time.Time
 }
 
 func newPoWChallenge(cfg config.PoWConfig, secret string) *PoWChallenge {
@@ -77,7 +89,7 @@ func (p *PoWChallenge) silentDifficulty() int {
 }
 
 // issueWithDifficulty 按指定难度签发挑战参数（silent 档专用）。
-func (p *PoWChallenge) issueWithDifficulty(ip string, difficulty int) (nonce string, diff int64, expires int64, sig string) {
+func (p *PoWChallenge) issueWithDifficulty(ip string, difficulty int, target string) (nonce string, diff int64, expires int64, sig string) {
 	buf := make([]byte, 16)
 	if _, err := rand.Read(buf); err != nil {
 		copy(buf, []byte(fmt.Sprintf("%d-%d", time.Now().UnixNano(), randInt())))
@@ -85,13 +97,13 @@ func (p *PoWChallenge) issueWithDifficulty(ip string, difficulty int) (nonce str
 	nonce = hex.EncodeToString(buf)
 	diff = int64(difficulty)
 	expires = time.Now().Add(p.ttl).Unix()
-	sig = p.sign(nonce, diff, expires, ip)
+	sig = p.sign(nonce, diff, expires, ip, target)
 	return
 }
 
 // issue 签发挑战参数。返回 nonce（hex）、difficulty（前缀零 bit）、
 // expires（Unix 秒）与签名。所有字段直接嵌入 HTML/表单，无服务端状态。
-func (p *PoWChallenge) issue(ip string, level ChallengeLevel) (nonce string, difficulty int64, expires int64, sig string) {
+func (p *PoWChallenge) issue(ip string, level ChallengeLevel, target string) (nonce string, difficulty int64, expires int64, sig string) {
 	buf := make([]byte, 16)
 	if _, err := rand.Read(buf); err != nil {
 		// 随机源不可用时用时间戳兜底（仍满足"每请求唯一"）
@@ -100,7 +112,7 @@ func (p *PoWChallenge) issue(ip string, level ChallengeLevel) (nonce string, dif
 	nonce = hex.EncodeToString(buf)
 	difficulty = int64(p.difficultyFor(level))
 	expires = time.Now().Add(p.ttl).Unix()
-	sig = p.sign(nonce, difficulty, expires, ip)
+	sig = p.sign(nonce, difficulty, expires, ip, target)
 	return
 }
 
@@ -109,45 +121,112 @@ func randInt() int64 {
 	return time.Now().UnixNano() & 0x7fffffff
 }
 
-// sign 计算 HMAC 签名：nonce|difficulty|expires|ip。
-func (p *PoWChallenge) sign(nonce string, difficulty, expires int64, ip string) string {
-	payload := nonce + "|" + strconv.FormatInt(difficulty, 10) + "|" + strconv.FormatInt(expires, 10) + "|" + ip
+// sign 计算 HMAC 签名：nonce|difficulty|expires|ip|target。
+// target 绑定挑战被签发的地址：解法不能拿去别的端点复用，回跳地址也不能被改写。
+func (p *PoWChallenge) sign(nonce string, difficulty, expires int64, ip, target string) string {
+	payload := nonce + "|" + strconv.FormatInt(difficulty, 10) + "|" + strconv.FormatInt(expires, 10) + "|" + ip + "|" + target
 	mac := hmac.New(sha256.New, p.key)
 	mac.Write([]byte(payload))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
+// challengeTarget 规范化挑战绑定的目标地址：仅允许站内相对路径。
+// 签发与校验必须使用同一形式，否则签名对不上会让合法用户反复失败。
+func challengeTarget(raw string) string {
+	if raw == "" || !strings.HasPrefix(raw, "/") || strings.Contains(raw, "//") {
+		return "/"
+	}
+	return raw
+}
+
+// levelForDifficulty 把签名的难度映射回风险档。
+// 整页 PoW 提交必须能对应到三档标准难度之一，防止客户端用低档解法冒充高档；
+// silent 档的折半难度不在此列（由 verify 的通用难度校验处理）。
+func (p *PoWChallenge) levelForDifficulty(d int64) (ChallengeLevel, bool) {
+	if d == int64(p.difficultyFor(ChallengeHigh)) {
+		return ChallengeHigh, true
+	}
+	if d == int64(p.difficultyFor(ChallengeMid)) {
+		return ChallengeMid, true
+	}
+	if d == int64(p.difficultyFor(ChallengeLow)) {
+		return ChallengeLow, true
+	}
+	return ChallengeLow, false
+}
+
 // verify 校验挑战提交：
-//  1. 签名有效（nonce/difficulty/expires/ip 任一被改 → 拒绝）；
+//  1. 签名有效（nonce/difficulty/expires/ip/target 任一被改 → 拒绝）；
 //  2. 未过期（expires 时间窗防重放）；
 //  3. 难度在允许范围（防御性校验，正常由签名保证）；
 //  4. solution 满足 sha256(nonce+solution) 前缀 difficulty bit 全零。
-func (p *PoWChallenge) verify(ip, nonce, sig string, difficulty, expires int64, solution string) bool {
+func (p *PoWChallenge) verify(ip, nonce, sig string, difficulty, expires int64, solution, target string) bool {
 	if p == nil {
 		return false
 	}
 	// 常数时间比较签名
-	want := p.sign(nonce, difficulty, expires, ip)
+	want := p.sign(nonce, difficulty, expires, ip, target)
 	if subtle.ConstantTimeCompare([]byte(sig), []byte(want)) != 1 {
-		metrics.PoWFailed.Inc()
 		return false
 	}
 	if time.Now().Unix() > expires {
-		metrics.PoWFailed.Inc()
 		return false
 	}
 	if difficulty <= 0 || difficulty > 32 || difficulty > int64(p.maxDiff) {
-		metrics.PoWFailed.Inc()
 		return false
 	}
 	// 工作量校验：一次 SHA-256（服务端成本恒定）
 	sum := sha256.Sum256([]byte(nonce + solution))
 	if !leadingZeroBits(sum[:], int(difficulty)) {
-		metrics.PoWFailed.Inc()
 		return false
 	}
-	metrics.PoWPassed.Inc()
+	// 一次性消费：同一 nonce 的有效解只能换取一次可信身份（防重放）。
+	// 放在工作量校验之后，避免攻击者用错误解抢先烧掉别人正在使用的 nonce。
+	return p.consume(nonce, expires)
+}
+
+// consume 登记 nonce 为已消费；重复 nonce 返回 false。表有硬上限，过期条目惰性清理。
+func (p *PoWChallenge) consume(nonce string, expires int64) bool {
+	now := time.Now()
+	until := time.Unix(expires, 0)
+
+	p.seenMu.Lock()
+	defer p.seenMu.Unlock()
+	if p.seen == nil {
+		p.seen = make(map[string]time.Time)
+	}
+	if _, used := p.seen[nonce]; used {
+		return false
+	}
+	if len(p.seen) >= powSeenMax {
+		p.pruneLocked(now)
+		for k := range p.seen {
+			if len(p.seen) < powSeenMax {
+				break
+			}
+			delete(p.seen, k)
+		}
+	}
+	p.seen[nonce] = until
 	return true
+}
+
+// pruneSeen 清理已过期的 nonce 记录（供后台 reaper 定期调用）。
+func (p *PoWChallenge) pruneSeen(now time.Time) {
+	if p == nil {
+		return
+	}
+	p.seenMu.Lock()
+	p.pruneLocked(now)
+	p.seenMu.Unlock()
+}
+
+func (p *PoWChallenge) pruneLocked(now time.Time) {
+	for k, exp := range p.seen {
+		if now.After(exp) {
+			delete(p.seen, k)
+		}
+	}
 }
 
 // leadingZeroBits 检查 hash 结果前缀（大端序，从首字节最高位起）bits 位全零。
@@ -222,7 +301,7 @@ __POW_LEADING_JS__
 		"__POW_DIFF__", strconv.FormatInt(difficulty, 10),
 		"__POW_EXP__", strconv.FormatInt(expires, 10),
 		"__POW_SIG__", sig,
-		"__POW_URL__", targetURL,
+		"__POW_URL__", html.EscapeString(targetURL),
 		"__POW_SHA256_JS__", powSHA256JS,
 		"__POW_LEADING_JS__", powLeadingZeroJS,
 	)

@@ -23,10 +23,9 @@ SecRule REQUEST_URI "@rx ^/admin" "id:1001,phase:1,deny,status:403,msg:'block ad
 func newRulesTestServer(t *testing.T) (*Server, string, *waf.Holder) {
 	t.Helper()
 	cfg := &config.Config{Listen: ":81", Backend: "http://127.0.0.1:8002"}
-	s := NewServer(cfg, "config.json", "sqlite", "", config.AdminConfig{})
-
 	dbPath := filepath.Join(t.TempDir(), "rules.db")
-	wr := &config.WAFRulesConfig{}
+	wr := &cfg.WAFRules
+	s := NewServer(config.NewHolder(cfg), "config.json", "sqlite", "", config.AdminConfig{})
 
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -40,7 +39,7 @@ func newRulesTestServer(t *testing.T) (*Server, string, *waf.Holder) {
 	}
 	holder.SetEngine(engine)
 
-	s.SetRuleRepo("sqlite", dbPath, wr, holder)
+	s.SetRuleRepo("sqlite", dbPath, holder)
 	return s, dbPath, holder
 }
 
@@ -111,8 +110,8 @@ SecRule REQUEST_URI "@rx ^/api" "id:1002,phase:1,deny,status:403,msg:'block api'
 	}
 
 	// waf_rules 结构同步更新（供 BuildRules 使用）
-	if len(s.wafRules.ScannerPaths) != 1 || s.wafRules.ScannerPaths[0] != "phpmyadmin" {
-		t.Fatalf("waf_rules 应同步更新: %+v", s.wafRules)
+	if got := s.cfg.Load().WAFRules.ScannerPaths; len(got) != 1 || got[0] != "phpmyadmin" {
+		t.Fatalf("waf_rules 应同步更新: %+v", got)
 	}
 }
 

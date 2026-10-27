@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"image"
 	"image/color"
@@ -112,6 +113,20 @@ func silentSubmit(h *CCDefenseHandler, page string, mutate func(map[string]strin
 	return rec, fields
 }
 
+// wrongPoW 确定性地构造一个不满足难度要求的解。
+// 不能固定用 "0"：难度仅 6 bit 时 sha256(nonce+"0") 有 1/64 概率恰好满足
+// 前导零，会让"错误解应被拒绝"用例随机失败（既有 flaky）。
+func wrongPoW(nonce, difficulty string) string {
+	diff, _ := strconv.Atoi(difficulty)
+	for c := 0; ; c++ {
+		s := strconv.Itoa(c)
+		sum := sha256.Sum256([]byte(nonce + s))
+		if !leadingZeroBits(sum[:], diff) {
+			return s
+		}
+	}
+}
+
 // TestSilentFlowHTTP 正常指纹通过 → 302 + 可信会话签发。
 func TestSilentFlowHTTP(t *testing.T) {
 	h := silentTestHandler(t)
@@ -154,7 +169,7 @@ func TestSilentFingerprintReject(t *testing.T) {
 		{"canvas空", func(m map[string]string) { m["fp_canvas"] = "" }},
 		{"langs空", func(m map[string]string) { m["fp_langs"] = "" }},
 		{"touch非法", func(m map[string]string) { m["fp_touch"] = "2" }},
-		{"错误解", func(m map[string]string) { m["solution"] = "0" }},
+		{"错误解", func(m map[string]string) { m["solution"] = wrongPoW(m["nonce"], m["difficulty"]) }},
 		{"签名篡改", func(m map[string]string) { m["sig"] = "deadbeef" }},
 	}
 	for _, c := range cases {
@@ -290,6 +305,21 @@ func TestSliderFlowHTTP(t *testing.T) {
 	}
 	if !strings.Contains(replay.Body.String(), "__cc_slider_verify") {
 		t.Fatal("重放响应应是新的 slider 页面")
+	}
+}
+
+// TestSliderBlockAlignsWithGapY 回归：拼图块必须初始就与缺口同高（top=gapY）。
+// 用户只能横向拖动，若块固定在顶部，会与下方的缺口视觉错位、看起来无法拼合。
+func TestSliderBlockAlignsWithGapY(t *testing.T) {
+	page := sliderHTML("id", "sig", 100, 40, 1700000000, "bg", "blk", "/p")
+	if strings.Contains(page, "__Y__") {
+		t.Fatal("__Y__ 占位符未替换")
+	}
+	if !strings.Contains(page, ".block{position:absolute;top:40px;") {
+		t.Fatal("拼图块 top 应与缺口纵坐标一致（40px）")
+	}
+	if strings.Contains(page, ".block{position:absolute;top:0;") {
+		t.Fatal("拼图块仍固定在顶部（top:0），会与缺口视觉错位")
 	}
 }
 

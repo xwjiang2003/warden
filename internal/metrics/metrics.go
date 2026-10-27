@@ -64,10 +64,12 @@ func Snapshot() map[string]int64 {
 	}
 }
 
-// BlockedTotal 各类拦截总数（含验证码挑战）。
+// BlockedTotal 真实被拦截的请求总数（不含挑战下发与按 IP 累计的拉黑数）。
+// CCChallenged 是"弹了挑战页"，FirewallBlocked 按 IP 计而非按请求计，
+// 混入后会让"拦截率"虚高且与 total_requests 分母不可比。
 func BlockedTotal() int64 {
-	return WAFBlocked.Value() + CCBlocked.Value() + CCChallenged.Value() + RateLimitBlocked.Value() +
-		IPCheckBlocked.Value() + FirewallBlocked.Value() + ConnLimitDropped.Value()
+	return WAFBlocked.Value() + CCBlocked.Value() + RateLimitBlocked.Value() +
+		IPCheckBlocked.Value() + ConnLimitDropped.Value()
 }
 
 // promMetric 描述一个计数器的 Prometheus 展示名与帮助文本。

@@ -62,6 +62,9 @@ func Open(driver, dsn string) (*Store, error) {
 }
 
 // Upsert 保存（或覆盖）一条灰名单记录。
+// 时间统一以 UTC RFC3339 存储：until/since 是 TEXT 列，SQL 里用字符串比较
+// 判断过期；若带本地时区偏移（+08:00），跨时区或夏令时下字符串序与时间序
+// 不一致，会误删未过期/漏删已过期记录。
 func (s *Store) Upsert(ip string, state int, fails int32, until, since time.Time, level int) {
 	if s == nil || s.db == nil {
 		return
@@ -69,7 +72,7 @@ func (s *Store) Upsert(ip string, state int, fails int32, until, since time.Time
 	d := sqlutil.DialectFor(s.driver)
 	err := sqlutil.Retry(func() error {
 		_, err := s.db.Exec(d.Upsert("grey_ip", []string{"ip", "state", "fails", "until", "level", "since"}, []string{"ip"}),
-			ip, state, fails, until.Format(time.RFC3339), level, since.Format(time.RFC3339))
+			ip, state, fails, until.UTC().Format(time.RFC3339), level, since.UTC().Format(time.RFC3339))
 		return err
 	})
 	if err != nil {
@@ -123,12 +126,13 @@ func (s *Store) LoadAll() []Entry {
 }
 
 // DeleteBefore 删除 until 早于 before 的过期记录，返回删除数量。
+// 与 Upsert 一致使用 UTC RFC3339 字符串比较。
 func (s *Store) DeleteBefore(before time.Time) int {
 	if s == nil || s.db == nil {
 		return 0
 	}
 	d := sqlutil.DialectFor(s.driver)
-	res, err := s.db.Exec(d.Placeholders(`DELETE FROM grey_ip WHERE until < ?`), before.Format(time.RFC3339))
+	res, err := s.db.Exec(d.Placeholders(`DELETE FROM grey_ip WHERE until < ?`), before.UTC().Format(time.RFC3339))
 	if err != nil {
 		log.Printf("[greyliststore] 清理过期灰名单失败: %v", err)
 		return 0
@@ -143,7 +147,7 @@ func (s *Store) List(offset, limit int) ([]Entry, int) {
 		return nil, 0
 	}
 	d := sqlutil.DialectFor(s.driver)
-	now := time.Now().Format(time.RFC3339)
+	now := time.Now().UTC().Format(time.RFC3339)
 	var total int
 	if err := s.db.QueryRow(d.Placeholders(`SELECT COUNT(*) FROM grey_ip WHERE until >= ?`), now).Scan(&total); err != nil {
 		log.Printf("[greyliststore] 统计灰名单失败: %v", err)

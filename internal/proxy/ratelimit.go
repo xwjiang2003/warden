@@ -2,10 +2,11 @@ package proxy
 
 import (
 	"log"
+	"net"
 	"net/http"
 	"regexp"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"warden/internal/attacklog"
 	"warden/internal/blockpage"
@@ -14,29 +15,53 @@ import (
 	"warden/internal/util"
 )
 
-// subnet24 提取 IP 的 /24 子网前缀
+// subnet24 提取 IP 的聚合前缀：IPv4 取 /24，IPv6 取 /48，用作子网限流的键。
+// 必须解析后按位掩码计算：此前 IPv6 用「截到最后一个冒号 + ::/48」的字符串
+// 拼接，压缩写法（如 2001:db8:1:2::5）会产出 "2001:db8:1:2::::/48" 这类
+// 非法且无法聚合同一 /48 的键，导致子网限流对 IPv6 失效。
 func subnet24(ip string) string {
-	if strings.Contains(ip, ":") {
-		// IPv6: 取 /48
-		return ip[:strings.LastIndex(ip, ":")] + "::/48"
-	}
-	// IPv4: 取 /24
-	idx := strings.LastIndex(ip, ".")
-	if idx < 0 {
+	pip := net.ParseIP(ip)
+	if pip == nil {
 		return ip
 	}
-	return ip[:idx] + ".0/24"
+	if v4 := pip.To4(); v4 != nil {
+		return v4.Mask(net.CIDRMask(24, 32)).String() + "/24"
+	}
+	if v6 := pip.To16(); v6 != nil {
+		return v6.Mask(net.CIDRMask(48, 128)).String() + "/48"
+	}
+	return ip
+}
+
+const (
+	// rlShardCount 分片数取 64。分片键用 /24 子网而不是单 IP：
+	// 同一子网的所有 IP 共享一把锁，子网限流阈值才不会被拆散放大。
+	rlShardBits  = 6
+	rlShardCount = 1 << rlShardBits
+	rlShardMask  = rlShardCount - 1
+
+	// rlSweepEvery 每 N 次检查轮转回收一个分片的过期条目。
+	// 把清理摊到多次请求上，避免请求路径出现整表 O(n) 扫描。
+	rlSweepEvery = 1024
+)
+
+type rlShard struct {
+	mu       sync.Mutex
+	counters map[string]*ipCounters
+	subnets  map[string]*subnetCounter
 }
 
 type IPRateLimiter struct {
-	cfg         config.RateLimitConfig
-	block       bool
-	hotPaths    []*regexp.Regexp
-	onBlock     func(ip string)
-	mu          sync.Mutex
-	counters    map[string]*ipCounters
-	subnetCount map[string]*subnetCounter // /24 子网计数
-	offenderCnt map[string]int
+	cfg      config.RateLimitConfig
+	block    bool
+	hotPaths []*regexp.Regexp
+	onBlock  func(ip string)
+
+	// 原实现用一把全局 mu 同时保护两张 map，且在条目数超阈值时于锁内做
+	// 全表 O(n) 扫描：攻击期（>10 万 IP）每个请求都要扫 10 万条，
+	// 同时把全部限流判定串行化。改为分片锁 + 轮转清理后，热路径只剩 O(1)。
+	shards [rlShardCount]rlShard
+	ops    atomic.Uint64
 
 	// logThrottle 限频打印"已拦截"日志。攻击期会有海量请求同时被限流，
 	// 若每个都 log.Printf，全部会去抢标准库 logger 的全局锁——
@@ -72,16 +97,34 @@ func NewIPRateLimiter(cfg config.RateLimitConfig, blockRequests bool, onBlock fu
 		compiled = append(compiled, regexp.MustCompile(p))
 	}
 
-	return &IPRateLimiter{
+	rl := &IPRateLimiter{
 		cfg:         cfg,
 		block:       blockRequests,
 		hotPaths:    compiled,
 		onBlock:     onBlock,
-		counters:    make(map[string]*ipCounters),
-		subnetCount: make(map[string]*subnetCounter),
-		offenderCnt: make(map[string]int),
 		logThrottle: newLogThrottler(ccLogThrottleInterval),
 	}
+	for i := range rl.shards {
+		rl.shards[i].counters = make(map[string]*ipCounters)
+		rl.shards[i].subnets = make(map[string]*subnetCounter)
+	}
+	return rl
+}
+
+// rlShardIndex 按 /24 子网前缀散列到分片（FNV-1a）。
+// 用子网而非单 IP 作键，保证同一子网的所有 IP 命中同一把锁——
+// 否则子网计数会被拆到多把锁里，实际阈值被放大到分片数倍。
+func rlShardIndex(subnet string) uint32 {
+	const (
+		offset32 = 2166136261
+		prime32  = 16777619
+	)
+	h := uint32(offset32)
+	for i := 0; i < len(subnet); i++ {
+		h ^= uint32(subnet[i])
+		h *= prime32
+	}
+	return h & rlShardMask
 }
 
 func (rl *IPRateLimiter) isHotPath(path string) bool {
@@ -124,46 +167,49 @@ func (rl *IPRateLimiter) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-// subnetCheckLocked 检查 /24 子网级别限流（需在 mu 锁内调用）
-func (rl *IPRateLimiter) subnetCheckLocked(ip string, now time.Time) (reason string, over bool) {
-	if rl.cfg.SubnetMaxPerMin <= 0 {
-		return "", false
-	}
-	subnet := subnet24(ip)
-	sc, ok := rl.subnetCount[subnet]
-	if !ok {
-		rl.subnetCount[subnet] = &subnetCounter{count: 1, reset: now.Add(time.Minute)}
-		return "", false
-	}
-	if now.After(sc.reset) {
-		sc.count = 1
-		sc.reset = now.Add(time.Minute)
-		return "", false
-	}
-	sc.count++
-	if sc.count > rl.cfg.SubnetMaxPerMin {
-		return "subnet_rpm", true
-	}
-	return "", false
-}
-
 func (rl *IPRateLimiter) check(ip string, hotPath bool) (reason string, over bool) {
 	now := time.Now()
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
+	subnet := subnet24(ip)
+	s := &rl.shards[rlShardIndex(subnet)]
 
+	s.mu.Lock()
+	reason, over = rl.checkLocked(s, subnet, ip, now, hotPath)
+	s.mu.Unlock()
+
+	// 轮转清理：每 rlSweepEvery 次检查回收一个分片的过期条目。
+	// 单次只清一个分片、且不在本次请求的锁内，均摊到每个请求是 O(1)。
+	if n := rl.ops.Add(1); n%rlSweepEvery == 0 {
+		rl.sweepShard(&rl.shards[(n/rlSweepEvery)%rlShardCount], now)
+	}
+	return reason, over
+}
+
+// checkLocked 在分片锁内完成子网与单 IP 的计数判定。
+func (rl *IPRateLimiter) checkLocked(s *rlShard, subnet, ip string, now time.Time, hotPath bool) (reason string, over bool) {
 	// /24 子网级别限流检查
-	if reason, over := rl.subnetCheckLocked(ip, now); over {
-		return reason, true
+	if rl.cfg.SubnetMaxPerMin > 0 {
+		sc, ok := s.subnets[subnet]
+		switch {
+		case !ok:
+			s.subnets[subnet] = &subnetCounter{count: 1, reset: now.Add(time.Minute)}
+		case now.After(sc.reset):
+			sc.count = 1
+			sc.reset = now.Add(time.Minute)
+		default:
+			sc.count++
+			if sc.count > rl.cfg.SubnetMaxPerMin {
+				return "subnet_rpm", true
+			}
+		}
 	}
 
-	c, ok := rl.counters[ip]
+	c, ok := s.counters[ip]
 	if !ok {
 		c = &ipCounters{
 			hotReset:  now.Add(time.Duration(rl.cfg.HotPathWindowSec) * time.Second),
 			siteReset: now.Add(time.Minute),
 		}
-		rl.counters[ip] = c
+		s.counters[ip] = c
 	}
 
 	if now.After(c.hotReset) {
@@ -187,21 +233,21 @@ func (rl *IPRateLimiter) check(ip string, hotPath bool) (reason string, over boo
 		}
 	}
 
-	if len(rl.counters) > 100000 {
-		for k, v := range rl.counters {
-			if now.After(v.siteReset) && now.After(v.hotReset) {
-				delete(rl.counters, k)
-			}
-		}
-	}
-	// 清理过期的子网计数器
-	if len(rl.subnetCount) > 50000 {
-		for k, v := range rl.subnetCount {
-			if now.After(v.reset) {
-				delete(rl.subnetCount, k)
-			}
-		}
-	}
-
 	return "", false
+}
+
+// sweepShard 回收单个分片中已过期的 IP / 子网计数（需持该分片锁）。
+func (rl *IPRateLimiter) sweepShard(s *rlShard, now time.Time) {
+	s.mu.Lock()
+	for k, v := range s.counters {
+		if now.After(v.siteReset) && now.After(v.hotReset) {
+			delete(s.counters, k)
+		}
+	}
+	for k, v := range s.subnets {
+		if now.After(v.reset) {
+			delete(s.subnets, k)
+		}
+	}
+	s.mu.Unlock()
 }

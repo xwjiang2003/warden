@@ -3,7 +3,10 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"warden/internal/config"
 )
 
 func tempDB(t *testing.T) string {
@@ -66,6 +69,34 @@ func TestRulePersistenceAcrossOpen(t *testing.T) {
 	}
 	if got != `{"block_script_ua":true}` {
 		t.Fatalf("内容不一致: %q", got)
+	}
+}
+
+// TestSaveSurfacesDBError 验证数据库写入失败时 Save 返回错误而非静默成功。
+// Load 优先读数据库，若 Save 吞掉 DB 错误，管理后台会提示"已保存"，
+// 重启后却从数据库加载旧配置，用户改动被回滚且无任何提示。
+func TestSaveSurfacesDBError(t *testing.T) {
+	dir := t.TempDir()
+	jsonPath := filepath.Join(dir, "config.json")
+	// 以目录作为 sqlite dsn：建表必然失败，用于模拟数据库不可用。
+	badDSN := t.TempDir()
+
+	cfg := &config.Config{Listen: ":8080"}
+	err := Save(jsonPath, "sqlite", badDSN, cfg)
+	if err == nil {
+		t.Fatal("数据库不可用时 Save 应返回错误，而不是仅告警")
+	}
+	if !strings.Contains(err.Error(), "写入数据库失败") {
+		t.Fatalf("错误信息应说明数据库写入失败，实际: %v", err)
+	}
+
+	// DB 失败时仍应尽力写 JSON 兜底。
+	got, loadErr := config.Load(jsonPath)
+	if loadErr != nil {
+		t.Fatalf("JSON 兜底应已写入: %v", loadErr)
+	}
+	if got.Listen != ":8080" {
+		t.Fatalf("JSON 内容不一致: got %q want %q", got.Listen, ":8080")
 	}
 }
 

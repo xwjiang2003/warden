@@ -49,18 +49,31 @@ func solvePoW(nonce string, difficulty int) string {
 // TestPowVerifyValid 合法求解通过（签名 + 时间窗 + 工作量全链路）。
 func TestPowVerifyValid(t *testing.T) {
 	p := newPoWChallenge(powTestConfig().Pow, "test-cc-secret")
-	nonce, difficulty, expires, sig := p.issue("1.2.3.4", ChallengeMid)
+	nonce, difficulty, expires, sig := p.issue("1.2.3.4", ChallengeMid, "/target")
 	sol := solvePoW(nonce, int(difficulty))
-	if !p.verify("1.2.3.4", nonce, sig, difficulty, expires, sol) {
+	if !p.verify("1.2.3.4", nonce, sig, difficulty, expires, sol, "/target") {
 		t.Fatal("合法解应通过")
+	}
+}
+
+// TestPowNonceReplayRejected 回归：同一 nonce 的合法解只能使用一次（一次性消费）。
+func TestPowNonceReplayRejected(t *testing.T) {
+	p := newPoWChallenge(powTestConfig().Pow, "test-cc-secret")
+	nonce, difficulty, expires, sig := p.issue("1.2.3.4", ChallengeMid, "/target")
+	sol := solvePoW(nonce, int(difficulty))
+	if !p.verify("1.2.3.4", nonce, sig, difficulty, expires, sol, "/target") {
+		t.Fatal("首次合法解应通过")
+	}
+	if p.verify("1.2.3.4", nonce, sig, difficulty, expires, sol, "/target") {
+		t.Fatal("同一 nonce 重放应被拒绝")
 	}
 }
 
 // TestPowVerifyWrongSolution 错误解拒绝。
 func TestPowVerifyWrongSolution(t *testing.T) {
 	p := newPoWChallenge(powTestConfig().Pow, "test-cc-secret")
-	nonce, difficulty, expires, sig := p.issue("1.2.3.4", ChallengeMid)
-	if p.verify("1.2.3.4", nonce, sig, difficulty, expires, "0") {
+	nonce, difficulty, expires, sig := p.issue("1.2.3.4", ChallengeMid, "/target")
+	if p.verify("1.2.3.4", nonce, sig, difficulty, expires, "0", "/target") {
 		t.Fatal("错误解应拒绝")
 	}
 }
@@ -68,23 +81,23 @@ func TestPowVerifyWrongSolution(t *testing.T) {
 // TestPowVerifyTamperedSig 签名被改（nonce/难度/过期/IP 任一篡改）拒绝。
 func TestPowVerifyTamperedSig(t *testing.T) {
 	p := newPoWChallenge(powTestConfig().Pow, "test-cc-secret")
-	nonce, difficulty, expires, sig := p.issue("1.2.3.4", ChallengeMid)
+	nonce, difficulty, expires, sig := p.issue("1.2.3.4", ChallengeMid, "/target")
 	sol := solvePoW(nonce, int(difficulty))
 
 	// 换 IP
-	if p.verify("9.9.9.9", nonce, sig, difficulty, expires, sol) {
+	if p.verify("9.9.9.9", nonce, sig, difficulty, expires, sol, "/target") {
 		t.Fatal("换 IP 应拒绝")
 	}
 	// 改难度（签名不匹配）
-	if p.verify("1.2.3.4", nonce, sig, difficulty+1, expires, sol) {
+	if p.verify("1.2.3.4", nonce, sig, difficulty+1, expires, sol, "/target") {
 		t.Fatal("改难度应拒绝")
 	}
 	// 改 sig
-	if p.verify("1.2.3.4", nonce, "deadbeef", difficulty, expires, sol) {
+	if p.verify("1.2.3.4", nonce, "deadbeef", difficulty, expires, sol, "/target") {
 		t.Fatal("改签名应拒绝")
 	}
 	// 空 nonce
-	if p.verify("1.2.3.4", "", sig, difficulty, expires, sol) {
+	if p.verify("1.2.3.4", "", sig, difficulty, expires, sol, "/target") {
 		t.Fatal("空 nonce 应拒绝")
 	}
 }
@@ -92,12 +105,12 @@ func TestPowVerifyTamperedSig(t *testing.T) {
 // TestPowVerifyExpired 过期挑战拒绝（防重放时间窗）。
 func TestPowVerifyExpired(t *testing.T) {
 	p := newPoWChallenge(powTestConfig().Pow, "test-cc-secret")
-	nonce, difficulty, _, _ := p.issue("1.2.3.4", ChallengeMid)
+	nonce, difficulty, _, _ := p.issue("1.2.3.4", ChallengeMid, "/target")
 	// 构造已过期（expires = now-1）的合法签名
 	expired := time.Now().Add(-1 * time.Second).Unix()
-	sigExp := p.sign(nonce, difficulty, expired, "1.2.3.4")
+	sigExp := p.sign(nonce, difficulty, expired, "1.2.3.4", "/target")
 	sol := solvePoW(nonce, int(difficulty))
-	if p.verify("1.2.3.4", nonce, sigExp, difficulty, expired, sol) {
+	if p.verify("1.2.3.4", nonce, sigExp, difficulty, expired, sol, "/target") {
 		t.Fatal("过期挑战应拒绝")
 	}
 }
@@ -105,15 +118,15 @@ func TestPowVerifyExpired(t *testing.T) {
 // TestPowVerifyDifficultyBound 难度越界拒绝（防御性校验）。
 func TestPowVerifyDifficultyBound(t *testing.T) {
 	p := newPoWChallenge(powTestConfig().Pow, "test-cc-secret")
-	nonce, _, expires, _ := p.issue("1.2.3.4", ChallengeMid)
+	nonce, _, expires, _ := p.issue("1.2.3.4", ChallengeMid, "/target")
 	// 难度 0（绕过工作量）——签名按难度 0 构造也无效
-	sig0 := p.sign(nonce, 0, expires, "1.2.3.4")
-	if p.verify("1.2.3.4", nonce, sig0, 0, expires, "0") {
+	sig0 := p.sign(nonce, 0, expires, "1.2.3.4", "/target")
+	if p.verify("1.2.3.4", nonce, sig0, 0, expires, "0", "/target") {
 		t.Fatal("难度 0 应拒绝")
 	}
 	// 难度超上限
-	sigH := p.sign(nonce, 33, expires, "1.2.3.4")
-	if p.verify("1.2.3.4", nonce, sigH, 33, expires, "0") {
+	sigH := p.sign(nonce, 33, expires, "1.2.3.4", "/target")
+	if p.verify("1.2.3.4", nonce, sigH, 33, expires, "0", "/target") {
 		t.Fatal("难度超上限应拒绝")
 	}
 }
@@ -173,7 +186,7 @@ func TestPowJSAlgorithmParity(t *testing.T) {
 		t.Skip("node 不可用，跳过 JS 一致性测试")
 	}
 	p := newPoWChallenge(powTestConfig().Pow, "test-cc-secret")
-	nonce, difficulty, expires, sig := p.issue("1.2.3.4", ChallengeMid)
+	nonce, difficulty, expires, sig := p.issue("1.2.3.4", ChallengeMid, "/target")
 
 	// 提取内嵌 JS 常量（与页面渲染的完全一致）
 	src, err := os.ReadFile(filepath.Join("challenge_pow.go"))
@@ -198,7 +211,7 @@ func TestPowJSAlgorithmParity(t *testing.T) {
 		t.Fatalf("node 求解失败: %v", err)
 	}
 	sol := strings.TrimSpace(string(out))
-	if !p.verify("1.2.3.4", nonce, sig, difficulty, expires, sol) {
+	if !p.verify("1.2.3.4", nonce, sig, difficulty, expires, sol, "/target") {
 		t.Fatalf("JS 求出的解 %q 应通过 Go 校验", sol)
 	}
 }
@@ -289,6 +302,116 @@ func TestPoWFlowHTTP(t *testing.T) {
 	}
 	if metrics.PoWPassed.Value() != passedBefore+1 || metrics.PoWFailed.Value() != failedBefore+1 {
 		t.Fatalf("指标异常: passed=%d failed=%d (基线 %d/%d)", metrics.PoWPassed.Value(), metrics.PoWFailed.Value(), passedBefore, failedBefore)
+	}
+}
+
+// powFields 解析挑战页里的隐藏字段。
+func powFields(body string) map[string]string {
+	m := map[string]string{}
+	for _, g := range powFieldRe.FindAllStringSubmatch(body, -1) {
+		m[g[1]] = g[2]
+	}
+	return m
+}
+
+// postPow 用挑战页字段构造一次验证提交。
+func postPow(h *CCDefenseHandler, fields map[string]string, solution, url, sid string) *httptest.ResponseRecorder {
+	form := "nonce=" + fields["nonce"] + "&difficulty=" + fields["difficulty"] +
+		"&expires=" + fields["expires"] + "&sig=" + fields["sig"] +
+		"&solution=" + solution + "&url=" + url
+	req := httptest.NewRequest(http.MethodPost, "/__cc_pow_verify", strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.RemoteAddr = "1.2.3.4:1234"
+	if sid != "" {
+		req.AddCookie(&http.Cookie{Name: ccSessionCookieName, Value: sid})
+	}
+	rec := httptest.NewRecorder()
+	h.handlePoWVerify(rec, req)
+	return rec
+}
+
+// TestPowVerifyTargetBound 回归：端点绑定——换目标地址（url 被改）签名不匹配。
+func TestPowVerifyTargetBound(t *testing.T) {
+	p := newPoWChallenge(powTestConfig().Pow, "test-cc-secret")
+	nonce, difficulty, expires, sig := p.issue("1.2.3.4", ChallengeMid, "/a")
+	sol := solvePoW(nonce, int(difficulty))
+	if p.verify("1.2.3.4", nonce, sig, difficulty, expires, sol, "/b") {
+		t.Fatal("换目标地址应被拒绝")
+	}
+	if !p.verify("1.2.3.4", nonce, sig, difficulty, expires, sol, "/a") {
+		t.Fatal("原目标地址应通过")
+	}
+}
+
+// TestPowLevelForDifficulty 回归：只接受三档标准难度，低档解法不能冒充其他档。
+func TestPowLevelForDifficulty(t *testing.T) {
+	p := newPoWChallenge(powTestConfig().Pow, "test-cc-secret")
+	for lvl, d := range map[ChallengeLevel]int64{
+		ChallengeLow:  int64(p.difficultyFor(ChallengeLow)),
+		ChallengeMid:  int64(p.difficultyFor(ChallengeMid)),
+		ChallengeHigh: int64(p.difficultyFor(ChallengeHigh)),
+	} {
+		if got, ok := p.levelForDifficulty(d); !ok || got != lvl {
+			t.Fatalf("难度 %d 应映射 %v，实际 %v ok=%v", d, lvl, got, ok)
+		}
+	}
+	if _, ok := p.levelForDifficulty(int64(p.difficultyFor(ChallengeMid)) + 1); ok {
+		t.Fatal("非标准难度不应映射到任何档位")
+	}
+}
+
+// TestPoWFailureKeepsLevel 回归：高档挑战失败后必须按同一档重发。
+// 原实现固定按 Mid 重发：攻击者在高档挑战上故意失败一次，就能拿到
+// 更便宜的题目降档通过，相当于高档难度从未生效。
+func TestPoWFailureKeepsLevel(t *testing.T) {
+	cfg := powTestConfig()
+	cfg.ChallengeByRisk.High = "pow"
+	h := NewCCDefense(cfg, config.IPCheckConfig{}, nil,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), nil, nil)
+
+	rec := httptest.NewRecorder()
+	h.serveChallenge(rec, httptest.NewRequest(http.MethodGet, "/p", nil), "1.2.3.4", ChallengeHigh)
+	fields := powFields(rec.Body.String())
+	wantDiff := strconv.FormatInt(int64(h.pow.difficultyFor(ChallengeHigh)), 10)
+	if fields["difficulty"] != wantDiff {
+		t.Fatalf("应下发高档难度 %s，实际 %q", wantDiff, fields["difficulty"])
+	}
+
+	bad := postPow(h, fields, wrongPoW(fields["nonce"], fields["difficulty"]), "%2Fp", "sess-bad")
+	if _, ok := h.trustedSessions.Load("sess-bad"); ok {
+		t.Fatal("错误解不应签发会话")
+	}
+	if got := powFields(bad.Body.String())["difficulty"]; got != wantDiff {
+		t.Fatalf("失败后应保持高档难度 %s，实际 %s", wantDiff, got)
+	}
+}
+
+// TestPowRejectsLowLevelDuringFlood 回归：泛洪期低档解法不能换取可信身份，
+// 否则攻击者可在泛洪前预解低档题目，泛洪时直接换成可信 IP。
+func TestPowRejectsLowLevelDuringFlood(t *testing.T) {
+	h := NewCCDefense(powTestConfig(), config.IPCheckConfig{}, nil,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), nil, nil)
+
+	// 直接置为泛洪状态（新 IP 占比 90%，总量远超判定门槛）
+	h.flood.mu.Lock()
+	h.flood.recentNew, h.flood.recentOld = 900, 100
+	h.flood.windowAt = time.Now().UnixNano()
+	h.flood.mu.Unlock()
+
+	nonce, difficulty, expires, sig := h.pow.issue("1.2.3.4", ChallengeLow, "/p")
+	fields := map[string]string{
+		"nonce":      nonce,
+		"difficulty": strconv.FormatInt(difficulty, 10),
+		"expires":    strconv.FormatInt(expires, 10),
+		"sig":        sig,
+	}
+	rec := postPow(h, fields, solvePoW(nonce, int(difficulty)), "%2Fp", "sess-low")
+	if _, ok := h.trustedSessions.Load("sess-low"); ok {
+		t.Fatal("泛洪期低档解法不应换取可信会话")
+	}
+	wantDiff := strconv.FormatInt(int64(h.pow.difficultyFor(ChallengeHigh)), 10)
+	if got := powFields(rec.Body.String())["difficulty"]; got != wantDiff {
+		t.Fatalf("应重发高档挑战 %s，实际 %q", wantDiff, got)
 	}
 }
 

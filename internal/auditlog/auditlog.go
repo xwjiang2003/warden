@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"warden/internal/accesslog"
@@ -26,6 +27,10 @@ type Event struct {
 var (
 	mu     sync.RWMutex
 	logger *accesslog.Logger
+	// lastSync 上次 fsync 时刻（UnixNano）。审计条目要尽快落盘（崩溃/断电
+	// 后取证不能缺行），但每条都 fsync 在攻击洪峰下会打爆磁盘，
+	// 故限流为最多每秒一次。
+	lastSync atomic.Int64
 )
 
 // Init 启用审计日志，复用 accesslog 的按天/大小轮转。
@@ -64,6 +69,13 @@ func Record(evt Event) {
 		return
 	}
 	l.WriteLine(string(b))
+	// 限流落盘：秒级内只 fsync 一次，兼顾审计持久性与写入吞吐。
+	now := time.Now().UnixNano()
+	if prev := lastSync.Load(); now-prev >= int64(time.Second) {
+		if lastSync.CompareAndSwap(prev, now) {
+			l.Sync()
+		}
+	}
 }
 
 // Disabled 返回审计日志是否未启用。

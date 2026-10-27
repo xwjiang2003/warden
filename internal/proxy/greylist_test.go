@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -211,6 +212,126 @@ func TestGreyListPersistRestore(t *testing.T) {
 	// 过期 hard → 降级 soft（restore 时处理）
 	if st, _ := g.status("9.9.9.11"); st != greySoft {
 		t.Fatalf("9.9.9.11 过期 hard 应降级 soft, got %v", st)
+	}
+}
+
+// greyEntryCount 统计内存态灰名单条目数。
+func greyEntryCount(g *greyList) int {
+	n := 0
+	g.entries.Range(func(_, _ interface{}) bool {
+		n++
+		return true
+	})
+	return n
+}
+
+// greySetExpired 把条目的 until 拨到过去，模拟 TTL 到期。
+func greySetExpired(g *greyList, ip string) {
+	v, ok := g.entries.Load(ip)
+	if !ok {
+		return
+	}
+	e := v.(*greyEntry)
+	e.mu.Lock()
+	e.until = time.Now().Add(-time.Second)
+	e.mu.Unlock()
+}
+
+// TestGreyListSweepReclaimsCounters 回归：未升级（greyNone）的失败计数条目
+// 必须有确定过期时间，并能被 reaper 回收。原实现 until 为零值，只能等同一 IP
+// 再次访问触发 status() 惰性清理——攻击期海量一次性 IP 会无界增长。
+func TestGreyListSweepReclaimsCounters(t *testing.T) {
+	g := newGreyList(testGreyCfg(true), nil, nil)
+	const ips = 100
+	for i := 0; i < ips; i++ {
+		ip := fmt.Sprintf("10.1.%d.%d", i/250, i%250)
+		g.recordFail(ip, ChallengeLow) // 未达 escalate=2，全部停留在 greyNone
+	}
+	if n := greyEntryCount(g); n != ips {
+		t.Fatalf("计数条目 = %d, want %d", n, ips)
+	}
+	for i := 0; i < ips; i++ {
+		greySetExpired(g, fmt.Sprintf("10.1.%d.%d", i/250, i%250))
+	}
+	g.sweepExpired(time.Now())
+	if n := greyEntryCount(g); n != 0 {
+		t.Fatalf("到期后应全部回收，剩余 %d 条", n)
+	}
+}
+
+// TestGreyListSweepExpiresStates 回归：soft 到期直接回收；hard 到期先降级 soft，
+// 下个窗口到期再回收——与 status() 的惰性策略一致，但不再依赖 IP 再次来访。
+func TestGreyListSweepExpiresStates(t *testing.T) {
+	g := newGreyList(testGreyCfg(true), nil, nil)
+
+	softIP := "9.9.9.20"
+	g.recordFail(softIP, ChallengeLow)
+	g.recordFail(softIP, ChallengeLow) // soft
+
+	hardIP := "9.9.9.21"
+	g.entries.Store(hardIP, &greyEntry{
+		ip: hardIP, state: greyHard, until: time.Now().Add(-time.Second), since: time.Now(),
+	})
+
+	greySetExpired(g, softIP)
+	g.sweepExpired(time.Now())
+
+	if _, ok := g.entries.Load(softIP); ok {
+		t.Fatal("soft 到期应被回收")
+	}
+	if st, _ := g.status(hardIP); st != greySoft {
+		t.Fatalf("hard 到期应先降级 soft，got %v", st)
+	}
+	greySetExpired(g, hardIP)
+	g.sweepExpired(time.Now())
+	if _, ok := g.entries.Load(hardIP); ok {
+		t.Fatal("降级后的 soft 到期应被回收")
+	}
+}
+
+// TestGreyListFailWindowResetsCount 回归：失败计数只在窗口内有效。
+// 陈旧次数不能在很久以后与新失败叠加触发升级。
+func TestGreyListFailWindowResetsCount(t *testing.T) {
+	g := newGreyList(testGreyCfg(true), nil, nil) // escalate=2
+	ip := "9.9.9.22"
+
+	g.recordFail(ip, ChallengeLow) // fails=1
+	greySetExpired(g, ip)          // 窗口过期
+	g.recordFail(ip, ChallengeLow) // 应重新计数为 1，而不是叠加到 2
+	if st, _ := g.status(ip); st != greyNone {
+		t.Fatalf("窗口过期后重新计数，不应升级，got %v", st)
+	}
+	g.recordFail(ip, ChallengeLow) // 窗口内第 2 次 → soft
+	if st, _ := g.status(ip); st != greySoft {
+		t.Fatalf("窗口内累计 2 次应升级 soft，got %v", st)
+	}
+}
+
+// TestGreyListSweepReclaimsLimiterBuckets 回归：灰名单限速桶也要按空闲回收。
+// 原实现只 gc 了 h.perIP，灰名单自身的桶（allow 时创建）在解灰后永不释放。
+func TestGreyListSweepReclaimsLimiterBuckets(t *testing.T) {
+	g := newGreyList(testGreyCfg(true), nil, nil)
+	ip := "9.9.9.23"
+	g.entries.Store(ip, &greyEntry{ip: ip, state: greySoft, until: time.Now().Add(time.Minute), since: time.Now()})
+	if !g.allow(ip) {
+		t.Fatal("首次 allow 应放行并创建桶")
+	}
+
+	g.limiter.mu.Lock()
+	b := g.limiter.buckets[ip]
+	g.limiter.mu.Unlock()
+	if b == nil {
+		t.Fatal("桶未创建")
+	}
+	// 桶空闲时间超过回收阈值（hardTTL = 2×ttl = 120s）
+	atomic.StoreInt64(&b.lastSeen, time.Now().Add(-3*time.Minute).UnixNano())
+
+	g.sweepExpired(time.Now())
+	g.limiter.mu.Lock()
+	_, still := g.limiter.buckets[ip]
+	g.limiter.mu.Unlock()
+	if still {
+		t.Fatal("空闲过期桶应被回收")
 	}
 }
 

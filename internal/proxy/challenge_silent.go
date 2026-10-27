@@ -3,6 +3,7 @@ package proxy
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"html"
 	"log"
 	"net/http"
 	"strconv"
@@ -40,10 +41,11 @@ func (h *CCDefenseHandler) serveSilent(w http.ResponseWriter, r *http.Request, i
 	// 必须先签发 sid cookie：grantTrust 以 sid 为键签发可信会话，
 	// 无 cookie 时验证通过后 follow 仍走慢速路径被再次挑战（真实缺陷，见 F7 验收 [2]）。
 	getOrSetSessionID(w, r)
-	nonce, difficulty, expires, sig := h.pow.issueWithDifficulty(ip, h.pow.silentDifficulty())
+	target := challengeTarget(r.URL.String())
+	nonce, difficulty, expires, sig := h.pow.issueWithDifficulty(ip, h.pow.silentDifficulty(), target)
 	metrics.SilentChallenged.Inc()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(silentHTML(nonce, difficulty, expires, sig, r.URL.String())))
+	w.Write([]byte(silentHTML(nonce, difficulty, expires, sig, target)))
 }
 
 // handleSilentVerify 处理无感验证提交：PoW 校验 + 指纹规则，通过即签发可信会话。
@@ -54,66 +56,79 @@ func (h *CCDefenseHandler) handleSilentVerify(w http.ResponseWriter, r *http.Req
 	}
 	ip := util.ClientIP(r)
 	sid := getSessionID(r)
-	target := r.FormValue("url")
-	if !strings.HasPrefix(target, "/") || strings.Contains(target, "//") {
-		target = "/"
-	}
+	target := challengeTarget(r.FormValue("url"))
 	nonce := r.FormValue("nonce")
 	solution := r.FormValue("solution")
 	sig := r.FormValue("sig")
 	difficulty, errD := strconv.ParseInt(r.FormValue("difficulty"), 10, 64)
 	expires, errE := strconv.ParseInt(r.FormValue("expires"), 10, 64)
+
+	// 统一失败出口：计数 + 失败冷却 + 静默回首页（无感验证没有重试 UI）。
+	reject := func() {
+		metrics.SilentFailed.Inc()
+		h.markChallengeFail(ip, ChallengeLow)
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	}
+
 	if nonce == "" || solution == "" || sig == "" || errD != nil || errE != nil {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	if h.pow == nil || !h.pow.verify(ip, nonce, sig, difficulty, expires, solution) {
-		metrics.SilentFailed.Inc()
-		// 校验失败不重发（无感验证无重试 UI）：静默回首页，让限速继续生效；
-		// 同时进入失败冷却，窗口内后续请求直接重发无感挑战。
-		h.markChallengeFail(ip, ChallengeLow)
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+	// 必须携带 sid：serveSilent 已签发 cookie，无 cookie 的提交说明客户端
+	// 未按挑战页流程走（纯脚本直连 POST），直接拒绝。
+	if sid == "" {
+		reject()
 		return
 	}
-	// 指纹规则：UA 一致性 + canvas 指纹非空 + 语言列表非空
+	if h.pow == nil || !h.pow.verify(ip, nonce, sig, difficulty, expires, solution, target) {
+		reject()
+		return
+	}
+	// 指纹规则：UA 一致性 + canvas 指纹非空 + 语言列表非空。
+	// 字段均为浏览器端 sha256 前缀（16 hex），长度/字符集必须严格匹配，
+	// 否则"随便填个非空字符串"即可绕过（原实现只校验了长度下限）。
 	ua := strings.ToLower(r.UserAgent())
-	uaHash := shortHashHex(ua)
 	fpUA := r.FormValue("fp_ua")
-	fpCanvas := r.FormValue("fp_canvas")
+	if !isHexHash(fpUA, silentFPHashLen) || fpUA != shortHashHex(ua) {
+		reject()
+		return
+	}
+	if !isHexHash(r.FormValue("fp_canvas"), silentFPHashLen) {
+		reject()
+		return
+	}
 	fpLangs := r.FormValue("fp_langs")
-	fpTouch := r.FormValue("fp_touch")
-	if fpUA != uaHash {
-		metrics.SilentFailed.Inc()
-		h.markChallengeFail(ip, ChallengeLow)
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+	if fpLangs == "" || len(fpLangs) > 256 {
+		reject()
 		return
 	}
-	if len(fpCanvas) < silentFPHashLen {
-		metrics.SilentFailed.Inc()
-		h.markChallengeFail(ip, ChallengeLow)
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
-	}
-	if fpLangs == "" {
-		metrics.SilentFailed.Inc()
-		h.markChallengeFail(ip, ChallengeLow)
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
-	}
-	if fpTouch != "0" && fpTouch != "1" {
-		metrics.SilentFailed.Inc()
-		h.markChallengeFail(ip, ChallengeLow)
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+	if fpTouch := r.FormValue("fp_touch"); fpTouch != "0" && fpTouch != "1" {
+		reject()
 		return
 	}
 	// 通过：与验证码同等语义——清违规、解拉黑、签发可信会话
 	h.grantTrust(w, r, ip, sid, target, "silent")
 }
 
+// isHexHash 判断字符串是否为指定长度的十六进制串（浏览器指纹字段统一为 sha256 前缀）。
+func isHexHash(s string, n int) bool {
+	if len(s) != n {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 // grantTrust 挑战通过的统一可信链路：清违规累计、解防火墙拉黑、解灰名单、签发可信会话并回跳。
 func (h *CCDefenseHandler) grantTrust(w http.ResponseWriter, r *http.Request, ip, sid, target, via string) {
 	h.offenders.Delete(ip)
 	h.chFails.Delete(ip)
+	h.slide.clearFail(ip)
 	if h.fw != nil {
 		h.fw.unblock(ip)
 	}
@@ -123,7 +138,14 @@ func (h *CCDefenseHandler) grantTrust(w http.ResponseWriter, r *http.Request, ip
 	} else {
 		h.trust.setTrusted(ip)
 	}
-	metrics.SilentPassed.Inc()
+	// 按实际挑战类型计数：slider 通过与 silent 通过是两套独立指标，
+	// 统一计 SilentPassed 会让"无感验证通过率"被滑动验证数据污染。
+	switch via {
+	case "silent":
+		metrics.SilentPassed.Inc()
+	case "slider":
+		metrics.SliderPassed.Inc()
+	}
 	log.Printf("[cc_defense] challenge passed ip=%s via=%s", ip, via)
 	http.Redirect(w, r, target, http.StatusSeeOther)
 }
@@ -200,7 +222,7 @@ __LEADING_JS__
 		"__DIFF__", strconv.FormatInt(difficulty, 10),
 		"__EXP__", strconv.FormatInt(expires, 10),
 		"__SIG__", sig,
-		"__URL__", targetURL,
+		"__URL__", html.EscapeString(targetURL),
 		"__SHA256_JS__", powSHA256JS,
 		"__LEADING_JS__", powLeadingZeroJS,
 	).Replace(page)

@@ -76,8 +76,15 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 func hostOnly(host string) string {
 	host = strings.TrimSpace(host)
-	if i := strings.LastIndex(host, ":"); i >= 0 {
-		host = host[:i]
+	if host == "" {
+		return ""
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	} else {
+		// 无端口主机名，或裸 IPv6（[::1]）：剥掉可选方括号。
+		// 只按最后一个冒号截断会把 "[::1]" 变成 "[:"，IPv6 站点永远匹配不上。
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
 	}
 	return strings.ToLower(host)
 }
